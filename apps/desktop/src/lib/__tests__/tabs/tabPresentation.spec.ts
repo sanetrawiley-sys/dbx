@@ -1,7 +1,25 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { useConnectionStore } from "@/stores/connectionStore";
-import { connectionGroupDisplayName, executionSummaryItems, middleEllipsis, queryResultBaseSql, queryResultExecutionSql, resultSourceRange, statementExecutionMarkers, tabTooltipLines, tabularResultItems } from "@/lib/tabs/tabPresentation";
+import {
+  connectionGroupDisplayName,
+  executionSummaryItems,
+  middleEllipsis,
+  queryResultBaseSql,
+  queryResultExecutionSql,
+  resultGridCacheKey,
+  resultGridColumnWidthCacheKey,
+  resultGridInstanceKey,
+  resultSourceRange,
+  statementExecutionMarkers,
+  tabColorStyle,
+  tabDatabaseIconType,
+  tabDisplayTitle,
+  tabIconClass,
+  tabTooltipLines,
+  tabularResultItems,
+  dirtyTabTitleStyle,
+} from "@/lib/tabs/tabPresentation";
 import { sqlTextFingerprint } from "@/lib/sql/sqlTextFingerprint";
 import type { ConnectionConfig, QueryTab } from "@/types/database";
 
@@ -9,6 +27,8 @@ const translations: Record<string, string> = {
   "tabs.tooltipConnection": "Connection:",
   "tabs.tooltipGroup": "Group:",
   "tabs.tooltipDatabase": "Database:",
+  "tabs.tooltipTable": "Table:",
+  "tabs.tooltipTableComment": "Table Comment:",
   "connectionGroup.ungroupedLabel": "Ungrouped",
   "editor.noDatabase": "No database",
 };
@@ -133,7 +153,29 @@ describe("query result labels", () => {
   });
 });
 
+describe("query result grid identity", () => {
+  it("separates rerun payloads while retaining run and result-set identity", () => {
+    const first = queryTab({ activeResultRunId: "run-1", activeResultIndex: 2, resultGridRevision: "execution-1" });
+    const rerun = queryTab({ activeResultRunId: "run-2", activeResultIndex: 2, resultGridRevision: "execution-2" });
+
+    expect(resultGridInstanceKey(first)).toBe("tab-1-run-1-2-execution-1");
+    expect(resultGridInstanceKey(rerun)).not.toBe(resultGridInstanceKey(first));
+    expect(resultGridInstanceKey({ ...first, activeResultIndex: 1 })).toBe("tab-1-run-1-1-execution-1");
+    expect(resultGridCacheKey(rerun)).not.toBe(resultGridCacheKey(first));
+    expect(resultGridColumnWidthCacheKey(rerun)).toBe(resultGridColumnWidthCacheKey(first));
+    expect(resultGridColumnWidthCacheKey({ ...first, activeResultIndex: 1 })).not.toBe(resultGridColumnWidthCacheKey(first));
+  });
+});
+
 describe("tab group presentation", () => {
+  it("uses the live database and branch context for Dolt version control tabs", () => {
+    const store = useConnectionStore();
+    store.connections = [{ id: "conn-1", name: "Production Dolt", db_type: "mysql", driver_profile: "dolt", database: "app" } as ConnectionConfig];
+
+    expect(tabDisplayTitle(queryTab({ mode: "dolt-version-control", title: "Dolt Version Control", workspaceBranch: "feature/orders" }), translate)).toBe("Production Dolt VCS@db.feature/orders");
+    expect(tabDisplayTitle(queryTab({ mode: "dolt-version-control", title: "Dolt Version Control" }), translate)).toBe("Production Dolt VCS@db");
+  });
+
   it("adds the full, live group path to tab tooltips", () => {
     const store = useConnectionStore();
     store.connections = [{ id: "conn-1", name: "PostgreSQL", db_type: "postgres", database: "app" } as ConnectionConfig];
@@ -168,6 +210,22 @@ describe("tab group presentation", () => {
     };
 
     expect(connectionGroupDisplayName("conn-1", translate)).toBe("Ungrouped");
+  });
+
+  it("shows a bounded table comment only when it is non-empty", () => {
+    const lines = tabTooltipLines(
+      queryTab({
+        mode: "data",
+        tableComment: `  ${"表".repeat(55)}\narchive  `,
+        tableMeta: { schema: "public", tableName: "users", columns: [], primaryKeys: [] },
+      }),
+      translate,
+    );
+    const comment = lines.find((line) => line.label === "Table Comment:")?.value;
+
+    expect(Array.from(comment || "")).toHaveLength(50);
+    expect(comment?.endsWith("…")).toBe(true);
+    expect(tabTooltipLines(queryTab({ mode: "data", tableComment: "   ", tableMeta: { schema: "public", tableName: "users", columns: [], primaryKeys: [] } }), translate).some((line) => line.label === "Table Comment:")).toBe(false);
   });
 });
 
@@ -232,6 +290,35 @@ describe("execution summary", () => {
     expect(executionSummaryItems({ results: [successfulAlias, markedFailure] }).map(({ status, isError }) => ({ status, isError }))).toEqual([
       { status: "success", isError: false },
       { status: "error", isError: true },
+    ]);
+  });
+
+  it("maps out-of-order results to their explicit statement indexes", () => {
+    const items = executionSummaryItems({
+      results: [
+        { columns: ["value"], rows: [["third"]], affected_rows: 0, execution_time_ms: 3, statement_index: 2 },
+        { columns: ["value"], rows: [["first"]], affected_rows: 0, execution_time_ms: 1, statement_index: 0 },
+      ],
+      batchSqlExecution: {
+        executionId: "run-out-of-order",
+        submittedSql: "SELECT 'first'; SELECT 'second'; SELECT 'third'",
+        editorFingerprint: "fingerprint",
+        sourceOffset: 0,
+        completed: 2,
+        total: 3,
+        startedAt: 1,
+        items: [
+          { statementIndex: 0, sql: "SELECT 'first'", from: 0, to: 14, status: "success" },
+          { statementIndex: 1, sql: "SELECT 'second'", from: 16, to: 31, status: "skipped" },
+          { statementIndex: 2, sql: "SELECT 'third'", from: 33, to: 47, status: "success" },
+        ],
+      },
+    });
+
+    expect(items.map((item) => [item.statementIndex, item.result?.rows[0]?.[0]])).toEqual([
+      [0, "first"],
+      [1, undefined],
+      [2, "third"],
     ]);
   });
 });
@@ -329,5 +416,40 @@ describe("statement execution markers", () => {
   it("invalidates every marker after the editor document changes", () => {
     const executedSql = "SELECT 1;\nSELECT 2;";
     expect(statementExecutionMarkers(`-- edited\n${executedSql}`, [{ columns: ["value"], rows: [[1]], affected_rows: 0, execution_time_ms: 1, statement_index: 0, sourceStatement: "SELECT 1" }], "mysql", "stale-editor-fingerprint", executedSql)).toEqual([]);
+  });
+});
+
+describe("shared tab presentation helpers", () => {
+  it("classifies tab icon colors without MQ special-casing", () => {
+    expect(tabIconClass(queryTab({ mode: "data" }))).toContain("text-emerald-600");
+    expect(tabIconClass(queryTab({ mode: "mq" }))).toBe("");
+    expect(tabIconClass(queryTab({ externalSqlFileMissing: true }))).toContain("text-amber-600");
+  });
+
+  it("builds active/inactive color styles for classic and non-classic layouts", () => {
+    const activeClassic = tabColorStyle(queryTab({}), true, true);
+    expect(activeClassic?.boxShadow).toContain("var(--ring)");
+    const inactiveModern = tabColorStyle(queryTab({}), false, false);
+    expect(inactiveModern?.borderColor).toBeUndefined();
+  });
+
+  it("resolves MQ driver icons from the connection store", () => {
+    const connectionStore = useConnectionStore();
+    connectionStore.connections = [
+      {
+        id: "mq-1",
+        name: "MQ",
+        db_type: "mq",
+        driver_profile: "kafka",
+        color: "",
+      } as ConnectionConfig,
+    ];
+    expect(tabDatabaseIconType(queryTab({ connectionId: "mq-1", mode: "mq" }))).toBe("kafka");
+  });
+
+  it("returns a dirty-title style only when the tab is dirty", () => {
+    expect(dirtyTabTitleStyle(false)).toBeUndefined();
+    expect(dirtyTabTitleStyle(true)?.fontStyle).toBe("italic");
+    expect(dirtyTabTitleStyle(true)?.fontWeight).toBe(700);
   });
 });

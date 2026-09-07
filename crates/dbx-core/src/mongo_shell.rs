@@ -8,8 +8,41 @@ pub enum MongoCommand {
     Version,
     #[serde(rename = "use")]
     Use { database: String },
+    #[serde(rename = "showDatabases")]
+    ShowDatabases,
+    #[serde(rename = "runCommand")]
+    RunCommand {
+        #[serde(rename = "commandJson")]
+        command_json: String,
+    },
+    #[serde(rename = "createUser")]
+    CreateUser {
+        #[serde(rename = "userJson")]
+        user_json: String,
+        #[serde(rename = "writeConcernJson")]
+        write_concern_json: Option<String>,
+    },
     #[serde(rename = "find")]
-    Find { collection: String, filter: String, projection: Option<String>, sort: Option<String>, skip: u64, limit: i64 },
+    Find {
+        collection: String,
+        filter: String,
+        projection: Option<String>,
+        sort: Option<String>,
+        collation: Option<String>,
+        skip: u64,
+        limit: i64,
+    },
+    #[serde(rename = "findExplain")]
+    FindExplain {
+        collection: String,
+        filter: String,
+        projection: Option<String>,
+        sort: Option<String>,
+        collation: Option<String>,
+        skip: u64,
+        limit: i64,
+        verbosity: String,
+    },
     #[serde(rename = "findOne")]
     FindOne { collection: String, filter: String, projection: Option<String>, options: Option<String> },
     #[serde(rename = "countDocuments")]
@@ -58,7 +91,9 @@ impl MongoCommand {
     pub fn is_mutating(&self) -> bool {
         matches!(
             self,
-            Self::Insert { .. }
+            Self::RunCommand { .. }
+                | Self::CreateUser { .. }
+                | Self::Insert { .. }
                 | Self::Update { .. }
                 | Self::Delete { .. }
                 | Self::CreateIndex { .. }
@@ -71,7 +106,7 @@ impl MongoCommand {
     }
 
     pub fn is_dangerous(&self) -> bool {
-        matches!(self, Self::DropCollection { .. })
+        matches!(self, Self::RunCommand { .. } | Self::CreateUser { .. } | Self::DropCollection { .. })
             || matches!(self, Self::DropIndexes { indexes: None, single: false, .. })
             || matches!(self, Self::Aggregate { pipeline, .. } if aggregate_writes(pipeline))
     }
@@ -322,12 +357,46 @@ fn mongo_field_predicate_is_exists_true(value: &serde_json::Value) -> bool {
 }
 
 pub fn parse(input: &str) -> Result<MongoCommand, String> {
+    let show_source = trim_mongo_outer_comments(input).trim_end_matches(';').trim();
+    if parse_show_databases(show_source) {
+        return Ok(MongoCommand::ShowDatabases);
+    }
     let source = input.trim().trim_end_matches(';').trim();
     if source.eq_ignore_ascii_case("db.version()") {
         return Ok(MongoCommand::Version);
     }
     if let Some(database) = parse_use_database(source) {
         return Ok(MongoCommand::Use { database });
+    }
+    if let Some((args, tail)) = database_method_call(source, "runCommand") {
+        if !tail.is_empty() || args.len() != 1 {
+            return Err("MongoDB runCommand() requires exactly one command document.".to_string());
+        }
+        let command_json = normalized_json(&args[0])?;
+        let command = parse_json_value(&command_json)
+            .and_then(|value| value.as_object().cloned())
+            .ok_or("MongoDB runCommand() requires a command document.")?;
+        if command.is_empty() {
+            return Err("MongoDB runCommand() requires a non-empty command document.".to_string());
+        }
+        return Ok(MongoCommand::RunCommand { command_json });
+    }
+    if let Some((args, tail)) = database_method_call(source, "createUser") {
+        if !tail.is_empty() || !(1..=2).contains(&args.len()) {
+            return Err("MongoDB createUser() requires a user document and optional write concern.".to_string());
+        }
+        let user_json = normalized_json(&args[0])?;
+        let user = parse_json_value(&user_json)
+            .and_then(|value| value.as_object().cloned())
+            .ok_or("MongoDB createUser() requires a user document.")?;
+        if user.get("user").and_then(Value::as_str).is_none_or(|user| user.trim().is_empty()) {
+            return Err("MongoDB createUser() requires a non-empty user name.".to_string());
+        }
+        let write_concern_json = optional_json_argument(args.get(1))?;
+        if write_concern_json.as_deref().and_then(parse_json_value).is_some_and(|value| !value.is_object()) {
+            return Err("MongoDB createUser() write concern must be a document.".to_string());
+        }
+        return Ok(MongoCommand::CreateUser { user_json, write_concern_json });
     }
     let (collection, prefix_end) = parse_collection_prefix(source)?;
 
@@ -339,20 +408,44 @@ pub fn parse(input: &str) -> Result<MongoCommand, String> {
             return Err("MongoDB find() accepts at most filter and projection arguments.".to_string());
         }
         let mut sort = None;
+        let mut collation = None;
         let mut skip = 0;
         let mut limit = 100;
-        for (name, call_args) in chained_calls(&tail)? {
+        let calls = chained_calls(&tail)?;
+        let call_count = calls.len();
+        for (index, (name, call_args)) in calls.into_iter().enumerate() {
             match name.as_str() {
                 "sort" => sort = Some(normalized_json(call_args.first().map(String::as_str).unwrap_or("{}"))?),
+                "collation" => {
+                    if call_args.len() != 1 {
+                        return Err("MongoDB collation() requires one options object.".to_string());
+                    }
+                    collation = Some(normalized_json(&call_args[0])?);
+                }
                 "skip" => skip = parse_integer(&call_args, "skip")? as u64,
                 "limit" => limit = parse_integer(&call_args, "limit")?,
                 "count" if call_args.is_empty() => {
                     return Ok(MongoCommand::Count { collection, filter, accurate: false });
                 }
+                "explain" => {
+                    if index + 1 != call_count {
+                        return Err("MongoDB explain() must be the final find() chain operation.".to_string());
+                    }
+                    return Ok(MongoCommand::FindExplain {
+                        collection,
+                        filter,
+                        projection,
+                        sort,
+                        collation,
+                        skip,
+                        limit,
+                        verbosity: parse_explain_verbosity(&call_args)?,
+                    });
+                }
                 _ => return Err(format!("Unsupported MongoDB find() chain: {name}()")),
             }
         }
-        return Ok(MongoCommand::Find { collection, filter, projection, sort, skip, limit });
+        return Ok(MongoCommand::Find { collection, filter, projection, sort, collation, skip, limit });
     }
 
     if let Some((args, tail)) = method_call(source, prefix_end, "findOne") {
@@ -558,6 +651,86 @@ pub fn parse(input: &str) -> Result<MongoCommand, String> {
     Err("Unsupported MongoDB shell command.".to_string())
 }
 
+fn parse_show_databases(source: &str) -> bool {
+    let mut words = source.split_whitespace();
+    words.next().is_some_and(|word| word.eq_ignore_ascii_case("show"))
+        && words.next().is_some_and(|word| word.eq_ignore_ascii_case("dbs") || word.eq_ignore_ascii_case("databases"))
+        && words.next().is_none()
+}
+
+fn trim_mongo_outer_comments(mut source: &str) -> &str {
+    loop {
+        source = source.trim_start();
+        if source.starts_with("//") || source.starts_with("--") {
+            source = source
+                .char_indices()
+                .find_map(|(index, character)| (character == '\n' || character == '\r').then_some(&source[index + 1..]))
+                .unwrap_or("");
+            continue;
+        }
+        if source.starts_with("/*") {
+            let Some(end) = source.find("*/") else {
+                return source;
+            };
+            source = &source[end + 2..];
+            continue;
+        }
+        break;
+    }
+
+    let source = source.trim_end();
+    let mut body_end = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let mut characters = source.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        let next = characters.peek().map(|(_, character)| *character);
+        if line_comment {
+            if character == '\n' || character == '\r' {
+                line_comment = false;
+            }
+            continue;
+        }
+        if block_comment {
+            if character == '*' && next == Some('/') {
+                block_comment = false;
+                characters.next();
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            body_end = index + character.len_utf8();
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        if (character == '/' && next == Some('/')) || (character == '-' && next == Some('-')) {
+            line_comment = true;
+            characters.next();
+            continue;
+        }
+        if character == '/' && next == Some('*') {
+            block_comment = true;
+            characters.next();
+            continue;
+        }
+        if matches!(character, '"' | '\'' | '`') {
+            quote = Some(character);
+        }
+        if !character.is_whitespace() {
+            body_end = index + character.len_utf8();
+        }
+    }
+    source[..body_end].trim_end()
+}
+
 fn parse_collection_prefix(source: &str) -> Result<(String, usize), String> {
     if !source.get(..3).is_some_and(|prefix| prefix.eq_ignore_ascii_case("db.")) {
         return Err("MongoDB command must start with db.<collection>.".to_string());
@@ -608,6 +781,24 @@ fn method_call(source: &str, prefix_end: usize, method: &str) -> Option<(Vec<Str
     Some((split_top_level(&source[open + 1..close]), source[close + 1..].trim().to_string()))
 }
 
+fn database_method_call(source: &str, method: &str) -> Option<(Vec<String>, String)> {
+    if !source.get(..2).is_some_and(|prefix| prefix.eq_ignore_ascii_case("db")) {
+        return None;
+    }
+    let after_db = source.get(2..)?.trim_start();
+    let after_dot = after_db.strip_prefix('.')?.trim_start();
+    if !after_dot.get(..method.len()).is_some_and(|name| name.eq_ignore_ascii_case(method)) {
+        return None;
+    }
+    let after_method = after_dot.get(method.len()..)?.trim_start();
+    if !after_method.starts_with('(') {
+        return None;
+    }
+    let open = source.len() - after_method.len();
+    let close = matching_paren(source, open)?;
+    Some((split_top_level(&source[open + 1..close]), source[close + 1..].trim().to_string()))
+}
+
 fn chained_calls(chain: &str) -> Result<Vec<(String, Vec<String>)>, String> {
     let mut rest = chain.trim();
     let mut calls = Vec::new();
@@ -641,11 +832,217 @@ fn parse_string_arg(arg: &str) -> Result<String, String> {
     value.as_str().map(ToOwned::to_owned).ok_or_else(|| "MongoDB argument must be a string.".to_string())
 }
 
+fn parse_explain_verbosity(args: &[String]) -> Result<String, String> {
+    if args.len() > 1 {
+        return Err("MongoDB explain() accepts at most one verbosity string.".to_string());
+    }
+    let verbosity = match args.first() {
+        Some(value) => parse_string_arg(value)?,
+        None => "queryPlanner".to_string(),
+    };
+    match verbosity.as_str() {
+        "queryPlanner" | "executionStats" | "allPlansExecution" => Ok(verbosity),
+        _ => Err("MongoDB explain() verbosity must be queryPlanner, executionStats, or allPlansExecution.".to_string()),
+    }
+}
+
 fn normalized_json(input: &str) -> Result<String, String> {
-    let transformed = transform_shell_constructors(input.trim())?;
+    let transformed = transform_shell_regex_literals(input.trim())?;
+    let transformed = transform_shell_constructors(&transformed)?;
     let value: Value =
         json5::from_str(&transformed).map_err(|error| format!("Invalid MongoDB JSON argument: {error}"))?;
     serde_json::to_string(&value).map_err(|error| error.to_string())
+}
+
+struct ShellRegexLiteral {
+    end: usize,
+    pattern: String,
+    options: String,
+}
+
+fn shell_regex_literal_at(input: &str, index: usize) -> Result<Option<ShellRegexLiteral>, String> {
+    if !input[index..].starts_with('/') || !is_shell_regex_value_position(input, index) {
+        return Ok(None);
+    }
+
+    read_shell_regex_literal(input, index).map(Some)
+}
+
+fn read_shell_regex_literal(input: &str, index: usize) -> Result<ShellRegexLiteral, String> {
+    let mut cursor = index + 1;
+    let mut pattern = String::new();
+    let mut escaped = false;
+    let mut in_character_class = false;
+    let mut closed = false;
+    while cursor < input.len() {
+        let current = input[cursor..].chars().next().ok_or("Invalid MongoDB regex literal.")?;
+        if matches!(current, '\n' | '\r' | '\u{2028}' | '\u{2029}') {
+            return Err("MongoDB regex literals cannot contain an unescaped line break.".to_string());
+        }
+        cursor += current.len_utf8();
+        if escaped {
+            pattern.push(current);
+            escaped = false;
+            continue;
+        }
+        if current == '\\' {
+            pattern.push(current);
+            escaped = true;
+            continue;
+        }
+        if current == '[' {
+            in_character_class = true;
+        } else if current == ']' && in_character_class {
+            in_character_class = false;
+        } else if current == '/' && !in_character_class {
+            closed = true;
+            break;
+        }
+        pattern.push(current);
+    }
+    if !closed {
+        return Err("Unclosed MongoDB regex literal.".to_string());
+    }
+
+    let mut options = Vec::new();
+    while cursor < input.len() {
+        let option = input[cursor..].chars().next().ok_or("Invalid MongoDB regex literal.")?;
+        if !option.is_ascii_alphabetic() {
+            break;
+        }
+        // JS-only regex flags (d/g/v/y) have no server-side meaning for a
+        // stored regex literal — MongoDB's $regex has no global modifier — so
+        // drop them instead of failing the whole command.
+        if matches!(option, 'd' | 'g' | 'v' | 'y') {
+            cursor += option.len_utf8();
+            continue;
+        }
+        if !matches!(option, 'i' | 'm' | 's' | 'u') || options.contains(&option) {
+            return Err(format!("Unsupported or duplicate MongoDB regex option: {option}"));
+        }
+        options.push(option);
+        cursor += option.len_utf8();
+    }
+    options.sort_unstable();
+    Ok(ShellRegexLiteral { end: cursor, pattern, options: options.into_iter().collect() })
+}
+
+fn transform_shell_regex_literals(input: &str) -> Result<String, String> {
+    let mut output = String::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        let rest = &input[index..];
+        let ch = rest.chars().next().ok_or("Invalid MongoDB argument.")?;
+
+        if matches!(ch, '"' | '\'') {
+            let start = index;
+            index += ch.len_utf8();
+            let mut escaped = false;
+            while index < input.len() {
+                let current = input[index..].chars().next().ok_or("Invalid MongoDB argument.")?;
+                index += current.len_utf8();
+                if escaped {
+                    escaped = false;
+                } else if current == '\\' {
+                    escaped = true;
+                } else if current == ch {
+                    break;
+                }
+            }
+            output.push_str(&input[start..index]);
+            continue;
+        }
+
+        if rest.starts_with("//") {
+            let end = rest.find(['\n', '\r']).map(|offset| index + offset).unwrap_or(input.len());
+            output.push_str(&input[index..end]);
+            index = end;
+            continue;
+        }
+        if rest.starts_with("/*") {
+            let end = rest.find("*/").map(|offset| index + offset + 2).unwrap_or(input.len());
+            output.push_str(&input[index..end]);
+            index = end;
+            continue;
+        }
+
+        if ch != '/' || !is_shell_regex_value_position(input, index) {
+            output.push(ch);
+            index += ch.len_utf8();
+            continue;
+        }
+
+        let literal = shell_regex_literal_at(input, index)?.ok_or("Invalid MongoDB regex literal.")?;
+        output.push_str(
+            &serde_json::to_string(&serde_json::json!({
+                "$regularExpression": {
+                    "pattern": literal.pattern,
+                    "options": literal.options,
+                }
+            }))
+            .map_err(|error| error.to_string())?,
+        );
+        index = literal.end;
+    }
+    Ok(output)
+}
+
+fn is_shell_regex_value_position(input: &str, index: usize) -> bool {
+    let mut previous_significant = None;
+    let mut cursor = 0;
+    while cursor < index {
+        let rest = &input[cursor..];
+        let current = rest.chars().next().expect("cursor is on a character boundary");
+
+        if matches!(current, '"' | '\'') {
+            let quote = current;
+            cursor += current.len_utf8();
+            let mut escaped = false;
+            while cursor < index {
+                let character = input[cursor..].chars().next().expect("cursor is on a character boundary");
+                cursor += character.len_utf8();
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == quote {
+                    break;
+                }
+            }
+            previous_significant = Some('\0');
+            continue;
+        }
+
+        if rest.starts_with("//") {
+            cursor = rest.find(['\n', '\r']).map(|offset| cursor + offset).unwrap_or(index).min(index);
+            continue;
+        }
+        if rest.starts_with("/*") {
+            cursor = rest.find("*/").map(|offset| cursor + offset + 2).unwrap_or(index).min(index);
+            continue;
+        }
+
+        if current == '/' && is_shell_regex_value_prefix(previous_significant) {
+            if let Ok(literal) = read_shell_regex_literal(input, cursor) {
+                if literal.end <= index {
+                    previous_significant = Some('\0');
+                    cursor = literal.end;
+                    continue;
+                }
+            }
+        }
+
+        if !current.is_whitespace() {
+            previous_significant = Some(current);
+        }
+        cursor += current.len_utf8();
+    }
+
+    is_shell_regex_value_prefix(previous_significant)
+}
+
+fn is_shell_regex_value_prefix(previous_significant: Option<char>) -> bool {
+    previous_significant.is_none_or(|character| matches!(character, ':' | '[' | ',' | '('))
 }
 
 fn transform_shell_constructors(input: &str) -> Result<String, String> {
@@ -653,6 +1050,25 @@ fn transform_shell_constructors(input: &str) -> Result<String, String> {
     let mut index = 0;
     while index < input.len() {
         let rest = &input[index..];
+        let ch = rest.chars().next().ok_or("Invalid MongoDB argument.")?;
+        if matches!(ch, '"' | '\'') {
+            let start = index;
+            index += ch.len_utf8();
+            let mut escaped = false;
+            while index < input.len() {
+                let current = input[index..].chars().next().ok_or("Invalid MongoDB argument.")?;
+                index += current.len_utf8();
+                if escaped {
+                    escaped = false;
+                } else if current == '\\' {
+                    escaped = true;
+                } else if current == ch {
+                    break;
+                }
+            }
+            output.push_str(&input[start..index]);
+            continue;
+        }
         let constructor = if rest.starts_with("ObjectId(") {
             Some("ObjectId(")
         } else if rest.starts_with("ISODate(") {
@@ -661,7 +1077,6 @@ fn transform_shell_constructors(input: &str) -> Result<String, String> {
             None
         };
         let Some(constructor) = constructor else {
-            let ch = rest.chars().next().ok_or("Invalid MongoDB argument.")?;
             output.push(ch);
             index += ch.len_utf8();
             continue;
@@ -739,14 +1154,15 @@ fn aggregate_writes(pipeline: &str) -> bool {
 }
 
 fn matching_paren(source: &str, open: usize) -> Option<usize> {
-    let bytes = source.as_bytes();
     let mut depth = 0;
     let mut quote = None;
     let mut escape = false;
-    for (index, byte) in bytes.iter().enumerate().skip(open) {
-        let ch = *byte as char;
+    let mut index = open;
+    while index < source.len() {
+        let ch = source[index..].chars().next()?;
         if escape {
             escape = false;
+            index += ch.len_utf8();
             continue;
         }
         if quote.is_some() {
@@ -755,10 +1171,16 @@ fn matching_paren(source: &str, open: usize) -> Option<usize> {
             } else if Some(ch) == quote {
                 quote = None;
             }
+            index += ch.len_utf8();
             continue;
         }
         if ch == '\'' || ch == '"' || ch == '`' {
             quote = Some(ch);
+        } else if ch == '/' && is_shell_regex_value_position(source, index) {
+            if let Ok(Some(literal)) = shell_regex_literal_at(source, index) {
+                index = literal.end;
+                continue;
+            }
         } else if ch == '(' {
             depth += 1;
         } else if ch == ')' {
@@ -767,6 +1189,7 @@ fn matching_paren(source: &str, open: usize) -> Option<usize> {
                 return Some(index);
             }
         }
+        index += ch.len_utf8();
     }
     None
 }
@@ -780,10 +1203,12 @@ fn split_top_level(source: &str) -> Vec<String> {
     let mut depth = 0;
     let mut quote = None;
     let mut escape = false;
-    for (index, byte) in source.as_bytes().iter().enumerate() {
-        let ch = *byte as char;
+    let mut index = 0;
+    while index < source.len() {
+        let ch = source[index..].chars().next().expect("index is on a character boundary");
         if escape {
             escape = false;
+            index += ch.len_utf8();
             continue;
         }
         if quote.is_some() {
@@ -792,10 +1217,16 @@ fn split_top_level(source: &str) -> Vec<String> {
             } else if Some(ch) == quote {
                 quote = None;
             }
+            index += ch.len_utf8();
             continue;
         }
         if ch == '\'' || ch == '"' || ch == '`' {
             quote = Some(ch);
+        } else if ch == '/' && is_shell_regex_value_position(source, index) {
+            if let Ok(Some(literal)) = shell_regex_literal_at(source, index) {
+                index = literal.end;
+                continue;
+            }
         } else if matches!(ch, '(' | '[' | '{') {
             depth += 1;
         } else if matches!(ch, ')' | ']' | '}') {
@@ -804,6 +1235,7 @@ fn split_top_level(source: &str) -> Vec<String> {
             result.push(source[start..index].trim().to_string());
             start = index + 1;
         }
+        index += ch.len_utf8();
     }
     result.push(source[start..].trim().to_string());
     result
@@ -822,10 +1254,62 @@ mod tests {
                 filter: r#"{"_id":{"$oid":"507f1f77bcf86cd799439011"}}"#.to_string(),
                 projection: Some(r#"{"title":1,"_id":0}"#.to_string()),
                 sort: Some(r#"{"title":1}"#.to_string()),
+                collation: None,
                 skip: 0,
                 limit: 1,
             }
         );
+    }
+
+    #[test]
+    fn parses_find_with_collation_chain() {
+        assert_eq!(
+            parse(r#"db.t_user.find({name: 'xxx'}).collation({ locale: "en", strength: 1 }).limit(20)"#).unwrap(),
+            MongoCommand::Find {
+                collection: "t_user".to_string(),
+                filter: r#"{"name":"xxx"}"#.to_string(),
+                projection: None,
+                sort: None,
+                collation: Some(r#"{"locale":"en","strength":1}"#.to_string()),
+                skip: 0,
+                limit: 20,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_find_explain_with_query_options_and_verbosity() {
+        let command = parse(
+            r#"db.im_msg.find({active: true}, {email: 1}).sort({email: 1}).collation({locale: "en", strength: 1}).skip(2).limit(5).explain("executionStats")"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(command).unwrap(),
+            serde_json::json!({
+                "kind": "findExplain",
+                "collection": "im_msg",
+                "filter": "{\"active\":true}",
+                "projection": "{\"email\":1}",
+                "sort": "{\"email\":1}",
+                "collation": "{\"locale\":\"en\",\"strength\":1}",
+                "skip": 2,
+                "limit": 5,
+                "verbosity": "executionStats"
+            })
+        );
+    }
+
+    #[test]
+    fn find_explain_defaults_and_validates_verbosity() {
+        let default = serde_json::to_value(parse("db.items.find({}).explain()").unwrap()).unwrap();
+        assert_eq!(default["verbosity"], "queryPlanner");
+
+        let all_plans = serde_json::to_value(parse("db.items.find({}).explain('allPlansExecution')").unwrap()).unwrap();
+        assert_eq!(all_plans["verbosity"], "allPlansExecution");
+
+        assert!(parse("db.items.find({}).explain('invalid')").unwrap_err().contains("verbosity"));
+        assert!(parse("db.items.find({}).explain('executionStats').limit(1)").unwrap_err().contains("final"));
     }
 
     #[test]
@@ -846,6 +1330,86 @@ mod tests {
         let legacy_update = parse("db.projects.update({}, {$set: {active: false}}, {multi: true})").unwrap();
         assert!(legacy_update.has_empty_filter());
         assert_eq!(validate_safety(&legacy_update, true, false, false), Err(MongoSafetyError::EmptyFilter));
+    }
+
+    #[test]
+    fn parses_create_user_as_a_dangerous_write() {
+        let command = parse(
+            r#"db . createUser({user: "test-db", pwd: "test-password", roles: [{role: "readWrite", db: "db1"}]}, {w: "majority"})"#,
+        )
+        .unwrap();
+        assert_eq!(
+            command,
+            MongoCommand::CreateUser {
+                user_json: r#"{"user":"test-db","pwd":"test-password","roles":[{"role":"readWrite","db":"db1"}]}"#
+                    .to_string(),
+                write_concern_json: Some(r#"{"w":"majority"}"#.to_string()),
+            }
+        );
+        assert!(command.is_mutating());
+        assert!(command.is_dangerous());
+        assert_eq!(validate_safety(&command, true, false, false), Err(MongoSafetyError::Dangerous));
+        assert_eq!(validate_safety(&command, true, true, false), Ok(()));
+        assert!(parse(r#"db.createUser({pwd: "missing-user", roles: []})"#).is_err());
+        assert!(parse(r#"db.createUser({user: "test"}, "majority")"#).is_err());
+    }
+
+    #[test]
+    fn parses_run_command_as_a_dangerous_write() {
+        let command = parse(
+            r#"db.runCommand({
+                find: "orders",
+                filter: {_id: ObjectId("507f1f77bcf86cd799439011")},
+                createdAt: ISODate("2025-01-01T00:00:00Z")
+            })"#,
+        )
+        .unwrap();
+        assert_eq!(
+            command,
+            MongoCommand::RunCommand {
+                command_json: r#"{"find":"orders","filter":{"_id":{"$oid":"507f1f77bcf86cd799439011"}},"createdAt":{"$date":"2025-01-01T00:00:00Z"}}"#.to_string(),
+            }
+        );
+        assert!(command.is_mutating());
+        assert!(command.is_dangerous());
+        assert_eq!(validate_safety(&command, false, false, false), Err(MongoSafetyError::WritesDisabled));
+        assert_eq!(validate_safety(&command, true, false, false), Err(MongoSafetyError::Dangerous));
+        assert_eq!(validate_safety(&command, true, true, false), Ok(()));
+    }
+
+    #[test]
+    fn parses_show_databases_aliases_as_read_only() {
+        for source in [
+            "show dbs",
+            "SHOW DATABASES;",
+            "ShOw DbS ;",
+            "/* databases */ show dbs -- list",
+            "// databases\nshow databases; /* list */",
+        ] {
+            let command = parse(source).unwrap();
+            assert_eq!(command, MongoCommand::ShowDatabases, "{source}");
+            assert!(!command.is_mutating(), "{source}");
+            assert!(!command.is_dangerous(), "{source}");
+            assert_eq!(validate_safety(&command, false, false, true), Ok(()), "{source}");
+        }
+
+        for source in ["show dbs extra", "show database", "show collections", "show"] {
+            assert!(parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_run_command_shapes() {
+        for source in [
+            "db.runCommand()",
+            "db.runCommand({})",
+            "db.runCommand('ping')",
+            "db.runCommand({ping: 1}, {readPreference: 'primary'})",
+            "db.runCommand({ping: 1}).valueOf()",
+            "db.runCommand([1, 2, 3])",
+        ] {
+            assert!(parse(source).unwrap_err().contains("runCommand"), "{source}");
+        }
     }
 
     #[test]
@@ -892,6 +1456,130 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(update, MongoCommand::Update { many: true, options: Some(_), .. }));
+    }
+
+    #[test]
+    fn parses_mongo_shell_regex_literals_in_update_filters() {
+        let command = parse(
+            r#"db.code_info.updateMany(
+                { level: "SECOND_LAYER", position: "B", packagingRatio: /^[^:：]*盒/, type: { $ne: "PACK_IN" } },
+                { $set: { type: "PACK_IN" }, $currentDate: { lastUpdateTime: true } }
+            )"#,
+        )
+        .unwrap();
+        let MongoCommand::Update { collection, filter, many, .. } = command else {
+            panic!("expected update command");
+        };
+
+        assert_eq!(collection, "code_info");
+        assert!(many);
+        assert_eq!(
+            serde_json::from_str::<Value>(&filter).unwrap(),
+            serde_json::json!({
+                "level": "SECOND_LAYER",
+                "position": "B",
+                "packagingRatio": {
+                    "$regularExpression": {
+                        "pattern": "^[^:：]*盒",
+                        "options": "",
+                    }
+                },
+                "type": { "$ne": "PACK_IN" },
+            })
+        );
+    }
+
+    #[test]
+    fn drops_js_only_regex_literal_flags() {
+        let command = parse(r#"db.items.find({ value: /abc/gi })"#).unwrap();
+        let MongoCommand::Find { filter, .. } = command else {
+            panic!("expected find command");
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&filter).unwrap(),
+            serde_json::json!({
+                "value": {
+                    "$regularExpression": {
+                        "pattern": "abc",
+                        "options": "i",
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn ignores_delimiters_inside_mongo_shell_regex_literals() {
+        let command = parse(r#"db.items.updateMany({ value: /a\),b/ }, { $set: { matched: true } })"#).unwrap();
+        let MongoCommand::Update { filter, many, .. } = command else {
+            panic!("expected update command");
+        };
+
+        assert!(many);
+        assert_eq!(
+            serde_json::from_str::<Value>(&filter).unwrap(),
+            serde_json::json!({
+                "value": {
+                    "$regularExpression": {
+                        "pattern": r#"a\),b"#,
+                        "options": "",
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn normalizes_regex_literal_edges_without_touching_strings_or_comments() {
+        let normalized = normalized_json(
+            r#"{
+                pattern: /a\/b[/:：]/mi,
+                constructorText: "ObjectId('literal')",
+                url: "https://example.com/a/b",
+                // slash comments stay comments
+                active: true,
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&normalized).unwrap(),
+            serde_json::json!({
+                "pattern": {
+                    "$regularExpression": {
+                        "pattern": r#"a\/b[/:：]"#,
+                        "options": "im",
+                    }
+                },
+                "constructorText": "ObjectId('literal')",
+                "url": "https://example.com/a/b",
+                "active": true,
+            })
+        );
+
+        for source in ["{pattern: /unterminated}", "{pattern: /value/ii}", "{pattern: /value/q}"] {
+            assert!(normalized_json(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn normalizes_regex_literals_after_comments() {
+        let normalized = normalized_json(
+            r#"{
+                block: /* explain the pattern */ /block/i,
+                line: // explain the next pattern
+                    /line/m,
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&normalized).unwrap(),
+            serde_json::json!({
+                "block": { "$regularExpression": { "pattern": "block", "options": "i" } },
+                "line": { "$regularExpression": { "pattern": "line", "options": "m" } },
+            })
+        );
     }
 
     #[test]
@@ -993,6 +1681,15 @@ mod tests {
         let count = serde_json::to_value(parse("db.items.count({})").unwrap()).unwrap();
         assert_eq!(count["kind"], "countDocuments");
         assert_eq!(count["accurate"], false);
+        let create_user =
+            serde_json::to_value(parse(r#"db.createUser({user: "app", pwd: "secret", roles: []})"#).unwrap()).unwrap();
+        assert_eq!(create_user["kind"], "createUser");
+        assert_eq!(create_user["userJson"], r#"{"user":"app","pwd":"secret","roles":[]}"#);
+        let run_command = serde_json::to_value(parse("db.runCommand({ping: 1})").unwrap()).unwrap();
+        assert_eq!(run_command["kind"], "runCommand");
+        assert_eq!(run_command["commandJson"], r#"{"ping":1}"#);
+        let show_databases = serde_json::to_value(parse("show dbs").unwrap()).unwrap();
+        assert_eq!(show_databases["kind"], "showDatabases");
     }
 
     #[test]

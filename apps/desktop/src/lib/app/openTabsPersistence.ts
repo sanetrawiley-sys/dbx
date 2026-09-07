@@ -9,6 +9,7 @@ export interface SavedQueryResultRun {
   sequence: number;
   sql: string;
   createdAt: number;
+  pinned?: boolean;
   activeResultIndex?: number;
   resultCacheKey?: string;
   resultEvicted?: boolean;
@@ -16,6 +17,7 @@ export interface SavedQueryResultRun {
 
 export interface SavedOpenTab {
   id: string;
+  createdAt?: number;
   title: string;
   customTitle?: boolean;
   connectionId: string;
@@ -26,6 +28,9 @@ export interface SavedOpenTab {
   originalSql?: string;
   savedSqlId?: string;
   externalSqlPath?: string;
+  externalSqlFileVersion?: QueryTab["externalSqlFileVersion"];
+  externalSqlIgnoredFileVersion?: QueryTab["externalSqlIgnoredFileVersion"];
+  externalSqlFileMissing?: boolean;
   lastExecutedSql?: string;
   resultBaseSql?: string;
   resultSortedSql?: string;
@@ -39,6 +44,7 @@ export interface SavedOpenTab {
   whereInput?: string;
   pinned?: boolean;
   mode?: QueryTab["mode"];
+  autoCommit?: boolean;
   mqTenant?: string;
   mqInitialTab?: QueryTab["mqInitialTab"];
   nacosNamespace?: string;
@@ -46,6 +52,8 @@ export interface SavedOpenTab {
   structureTableName?: string;
   objectBrowser?: QueryTab["objectBrowser"];
   objectSource?: QueryTab["objectSource"];
+  sourceView?: boolean;
+  tableComment?: QueryTab["tableComment"];
   tableMeta?: QueryTab["tableMeta"];
   mongoEditTarget?: QueryTab["mongoEditTarget"];
   resultEvicted?: boolean;
@@ -58,6 +66,23 @@ export interface SavedOpenTab {
 export interface RestoredOpenTabs {
   tabs: QueryTab[];
   activeTabId: string | null;
+}
+
+/** Group membership persisted with the open-tabs payload. */
+export interface PersistedEditorGroup {
+  id: string;
+  tabIds: string[];
+  activeTabId: string | null;
+}
+
+/** Shared open-tabs transport payload — the single definition both backend adapters persist. */
+export interface OpenTabsStatePayload {
+  tabs: unknown[];
+  activeTabId: string | null;
+  groups?: PersistedEditorGroup[];
+  focusedGroupId?: string;
+  orientation?: "vertical" | "horizontal";
+  sizes?: number[];
 }
 
 export type OpenTabsRestoreFilter = "all" | "pinned";
@@ -74,7 +99,7 @@ function shouldPersistTabSql(tab: QueryTab) {
 
 function restoredOriginalSql(tab: SavedOpenTab, mode: QueryTab["mode"], sql: string) {
   if (mode !== "query") return undefined;
-  if (tab.externalSqlPath) return sql;
+  if (tab.externalSqlPath) return tab.originalSql ?? sql;
   if (tab.savedSqlId) return sql ? "" : undefined;
   // Prefer the persisted originalSql so a clean prefilled query tab (sql === originalSql)
   // restores clean instead of being marked dirty. Older saved state without this field
@@ -86,6 +111,7 @@ function restoredOriginalSql(tab: SavedOpenTab, mode: QueryTab["mode"], sql: str
 export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
   return tabs.map((tab) => ({
     id: tab.id,
+    ...(typeof tab.createdAt === "number" ? { createdAt: tab.createdAt } : {}),
     title: tab.title,
     ...(tab.customTitle ? { customTitle: true } : {}),
     connectionId: tab.connectionId,
@@ -93,12 +119,14 @@ export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
     ...(tab.catalog !== undefined ? { catalog: tab.catalog } : {}),
     schema: tab.schema,
     sql: shouldPersistTabSql(tab) ? tab.sql : "",
-    // Only round-trip originalSql for plain query tabs (no savedSqlId / externalSqlPath):
-    // saved-SQL and external-file tabs re-derive it on restore, and persisting it here
-    // would duplicate their (potentially large) SQL text in the open-tabs state.
-    ...(tab.originalSql !== undefined && !tab.savedSqlId && !tab.externalSqlPath ? { originalSql: tab.originalSql } : {}),
+    // Plain query tabs always round-trip originalSql. External-file tabs only persist it
+    // while dirty so their disk baseline survives restart without duplicating clean SQL.
+    ...(tab.originalSql !== undefined && !tab.savedSqlId && (!tab.externalSqlPath || tab.sql !== tab.originalSql) ? { originalSql: tab.originalSql } : {}),
     savedSqlId: tab.savedSqlId,
     externalSqlPath: tab.externalSqlPath,
+    ...(tab.externalSqlFileVersion ? { externalSqlFileVersion: tab.externalSqlFileVersion } : {}),
+    ...(tab.externalSqlIgnoredFileVersion ? { externalSqlIgnoredFileVersion: tab.externalSqlIgnoredFileVersion } : {}),
+    ...(tab.externalSqlFileMissing ? { externalSqlFileMissing: true } : {}),
     ...(tab.lastExecutedSql !== undefined ? { lastExecutedSql: tab.lastExecutedSql } : {}),
     ...(tab.resultBaseSql !== undefined ? { resultBaseSql: tab.resultBaseSql } : {}),
     ...(tab.resultSortedSql !== undefined ? { resultSortedSql: tab.resultSortedSql } : {}),
@@ -112,6 +140,7 @@ export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
     ...(tab.whereInput !== undefined ? { whereInput: tab.whereInput } : {}),
     pinned: tab.pinned,
     mode: tab.mode,
+    ...(tab.mode === "query" && tab.autoCommit !== undefined ? { autoCommit: tab.autoCommit } : {}),
     ...(tab.mqTenant !== undefined ? { mqTenant: tab.mqTenant } : {}),
     ...(tab.mqInitialTab !== undefined ? { mqInitialTab: tab.mqInitialTab } : {}),
     ...(tab.nacosNamespace !== undefined ? { nacosNamespace: tab.nacosNamespace } : {}),
@@ -119,6 +148,8 @@ export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
     ...(tab.structureTableName !== undefined ? { structureTableName: tab.structureTableName } : {}),
     objectBrowser: tab.objectBrowser,
     objectSource: tab.objectSource,
+    ...(tab.sourceView ? { sourceView: true } : {}),
+    ...(tab.tableComment !== undefined ? { tableComment: tab.tableComment } : {}),
     tableMeta: tab.tableMeta,
     ...(tab.mongoEditTarget !== undefined ? { mongoEditTarget: tab.mongoEditTarget } : {}),
     ...(tab.mode !== "data" && tab.resultEvicted ? { resultEvicted: true } : {}),
@@ -131,6 +162,7 @@ export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
             sequence: run.sequence,
             sql: run.sql,
             createdAt: run.createdAt,
+            ...(run.pinned ? { pinned: true } : {}),
             activeResultIndex: run.activeResultIndex,
             ...(run.resultCacheKey !== undefined ? { resultCacheKey: run.resultCacheKey } : {}),
             ...(run.resultEvicted ? { resultEvicted: true } : {}),
@@ -179,6 +211,7 @@ function restoreOpenTabsArray(parsed: unknown, rawActiveTabId: string | null, op
         isExecuting: false,
         isCancelling: false,
         queryExecutionStartedAt: undefined,
+        executingResultRunId: undefined,
         editorViewport: undefined,
         editorSelection: undefined,
         isExplaining: false,

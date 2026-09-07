@@ -91,6 +91,11 @@ public final class JsonRpcServer {
     Object dispatchForRuntime(String method, JsonObject params) throws Exception {
         return AgentExecutionContext.withJdbcExecutor(jdbcExecutor, () -> {
             AbstractJdbcAgent jdbcAgent = pooledJdbcAgent();
+            if (AgentProtocol.METHOD_VALIDATE_CONNECTION.equals(method)
+                && jdbcAgent != null
+                && jdbcAgent.hasActivePooledLeases()) {
+                return Collections.singletonMap("ok", true);
+            }
             boolean manageConnection = jdbcAgent != null && requiresConnectedConnection(method);
             if (manageConnection) {
                 jdbcAgent.beginPooledRequest();
@@ -157,7 +162,8 @@ public final class JsonRpcServer {
         if (AgentProtocol.METHOD_TEST_CONNECTION.equals(method)) {
             Map<String, Object> result = agent.testConnectionWithInfo(gson.fromJson(params, ConnectParams.class));
             if (!Boolean.TRUE.equals(result.get("ok"))) {
-                throw new RuntimeException("Connection failed");
+                Object error = result.get("error");
+                throw new RuntimeException(error == null ? "Connection failed" : String.valueOf(error));
             }
             return result;
         }
@@ -166,8 +172,10 @@ public final class JsonRpcServer {
             boolean valid = false;
             if (conn != null) {
                 try {
-                    valid = !conn.isClosed() && conn.isValid(2);
-                } catch (Exception ignored) {
+                    valid = agent instanceof AbstractJdbcAgent jdbcAgent
+                        ? jdbcAgent.isConnectionValid(conn, 2)
+                        : !conn.isClosed() && conn.isValid(2);
+                } catch (Exception | AbstractMethodError ignored) {
                 }
             }
             if (!valid) {
@@ -365,8 +373,10 @@ public final class JsonRpcServer {
         }
         boolean valid = false;
         try {
-            valid = !conn.isClosed() && conn.isValid(2);
-        } catch (Exception ignored) {
+            valid = agent instanceof AbstractJdbcAgent validationAgent
+                ? validationAgent.isConnectionValid(conn, 2)
+                : !conn.isClosed() && conn.isValid(2);
+        } catch (Exception | AbstractMethodError ignored) {
         }
         if (valid) {
             lastConnectionValidationTimeMillis = now;

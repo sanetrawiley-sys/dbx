@@ -8,6 +8,37 @@ const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 const MIN_BSON_INT64 = -9223372036854775808n;
 const MAX_BSON_INT64 = 9223372036854775807n;
 const MONGO_EXTENDED_JSON_VALUE_KEYS = new Set(["$binary", "$code", "$date", "$dbPointer", "$maxKey", "$minKey", "$numberDecimal", "$numberDouble", "$numberInt", "$numberLong", "$oid", "$regularExpression", "$symbol", "$timestamp", "$undefined", "$uuid"]);
+const MONGO_EXTENDED_JSON_NUMERIC_TYPES = new Map([
+  ["$numberInt", "int32"],
+  ["$numberLong", "int64"],
+  ["$numberDouble", "double"],
+  ["$numberDecimal", "decimal128"],
+] as const);
+
+function mongoDocumentNumericValueType(value: unknown): string | undefined {
+  if (typeof value === "number") return "number";
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+
+  const object = value as Record<string, unknown>;
+  const keys = Object.keys(object);
+  if (keys.length !== 1) return undefined;
+  const key = keys[0] as "$numberInt" | "$numberLong" | "$numberDouble" | "$numberDecimal";
+  return typeof object[key] === "string" ? MONGO_EXTENDED_JSON_NUMERIC_TYPES.get(key) : undefined;
+}
+
+export function mongoDocumentGridColumnTypes(documents: readonly Record<string, unknown>[], columns: readonly string[]): string[] {
+  return columns.map((column) => {
+    let inferredType: string | undefined;
+    for (const document of documents) {
+      const value = document[column];
+      if (value === undefined || value === null) continue;
+      const numericType = mongoDocumentNumericValueType(value);
+      if (!numericType) return "";
+      inferredType = inferredType && inferredType !== numericType ? "number" : numericType;
+    }
+    return inferredType ?? "";
+  });
+}
 
 export function mongoShellDateToExtendedJson(value: unknown): unknown {
   if (typeof value !== "string") return value;
@@ -21,7 +52,9 @@ export function parseMongoDocumentInputValue(raw: MongoInputValue): unknown {
 
   const trimmed = raw.trim();
   if (trimmed === "NULL") return null;
-  if (/^(true|false|null)$/i.test(trimmed)) return JSON.parse(trimmed.toLowerCase());
+  if (/^true$/i.test(trimmed)) return true;
+  if (/^false$/i.test(trimmed)) return false;
+  if (/^null$/i.test(trimmed)) return null;
 
   const shellDate = mongoShellDateToExtendedJson(trimmed);
   if (shellDate !== trimmed) return shellDate;
@@ -37,12 +70,18 @@ export function parseMongoDocumentInputValue(raw: MongoInputValue): unknown {
   }
   if (/^-?\d+\.\d+$/.test(trimmed)) return Number(trimmed);
   if (trimmed.startsWith("{") || trimmed.startsWith("[") || trimmed.startsWith('"')) {
-    return mongoShellDateToExtendedJson(JSON.parse(trimmed));
+    try {
+      return mongoShellDateToExtendedJson(JSON.parse(trimmed));
+    } catch {
+      // JSON-shaped text is still valid user data when it is not valid JSON.
+      return raw;
+    }
   }
   return raw;
 }
 
 export function mongoDocumentDisplayValue(value: unknown): unknown {
+  if (value === null) return "NULL";
   if (value && typeof value === "object" && !Array.isArray(value)) {
     const object = value as Record<string, unknown>;
     if (Object.keys(object).length === 1 && typeof object.$numberLong === "string") return `NumberLong(${JSON.stringify(object.$numberLong)})`;

@@ -8,7 +8,7 @@ import type { UpdateDownloadSource as SettingsUpdateDownloadSource } from "@/sto
 import type { UpdateDownloadProgress } from "@/lib/backend/tauri";
 import { currentLocale } from "@/i18n";
 import { shouldBlockAppUpdate } from "@/lib/app/appUpdateTaskGuard";
-import { downloadAndInstallUpdateWhenIdle, installDownloadedUpdateWhenIdle } from "@/lib/app/appUpdateInstallFlow";
+import { installDownloadedUpdateWhenIdle } from "@/lib/app/appUpdateInstallFlow";
 
 interface UseAppUpdaterOptions {
   getActiveTaskCount?: () => number;
@@ -20,6 +20,62 @@ export function shouldOpenUpdateDialog(options: { silent?: boolean }) {
 
 export function canDownloadAndInstallUpdate(info: api.UpdateInfo | null, isDesktop: boolean) {
   return isDesktop && info?.update_available === true && info.manual_update_only !== true;
+}
+
+interface ParsedUpdateVersion {
+  core: [string, string, string];
+  prerelease: string[];
+}
+
+function normalizeUpdateVersion(version: string): string {
+  return version.trim().replace(/^[vV]/, "");
+}
+
+function parseUpdateVersion(version: string): ParsedUpdateVersion | null {
+  const match = normalizeUpdateVersion(version).match(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/);
+  if (!match) return null;
+  return {
+    core: [match[1], match[2], match[3]],
+    prerelease: match[4]?.split(".") ?? [],
+  };
+}
+
+function compareNumericVersionIdentifier(left: string, right: string): number {
+  if (left.length !== right.length) return left.length < right.length ? -1 : 1;
+  return left === right ? 0 : left < right ? -1 : 1;
+}
+
+function compareParsedUpdateVersions(left: ParsedUpdateVersion, right: ParsedUpdateVersion): number {
+  for (let index = 0; index < left.core.length; index += 1) {
+    const comparison = compareNumericVersionIdentifier(left.core[index], right.core[index]);
+    if (comparison !== 0) return comparison;
+  }
+  if (!left.prerelease.length || !right.prerelease.length) {
+    if (left.prerelease.length === right.prerelease.length) return 0;
+    return left.prerelease.length ? -1 : 1;
+  }
+  const length = Math.max(left.prerelease.length, right.prerelease.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftIdentifier = left.prerelease[index];
+    const rightIdentifier = right.prerelease[index];
+    if (leftIdentifier === undefined || rightIdentifier === undefined) return leftIdentifier === undefined ? -1 : 1;
+    if (leftIdentifier === rightIdentifier) continue;
+    const leftNumeric = /^\d+$/.test(leftIdentifier);
+    const rightNumeric = /^\d+$/.test(rightIdentifier);
+    if (leftNumeric && rightNumeric) return compareNumericVersionIdentifier(leftIdentifier, rightIdentifier);
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+    return leftIdentifier < rightIdentifier ? -1 : 1;
+  }
+  return 0;
+}
+
+export function isUpdateIgnored(info: api.UpdateInfo | null, ignoredVersion: string | undefined): boolean {
+  const latest = info?.latest_version;
+  if (!latest || !ignoredVersion) return false;
+  const parsedLatest = parseUpdateVersion(latest);
+  const parsedIgnored = parseUpdateVersion(ignoredVersion);
+  if (!parsedLatest || !parsedIgnored) return normalizeUpdateVersion(latest) === normalizeUpdateVersion(ignoredVersion);
+  return compareParsedUpdateVersions(parsedLatest, parsedIgnored) <= 0;
 }
 
 export function normalizeUpdateDownloadSource(value: unknown): SettingsUpdateDownloadSource {
@@ -38,6 +94,7 @@ export function resolveUpdateReleaseUrl(info: api.UpdateInfo | null, source: unk
   if (normalizedSource === "cnb" && info?.latest_version) {
     return `https://cnb.cool/dbxio.com/dbx/-/releases/tag/${tagVersion(info.latest_version)}`;
   }
+  if (normalizedSource === "cnb") return "https://cnb.cool/dbxio.com/dbx/-/releases";
   return info?.release_url || fallbackUrl;
 }
 
@@ -59,14 +116,17 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   const checkingUpdates = ref(false);
   const updateInfo = ref<api.UpdateInfo | null>(null);
   const updateCheckMessage = ref("");
+  const updateCheckFailed = ref(false);
   const showUpdateDialog = ref(false);
   const isDownloadingUpdate = ref(false);
-  const downloadProgress = ref(0);
+  // null while the download size is unknown (backend reported no total) — the UI shows an indeterminate state.
+  const downloadProgress = ref<number | null>(0);
   const updateDownloaded = ref(false);
   const isInstallingUpdate = ref(false);
   const updateReady = ref(false);
+  const isIgnoringUpdate = ref(false);
   const activeTaskCount = computed(() => Math.max(0, Math.trunc(options.getActiveTaskCount?.() ?? 0)));
-  const hasUpdateAvailable = computed(() => updateInfo.value?.update_available === true);
+  const hasUpdateAvailable = computed(() => updateInfo.value?.update_available === true && !isUpdateIgnored(updateInfo.value, settingsStore.editorSettings.ignoredUpdateVersion));
   const latestReleaseUrl = "https://github.com/t8y2/dbx/releases/latest";
   let activeDownloadAttempt = 0;
   let pendingCancellation: Promise<void> | undefined;
@@ -81,11 +141,21 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
 
   async function checkUpdates(options: { silent?: boolean } = {}) {
     if (checkingUpdates.value) return;
+    // The toolbar icon reuses this as its click handler. If a download/install is already
+    // in flight or finished, just resurface the dialog instead of hitting the network again.
+    if (!options.silent && (isDownloadingUpdate.value || updateDownloaded.value || updateReady.value)) {
+      showUpdateDialog.value = true;
+      return;
+    }
     checkingUpdates.value = true;
-    updateCheckMessage.value = "";
+    // Keep the previous message/failed state visible while the check is in
+    // flight: pre-clearing would flip the dialog to "up to date" with an empty
+    // version and unmount the source switcher until the request settles.
     try {
       const info = await api.checkForUpdates(currentLocale(), normalizeUpdateDownloadSource(settingsStore.editorSettings.updateDownloadSource));
       updateInfo.value = info;
+      updateCheckMessage.value = "";
+      updateCheckFailed.value = false;
       if (info.update_available) {
         if (shouldOpenUpdateDialog({ silent: options.silent })) {
           showUpdateDialog.value = true;
@@ -96,7 +166,13 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
       }
     } catch (e: any) {
       if (!options.silent) {
+        // Drop the stale update info only on a surfaced failure; silent
+        // background checks keep the last known state so the toolbar
+        // indicator and an in-flight download's portable-mode flag survive
+        // a single failed poll.
+        updateInfo.value = null;
         updateCheckMessage.value = formatUpdateError(String(e));
+        updateCheckFailed.value = true;
         showUpdateDialog.value = true;
       }
     } finally {
@@ -123,24 +199,48 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     openUrl(url);
   }
 
+  async function changeUpdateDownloadSource(source: SettingsUpdateDownloadSource) {
+    await settingsStore.updateEditorSettingsAndPersist({ updateDownloadSource: source });
+    await checkUpdates();
+  }
+
+  async function ignoreCurrentVersion() {
+    const latest = updateInfo.value?.latest_version;
+    if (!latest || isIgnoringUpdate.value) return;
+    isIgnoringUpdate.value = true;
+    try {
+      await settingsStore.updateEditorSettingsAndPersist({ ignoredUpdateVersion: latest });
+      showUpdateDialog.value = false;
+      toast(t("updates.versionIgnored", { version: tagVersion(latest) }), 5000);
+    } catch (error) {
+      toast(t("updates.ignoreVersionFailed", { error: error instanceof Error ? error.message : String(error) }), 5000);
+    } finally {
+      isIgnoringUpdate.value = false;
+    }
+  }
+
   function blockUpdateForActiveTasks(): boolean {
     if (!shouldBlockAppUpdate(activeTaskCount.value)) return false;
     toast(t("updates.activeTasksBlockUpdate", { count: activeTaskCount.value }), 5000);
     return true;
   }
 
-  async function downloadAndInstallUpdate() {
+  async function downloadUpdateInBackground() {
     if (!isTauriRuntime() || isDownloadingUpdate.value || isInstallingUpdate.value || updateDownloaded.value || updateReady.value) return;
     if (!canDownloadAndInstallUpdate(updateInfo.value, true)) {
       openLatestRelease();
       return;
     }
-    if (blockUpdateForActiveTasks()) return;
+    // Starting the download never has to wait on active work — only installing
+    // (file replacement) is disruptive, so that guard applies at install time instead.
+    showUpdateDialog.value = false;
     const attempt = ++activeDownloadAttempt;
     isDownloadingUpdate.value = true;
-    downloadProgress.value = 0;
+    // The total is unknown until the first progress event arrives.
+    downloadProgress.value = null;
     let unlisten: (() => void) | undefined;
     const latestVersion = updateInfo.value?.latest_version;
+    toast(t("updates.downloadStarted", { version: latestVersion ? tagVersion(latestVersion) : "" }), 3000);
     try {
       await pendingCancellation;
       if (attempt !== activeDownloadAttempt) return;
@@ -148,23 +248,27 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
       unlisten = await listen<UpdateDownloadProgress>("update-download-progress", (event) => {
         if (attempt !== activeDownloadAttempt) return;
         const total = event.payload.total ?? 0;
-        downloadProgress.value = total > 0 ? Math.round((event.payload.downloaded / total) * 100) : 0;
+        downloadProgress.value = total > 0 ? Math.round((event.payload.downloaded / total) * 100) : null;
       });
-      const result = await downloadAndInstallUpdateWhenIdle({
-        getActiveTaskCount: () => activeTaskCount.value,
-        download: async () => {
-          await api.downloadUpdate(normalizeUpdateDownloadSource(settingsStore.editorSettings.updateDownloadSource), latestVersion);
-          if (attempt !== activeDownloadAttempt) throw new Error("Download canceled by user.");
-          downloadProgress.value = 100;
-          updateDownloaded.value = true;
-          isDownloadingUpdate.value = false;
-        },
-        install: async () => {
-          await installPendingUpdate();
-        },
-      });
-      if (result === "blocked" || result === "downloaded") {
-        blockUpdateForActiveTasks();
+      await api.downloadUpdate(normalizeUpdateDownloadSource(settingsStore.editorSettings.updateDownloadSource), latestVersion);
+      if (attempt !== activeDownloadAttempt) return;
+      downloadProgress.value = 100;
+      updateDownloaded.value = true;
+      // The download phase is truly finished — flip this now so the install guard (which
+      // checks isDownloadingUpdate) can evaluate freely instead of treating us as still busy.
+      isDownloadingUpdate.value = false;
+      if (shouldBlockAppUpdate(activeTaskCount.value)) {
+        // Matches the pre-refactor behavior: installing waits for active work to finish, but
+        // unlike before, only installing waits — the download itself never blocked on it.
+        toast(t("updates.readyToInstall", { version: latestVersion ? tagVersion(latestVersion) : "" }), 10000, {
+          label: t("updates.installNow"),
+          onClick: () => {
+            void installDownloadedUpdate();
+          },
+        });
+      } else {
+        // Restores the pre-refactor auto-install-when-idle behavior for the install step.
+        await installDownloadedUpdate();
       }
     } catch (e: any) {
       if (attempt !== activeDownloadAttempt) return;
@@ -204,7 +308,18 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
         getActiveTaskCount: () => activeTaskCount.value,
         install: installPendingUpdate,
       });
-      if (!installed) blockUpdateForActiveTasks();
+      if (!installed) {
+        blockUpdateForActiveTasks();
+        return;
+      }
+      if (updateReady.value) {
+        toast(t("updates.installedReadyToRestart"), 10000, {
+          label: t("updates.restart"),
+          onClick: () => {
+            void restartApp();
+          },
+        });
+      }
     } catch (e: any) {
       toast(t("updates.installFailed", { error: e?.message || String(e) }), 5000);
     }
@@ -244,12 +359,14 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     checkingUpdates,
     updateInfo,
     updateCheckMessage,
+    updateCheckFailed,
     showUpdateDialog,
     isDownloadingUpdate,
     downloadProgress,
     updateDownloaded,
     isInstallingUpdate,
     updateReady,
+    isIgnoringUpdate,
     activeTaskCount,
     hasUpdateAvailable,
     latestReleaseUrl,
@@ -257,7 +374,9 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     checkUpdates,
     formatUpdateError,
     openLatestRelease,
-    downloadAndInstallUpdate,
+    changeUpdateDownloadSource,
+    ignoreCurrentVersion,
+    downloadUpdateInBackground,
     cancelDownload,
     installDownloadedUpdate,
     restartApp,

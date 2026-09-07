@@ -21,6 +21,17 @@ function roundTrip(tabs: QueryTab[]) {
 }
 
 describe("openTabsPersistence originalSql round-trip", () => {
+  it("preserves read-only source intent without adding editable source metadata", () => {
+    const [restored] = roundTrip([queryTab({ sourceView: true, sql: "CREATE SEQUENCE seq_users" })]);
+    expect(restored.sourceView).toBe(true);
+    expect(restored.objectSource).toBeUndefined();
+  });
+
+  it("keeps legacy query tabs without source intent compatible", () => {
+    const [restored] = roundTrip([queryTab({ sql: "SELECT 1" })]);
+    expect(restored.sourceView).toBeUndefined();
+  });
+
   it("restores a clean prefilled query tab as clean (sql === originalSql)", () => {
     const sql = 'SELECT * FROM "public"."users"';
     const [restored] = roundTrip([queryTab({ sql, originalSql: sql })]);
@@ -51,10 +62,75 @@ describe("openTabsPersistence originalSql round-trip", () => {
     expect(restored.originalSql).toBe("");
   });
 
+  it("does not persist the transient result execution target", () => {
+    const tab = queryTab({ activeResultRunId: "run-1", executingResultRunId: "run-1", isExecuting: true });
+    const [saved] = serializeOpenTabs([tab]);
+    const [restored] = restoreOpenTabsPayload({
+      tabs: [{ ...saved, executingResultRunId: "run-1" }],
+      activeTabId: tab.id,
+    }).tabs;
+
+    expect(saved).not.toHaveProperty("executingResultRunId");
+    expect(restored.executingResultRunId).toBeUndefined();
+    expect(restored.isExecuting).toBe(false);
+  });
+
   it("preserves an external Doris catalog across tab restore", () => {
     const [restored] = roundTrip([queryTab({ database: "dbx_catalog_completion", catalog: "dbx_mysql_catalog" })]);
 
     expect(restored.database).toBe("dbx_catalog_completion");
     expect(restored.catalog).toBe("dbx_mysql_catalog");
+  });
+
+  it("preserves external file versions and acknowledged state across tab restore", () => {
+    const version = { sizeBytes: 9, modifiedNs: "100", contentHash: "original" };
+    const ignoredVersion = { sizeBytes: 9, modifiedNs: "200", contentHash: "changed" };
+    const [restored] = roundTrip([
+      queryTab({
+        sql: "SELECT 1",
+        originalSql: "SELECT 1",
+        externalSqlPath: "/tmp/query.sql",
+        externalSqlFileVersion: version,
+        externalSqlIgnoredFileVersion: ignoredVersion,
+        externalSqlFileMissing: true,
+      }),
+    ]);
+
+    expect(restored.externalSqlFileVersion).toEqual(version);
+    expect(restored.externalSqlIgnoredFileVersion).toEqual(ignoredVersion);
+    expect(restored.externalSqlFileMissing).toBe(true);
+  });
+
+  it("preserves the disk baseline for a dirty external file after an ignored change", () => {
+    const version = { sizeBytes: 9, modifiedNs: "100", contentHash: "original" };
+    const ignoredVersion = { sizeBytes: 9, modifiedNs: "200", contentHash: "changed" };
+    const [restored] = roundTrip([
+      queryTab({
+        sql: "SELECT 2",
+        originalSql: "SELECT 1",
+        externalSqlPath: "/tmp/query.sql",
+        externalSqlFileVersion: version,
+        externalSqlIgnoredFileVersion: ignoredVersion,
+      }),
+    ]);
+
+    expect(restored.sql).toBe("SELECT 2");
+    expect(restored.originalSql).toBe("SELECT 1");
+    expect(restored.externalSqlIgnoredFileVersion).toEqual(ignoredVersion);
+  });
+
+  it("preserves the disk baseline for a dirty external file acknowledged as missing", () => {
+    const [restored] = roundTrip([
+      queryTab({
+        sql: "SELECT 2",
+        originalSql: "SELECT 1",
+        externalSqlPath: "/tmp/query.sql",
+        externalSqlFileMissing: true,
+      }),
+    ]);
+
+    expect(restored.sql).toBe("SELECT 2");
+    expect(restored.originalSql).toBe("SELECT 1");
+    expect(restored.externalSqlFileMissing).toBe(true);
   });
 });
