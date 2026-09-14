@@ -79,6 +79,48 @@ fn mysql_table_engine_change_generates_alter_table() {
 }
 
 #[test]
+fn sqlite_autoincrement_normalizes_integer_aliases_to_exact_integer() {
+    let mut id = column("id");
+    id.data_type = "bigint".to_string();
+    id.is_nullable = false;
+    id.is_primary_key = true;
+    id.extra = Some(ColumnExtra { auto_increment: Some(true), ..Default::default() });
+
+    let options = structure_change_options(DatabaseType::Sqlite, None, "items", vec![id, column("value")]);
+    let result = build_create_table_sql(options);
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(
+        result.statements[0],
+        "CREATE TABLE \"items\" (\n  \"id\" INTEGER PRIMARY KEY AUTOINCREMENT,\n  \"value\" varchar(255)\n);"
+    );
+}
+
+#[test]
+fn sqlite_autoincrement_rejects_composite_primary_keys_and_non_integer_types() {
+    let mut a = column("a");
+    a.data_type = "int".to_string();
+    a.is_primary_key = true;
+    a.extra = Some(ColumnExtra { auto_increment: Some(true), ..Default::default() });
+    let mut b = column("b");
+    b.data_type = "int".to_string();
+    b.is_primary_key = true;
+
+    let options = structure_change_options(DatabaseType::Sqlite, None, "items", vec![a, b]);
+    let result = build_create_table_sql(options);
+    assert!(result.statements.is_empty());
+    assert!(result.warnings.iter().any(|w| w.contains("composite primary keys")), "{:?}", result.warnings);
+
+    let mut text_id = column("id");
+    text_id.data_type = "text".to_string();
+    text_id.is_primary_key = true;
+    text_id.extra = Some(ColumnExtra { auto_increment: Some(true), ..Default::default() });
+    let options = structure_change_options(DatabaseType::Sqlite, None, "items2", vec![text_id]);
+    let result = build_create_table_sql(options);
+    assert!(result.statements.is_empty());
+    assert!(result.warnings.iter().any(|w| w.contains("must use an integer type")), "{:?}", result.warnings);
+}
+
+#[test]
 fn mysql_create_table_includes_engine_before_comment() {
     let mut options = structure_change_options(DatabaseType::Mysql, Some("dbx_test"), "archive", vec![column("id")]);
     options.mysql_engine = Some("MyISAM".to_string());
@@ -5058,6 +5100,138 @@ fn mysql_create_table_with_on_update_current_timestamp() {
 
     assert_eq!(result.warnings, Vec::<String>::new());
     assert!(result.statements[0].contains("ON UPDATE CURRENT_TIMESTAMP"));
+}
+
+#[test]
+fn mysql_create_table_carries_temporal_precision_into_current_timestamp_clauses() {
+    let mut col = column("updated_at");
+    col.data_type = "datetime(3)".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP".to_string();
+    col.extra = Some(ColumnExtra { on_update_current_timestamp: Some(true), ..Default::default() });
+
+    let result = build_create_table_sql(structure_change_options(DatabaseType::Mysql, None, "users", vec![col]));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["CREATE TABLE `users` (\n  `updated_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)\n);"]
+    );
+}
+
+#[test]
+fn mysql_create_table_keeps_explicit_zero_temporal_precision_in_current_timestamp_clauses() {
+    let mut col = column("updated_at");
+    col.data_type = "datetime(0)".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP".to_string();
+    col.extra = Some(ColumnExtra { on_update_current_timestamp: Some(true), ..Default::default() });
+
+    let result = build_create_table_sql(structure_change_options(DatabaseType::Mysql, None, "users", vec![col]));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["CREATE TABLE `users` (\n  `updated_at` datetime(0) NOT NULL DEFAULT CURRENT_TIMESTAMP(0) ON UPDATE CURRENT_TIMESTAMP(0)\n);"]
+    );
+}
+
+#[test]
+fn mysql_single_column_alter_carries_temporal_precision_into_current_timestamp_clauses() {
+    let mut col = column("updated_at");
+    col.data_type = "datetime(3)".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP".to_string();
+    col.extra = Some(ColumnExtra { on_update_current_timestamp: Some(true), ..Default::default() });
+    col.original = Some(ColumnInfo {
+        name: "updated_at".to_string(),
+        data_type: "datetime".to_string(),
+        is_nullable: false,
+        column_default: None,
+        is_primary_key: false,
+        extra: None,
+        comment: None,
+        ..Default::default()
+    });
+
+    let result = build_single_column_alter_sql(SingleColumnAlterSqlOptions {
+        database_type: Some(DatabaseType::Mysql),
+        driver_profile: None,
+        schema: None,
+        table_name: "users".to_string(),
+        column: col,
+    });
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["ALTER TABLE `users` MODIFY COLUMN `updated_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3);"]
+    );
+}
+
+#[test]
+fn mysql_single_column_alter_resaving_precision_column_keeps_temporal_precision() {
+    let mut col = column("updated_at");
+    col.data_type = "datetime(3)".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP(3)".to_string();
+    col.comment = "updated".to_string();
+    col.extra = Some(ColumnExtra { on_update_current_timestamp: Some(true), ..Default::default() });
+    col.original = Some(ColumnInfo {
+        name: "updated_at".to_string(),
+        data_type: "datetime(3)".to_string(),
+        is_nullable: false,
+        column_default: Some("CURRENT_TIMESTAMP(3)".to_string()),
+        is_primary_key: false,
+        extra: Some("on update CURRENT_TIMESTAMP(3)".to_string()),
+        comment: None,
+        ..Default::default()
+    });
+
+    let result = build_single_column_alter_sql(SingleColumnAlterSqlOptions {
+        database_type: Some(DatabaseType::Mysql),
+        driver_profile: None,
+        schema: None,
+        table_name: "users".to_string(),
+        column: col,
+    });
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["ALTER TABLE `users` MODIFY COLUMN `updated_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT 'updated';"]
+    );
+}
+
+#[test]
+fn mysql_current_timestamp_clauses_stay_bare_without_column_precision() {
+    let mut col = column("updated_at");
+    col.data_type = "timestamp".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP".to_string();
+    col.extra = Some(ColumnExtra { on_update_current_timestamp: Some(true), ..Default::default() });
+
+    let result = build_create_table_sql(structure_change_options(DatabaseType::Mysql, None, "users", vec![col]));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["CREATE TABLE `users` (\n  `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP\n);"]
+    );
+
+    let mut col = column("updated_at");
+    col.data_type = "datetime(7)".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP".to_string();
+    col.extra = Some(ColumnExtra { on_update_current_timestamp: Some(true), ..Default::default() });
+
+    let result = build_create_table_sql(structure_change_options(DatabaseType::Mysql, None, "users", vec![col]));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["CREATE TABLE `users` (\n  `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP\n);"]
+    );
 }
 
 #[test]

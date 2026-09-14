@@ -1,3 +1,6 @@
+import type { DatabaseType } from "@/types/database";
+import { DBX_ROWID_COLUMN } from "@/lib/table/tableEditing";
+
 // Binary column types that should not be edited inline
 export const BINARY_TYPES = new Set(["blob", "clob", "bytea", "varbinary", "binary", "image", "longblob", "mediumblob", "tinyblob", "blob sub_type 2004", "blob sub_type 2005"]);
 
@@ -229,7 +232,7 @@ export function analyzeEditableQueryEditability(sql: string): QueryEditability {
   if (hasTopLevelKeyword(normalized, ["UNION", "INTERSECT", "EXCEPT", "MINUS"])) {
     return { editable: false, reason: "set-operation" };
   }
-  if (normalized.includes(";")) return { editable: false, reason: "complex-source" };
+  if (hasTopLevelSemicolon(normalized)) return { editable: false, reason: "complex-source" };
 
   const fromIndex = findTopLevelKeyword(normalized, "FROM", 0);
   if (fromIndex < 0) return { editable: false, reason: "no-table" };
@@ -310,7 +313,7 @@ export function analyzeSelectStructureForDisplay(sql: string): EditableQueryInfo
   if (/^\s*WITH\b/i.test(normalized)) return null;
   if (!/^SELECT\b/i.test(normalized)) return null;
   if (hasTopLevelKeyword(normalized, ["UNION", "INTERSECT", "EXCEPT", "MINUS"])) return null;
-  if (normalized.includes(";")) return null;
+  if (hasTopLevelSemicolon(normalized)) return null;
 
   const fromIndex = findTopLevelKeyword(normalized, "FROM", 0);
   if (fromIndex < 0) return null;
@@ -758,6 +761,36 @@ function hasTopLevelKeyword(sql: string, keywords: string[]): boolean {
   return keywords.some((keyword) => findTopLevelKeyword(sql, keyword, 0) >= 0);
 }
 
+function hasTopLevelSemicolon(sql: string): boolean {
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i];
+    if (quote) {
+      if (ch === quote || (quote === "]" && ch === "]")) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "[") {
+      quote = "]";
+      continue;
+    }
+    if (ch === "(") {
+      depth++;
+      continue;
+    }
+    if (ch === ")") {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (depth === 0 && ch === ";") return true;
+  }
+  return false;
+}
+
 function firstTopLevelKeywordIndex(sql: string, keywords: string[], start: number): number {
   const indexes = keywords.map((keyword) => findTopLevelKeyword(sql, keyword, start)).filter((index) => index >= 0);
   return indexes.length ? Math.min(...indexes) : -1;
@@ -812,12 +845,13 @@ function escapeRegExp(value: string): string {
  * comparison prevents `id` from being mistaken for a distinct quoted `"ID"`
  * column in PostgreSQL.
  */
-export function allPrimaryKeysPresent(primaryKeys: string[], resultColumns: string[], analysis?: EditableQueryInfo, sourceKey?: string): boolean {
+export function allPrimaryKeysPresent(primaryKeys: string[], resultColumns: string[], analysis?: EditableQueryInfo, sourceKey?: string, databaseType?: DatabaseType): boolean {
   if (analysis && !analysis.selectStar) {
     const sourceColumns = new Set(
       analysis.columns.flatMap((column) => {
         if (!column.sourceName) return [];
         if (sourceKey && column.sourceKey !== sourceKey) return [];
+        if (databaseType === "oracle" && !column.sourceNameQuoted && column.sourceName.toUpperCase() === "ROWID" && column.sourceKey === sourceKey) return [DBX_ROWID_COLUMN, column.sourceName];
         return [column.sourceName];
       }),
     );
@@ -850,12 +884,15 @@ export function allEditableColumnsWriteable(analysis: EditableQueryInfo, resultC
   return !!matchedColumns && matchedColumns.every((source) => !sourceKey || !source.sourceName || source.sourceKey === sourceKey);
 }
 
-export function sourceColumnsForResult(analysis: EditableQueryInfo, resultColumns: string[], sourceKey?: string): Array<string | undefined> | undefined {
+export function sourceColumnsForResult(analysis: EditableQueryInfo, resultColumns: string[], sourceKey?: string, databaseType?: DatabaseType, primaryKeys?: readonly string[]): Array<string | undefined> | undefined {
   if (analysis.selectStar) return undefined;
   const matchedColumns = matchColumnsForResult(analysis, resultColumns);
   if (!matchedColumns) return undefined;
   return matchedColumns.map((column) => {
     if (sourceKey && column.sourceKey !== sourceKey) return undefined;
+    if (databaseType === "oracle" && !column.sourceNameQuoted && column.sourceName?.toUpperCase() === "ROWID" && column.sourceKey === sourceKey) {
+      return primaryKeys?.length === 1 && primaryKeys[0] === DBX_ROWID_COLUMN ? DBX_ROWID_COLUMN : undefined;
+    }
     return column.sourceName;
   });
 }

@@ -2,7 +2,7 @@ import type { ConnectionConfig, DatabaseType } from "@/types/database";
 import { isSchemaAware, spannerObjectTreeSchema, usesDatabaseObjectTreeMode, usesTreeSchemaMode } from "@/lib/database/databaseFeatureSupport";
 import type { CodeMirrorSqlDialectName } from "@/lib/editor/codemirrorSqlDialect";
 
-type JdbcDialectConnection = Partial<Pick<ConnectionConfig, "db_type" | "driver_profile" | "driver_label" | "connection_string" | "url_params" | "jdbc_driver_class" | "jdbc_driver_paths" | "database_info" | "external_config">>;
+type JdbcDialectConnection = Partial<Pick<ConnectionConfig, "db_type" | "driver_profile" | "driver_label" | "connection_string" | "url_params" | "jdbc_driver_class" | "jdbc_driver_paths" | "database_info" | "external_config" | "username">>;
 
 export type GaussdbIdentifierQuoteStyle = "auto" | "double" | "backtick";
 export type GaussdbConnectionMode = "native" | "m-jdbc";
@@ -38,11 +38,14 @@ const JDBC_DIALECT_MATCHERS: Array<{ type: DatabaseType; patterns: RegExp[] }> =
   { type: "sqlserver", patterns: [/jdbc:sqlserver:/i, /sqlserver/i, /mssql/i] },
   { type: "oracle", patterns: [/jdbc:oracle:/i, /oracle/i] },
   { type: "clickhouse", patterns: [/jdbc:clickhouse:/i, /clickhouse/i] },
+  { type: "tdengine", patterns: [/jdbc:taos(?:-rs|-ws)?:/i, /taosdata/i, /tdengine/i] },
   { type: "h2", patterns: [/jdbc:h2:/i, /\bh2\b/i] },
   { type: "sqlite", patterns: [/jdbc:sqlite:/i, /sqlite/i] },
   { type: "db2", patterns: [/jdbc:db2:/i, /\bdb2\b/i] },
   { type: "informix", patterns: [/jdbc:informix/i, /informix/i] },
-  { type: "iris", patterns: [/jdbc:(?:iris|cache):/i, /com\.intersystems\.jdbc\.(?:IRIS|Cache)Driver/i, /intersystems-jdbc/i] },
+  // CacheDB.jar (legacy Caché driver) carries none of the intersystems URL or
+  // class-name markers, so match the jar file name / driver label directly.
+  { type: "iris", patterns: [/jdbc:(?:iris|cache):/i, /com\.intersystems\.jdbc\.(?:IRIS|Cache)Driver/i, /intersystems-jdbc/i, /\bcache(?:db)?\b/i] },
 ];
 
 // ASE uses Transact-SQL, but treating it as SQL Server globally would also
@@ -212,6 +215,8 @@ export function connectionUsesDatabaseObjectTreeMode(connection?: JdbcDialectCon
   const dialect = inferJdbcDialect(connection);
   if (!dialect) return true;
   if (dialect === "hive" || dialect === "trino") return false;
+  // TDengine exposes databases as the top-level namespace, without schemas.
+  if (dialect === "tdengine") return false;
   if (dialect === "databend") return true;
   return !usesTreeSchemaMode(dialect);
 }
@@ -263,6 +268,21 @@ export function connectionObjectTreeQuerySchema(connection: JdbcDialectConnectio
 }
 
 /**
+ * Schema sent with object-list (listObjects) requests. Dameng's object SQL
+ * filters on a fixed `WHERE o.OWNER = ?`, so a blank schema matches nothing and
+ * the object tab renders empty when the schema could not be resolved (#8301).
+ * Mirror the completion path (connectionStore.listCompletionColumns) and fall
+ * back to the connection username — uppercased, the Oracle-family storage
+ * convention for unquoted Dameng users. Other Oracle-family types keep the
+ * blank schema so the backend resolves the current schema itself.
+ */
+export function objectListSchemaForConnection(connection: JdbcDialectConnection | undefined, schema?: string): string {
+  if (schema) return schema;
+  if (effectiveDatabaseTypeForConnection(connection) !== "dameng") return "";
+  return connection?.username?.trim().toUpperCase() || "";
+}
+
+/**
  * Metadata schema for query paths that treat the database name as the schema when a
  * connection exposes no schema level (MySQL, HBase, and the other flat engines).
  * Cloud Spanner is the exception: its database is a resource path, so the blank
@@ -290,6 +310,12 @@ export function connectionObjectTreeNodeSchema(connection: JdbcDialectConnection
   if (!type) return schema;
   if (!schema && databaseNameIsNotASchema(type)) return undefined;
   return isSchemaAware(type) ? schema || database : undefined;
+}
+
+/** GBase 8s reports the table owner as a schema, but does not accept it in table DML/DDL names. */
+export function connectionTableSqlSchema(connection: JdbcDialectConnection | undefined, schema?: string): string | undefined {
+  if (connection?.db_type === "gbase" && isGbase8sProfile(connection.driver_profile)) return undefined;
+  return schema;
 }
 
 /** Maps a database type to the corresponding CodeMirror SQL dialect name used by QueryEditor and DdlViewDialog. */

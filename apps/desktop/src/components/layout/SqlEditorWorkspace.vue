@@ -92,9 +92,9 @@ defineExpose({
     const group = groupForElement(target) ?? activeEditorGroup();
     return group?.handleModRTarget(target) ?? false;
   },
-  requestQueryEditorExecute: () => activeEditorGroup()?.requestQueryEditorExecute() ?? false,
-  captureQueryEditorExecutionSnapshot: () => activeEditorGroup()?.captureQueryEditorExecutionSnapshot(),
-  requestQueryEditorExecuteInNewResultTab: () => activeEditorGroup()?.requestQueryEditorExecuteInNewResultTab() ?? false,
+  requestQueryEditorExecute: (tabId?: string) => editorGroupForTab(tabId)?.requestQueryEditorExecute() ?? false,
+  captureQueryEditorExecutionSnapshot: (tabId?: string) => editorGroupForTab(tabId)?.captureQueryEditorExecutionSnapshot(),
+  requestQueryEditorExecuteInNewResultTab: (tabId?: string) => editorGroupForTab(tabId)?.requestQueryEditorExecuteInNewResultTab() ?? false,
   requestQueryEditorPreviewChanges: (stackSql?: string) => activeEditorGroup()?.requestQueryEditorPreviewChanges(stackSql) ?? false,
   shouldBlockQueryEditorExecutionShortcut: (event: KeyboardEvent) => activeEditorGroup()?.shouldBlockQueryEditorExecutionShortcut(event) ?? false,
   cancelQueryEditorExecutionViewport: (requestId: number) => activeEditorGroup()?.cancelQueryEditorExecutionViewport(requestId) ?? false,
@@ -123,7 +123,7 @@ provide(GROUP_TAB_BAR_PORTAL, {
   },
 });
 const tabNavigationStyle = computed(() => {
-  const width = props.tabBarCollapsed ? "3.5rem" : `${props.tabBarWidth ?? 240}px`;
+  const width = props.tabBarCollapsed ? "var(--collapsed-tab-rail-width)" : `${props.tabBarWidth ?? 240}px`;
   return { width, flex: `0 0 ${width}` };
 });
 function setTabBarTarget(groupId: string, element: unknown) {
@@ -140,7 +140,13 @@ const SHARED_RESULT_PANE_DEFAULT_SIZE = 32;
 const SHARED_RESULT_PANE_STORAGE_KEY = "dbx-shared-results-pane-size";
 const storedResultPaneSize = Number(safeLocalStorageGet(SHARED_RESULT_PANE_STORAGE_KEY));
 const resultPaneSize = ref(Number.isFinite(storedResultPaneSize) && storedResultPaneSize >= SHARED_RESULT_PANE_MIN_SIZE && storedResultPaneSize <= SHARED_RESULT_PANE_MAX_SIZE ? storedResultPaneSize : SHARED_RESULT_PANE_DEFAULT_SIZE);
-const showResultPane = ref(true);
+const showResultPane = computed({
+  get: () => activeTab.value?.uiState?.resultPaneOpen ?? true,
+  set: (open: boolean) => {
+    const tab = activeTab.value;
+    if (tab?.mode === "query") queryStore.updateTabUiState(tab.id, { resultPaneOpen: open });
+  },
+});
 const isResultPaneVisible = computed(() => hasSharedOutput.value && showResultPane.value);
 // Keep the pane mounted, but apply its target size immediately so available
 // results never wait for an expansion animation before becoming visible.
@@ -206,6 +212,11 @@ function setGroupRef(groupId: string, el: unknown) {
 }
 function activeEditorGroup() {
   const group = queryStore.groups.find((item) => item.id === queryStore.focusedGroupId) ?? queryStore.groups[0];
+  return group ? (groupRefs.get(group.id) ?? null) : null;
+}
+function editorGroupForTab(tabId?: string): InstanceType<typeof EditorGroup> | null {
+  if (!tabId) return activeEditorGroup();
+  const group = queryStore.groups.find((item) => item.activeTabId === tabId);
   return group ? (groupRefs.get(group.id) ?? null) : null;
 }
 function groupForElement(element: Element | null): InstanceType<typeof EditorGroup> | null {

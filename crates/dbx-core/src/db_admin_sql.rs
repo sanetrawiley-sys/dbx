@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::models::connection::DatabaseType;
 use crate::sql_dialect::{
     is_schema_aware, profile_for, qualified_table_name, quote_table_data_identifier, quote_table_identifier,
-    uses_connection_identifier_quote,
+    uses_connection_identifier_quote, DdlDialectProfile,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +203,17 @@ pub struct DuplicateTableStructureSqlOptions {
     pub table_comment: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub column_comments: Vec<DuplicateTableColumnComment>,
+    /// Source primary-key columns to recreate on the clone. SQL Server's
+    /// `SELECT ... INTO` copies columns but drops constraints, so the clone
+    /// needs an explicit `ALTER TABLE ... ADD CONSTRAINT ... PRIMARY KEY`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub primary_key_columns: Vec<String>,
+    /// Pre-computed primary-key constraint name for the clone. Callers derive
+    /// it from the source index names so the generated `PK_{target}` respects
+    /// SQL Server's 128-character identifier limit and avoids a name that
+    /// already exists on the source table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_key_constraint_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identifier_quote: Option<String>,
 }
@@ -415,35 +426,28 @@ pub fn build_drop_table_sql(options: TableAdminSqlOptions) -> String {
         &options.table_name,
         options.identifier_quote.as_deref(),
     );
+    // IoTDB is the one engine whose drop target is a derived path pattern rather than the
+    // qualified name, so it cannot be expressed as a profile template.
     if matches!(options.database_type, Some(DatabaseType::Iotdb)) {
         return format!("DELETE TIMESERIES {};", iotdb_timeseries_pattern(&table));
-    } else if matches!(options.database_type, Some(DatabaseType::InfluxDb)) {
-        return format!("DROP MEASUREMENT {};", table);
     }
-    // CASCADE is valid for PostgreSQL-family dialects; keep default RESTRICT behavior elsewhere.
     let cascade = if options.cascade.unwrap_or(false) && supports_drop_table_cascade(options.database_type) {
         " CASCADE"
     } else {
         ""
     };
-    format!("DROP TABLE {table}{cascade};")
+    // Unknown database type: fall back to the ANSI shape rather than guessing a profile.
+    let Some(database_type) = options.database_type else {
+        return format!("DROP TABLE {table}{cascade};");
+    };
+    DdlDialectProfile::render_template(
+        profile_for(database_type).drop_table_template,
+        &[("table", &table), ("cascade", cascade)],
+    )
 }
 
 fn supports_drop_table_cascade(database_type: Option<DatabaseType>) -> bool {
-    matches!(
-        database_type,
-        Some(
-            DatabaseType::Postgres
-                | DatabaseType::Redshift
-                | DatabaseType::Gaussdb
-                | DatabaseType::Kwdb
-                | DatabaseType::Kingbase
-                | DatabaseType::Highgo
-                | DatabaseType::Uxdb
-                | DatabaseType::Vastbase
-                | DatabaseType::OpenGauss
-        )
-    )
+    database_type.is_some_and(|database_type| profile_for(database_type).drop_table_supports_cascade)
 }
 
 pub fn build_drop_table_child_object_sql(options: DropTableChildObjectSqlOptions) -> Result<String, String> {
@@ -782,10 +786,32 @@ pub fn build_duplicate_table_structure_sql(options: DuplicateTableStructureSqlOp
             Some(format!("COMMENT ON COLUMN {target}.{column_name} IS {}", quote_sql_string(&column.comment)))
         }));
     }
-    if comment_sql.is_empty() {
+
+    // `SELECT ... INTO` copies the IDENTITY property but not constraints, so the cloned table
+    // would silently lose its primary key (t8y2/dbx#8931). Recreate it from the source metadata.
+    let mut constraint_sql = Vec::new();
+    if options.database_type == Some(DatabaseType::SqlServer) && !options.primary_key_columns.is_empty() {
+        let raw_constraint_name: String = match options.primary_key_constraint_name.as_deref() {
+            Some(name) => name.to_string(),
+            None => format!("PK_{}", options.target_name),
+        };
+        let constraint_name = quote_table_identifier(options.database_type, &raw_constraint_name);
+        let key_columns = options
+            .primary_key_columns
+            .iter()
+            .map(|column| quote_table_identifier(options.database_type, column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        constraint_sql
+            .push(format!("ALTER TABLE {target} ADD CONSTRAINT {constraint_name} PRIMARY KEY ({key_columns})"));
+    }
+
+    let mut trailing_sql = constraint_sql;
+    trailing_sql.extend(comment_sql);
+    if trailing_sql.is_empty() {
         return structure_sql;
     }
-    format!("{};\n{};", structure_sql.trim_end_matches(';'), comment_sql.join(";\n"))
+    format!("{};\n{};", structure_sql.trim_end_matches(';'), trailing_sql.join(";\n"))
 }
 
 pub fn build_copy_table_data_sql(options: CopyTableDataSqlOptions) -> String {
@@ -1012,7 +1038,11 @@ fn is_postgres_like_rename(database_type: DatabaseType) -> bool {
 
 fn is_oracle_like_rename(database_type: DatabaseType) -> bool {
     // 神通 Oscar 实测支持 `ALTER TABLE old RENAME TO new`（PG 风格，与 Dameng/Oracle 一致）。
-    matches!(database_type, DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::Oscar)
+    // OceanBase Oracle 模式同样接受该语法。
+    matches!(
+        database_type,
+        DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::OceanbaseOracle | DatabaseType::Oscar
+    )
 }
 
 fn is_postgres_like_structure_copy(database_type: DatabaseType) -> bool {
@@ -1803,6 +1833,57 @@ mod tests {
         }
     }
 
+    /// `build_drop_table_sql` renders `DdlDialectProfile::drop_table_template`, so the six
+    /// profile families plus DuckDB (which resolves to `conservative_ansi`, not the SQLite
+    /// family) must all produce a valid statement.
+    #[test]
+    fn builds_drop_table_sql_per_profile_family() {
+        let drop_sql = |database_type: DatabaseType, schema: Option<&str>, cascade: Option<bool>| {
+            build_drop_table_sql(TableAdminSqlOptions {
+                database_type: Some(database_type),
+                schema: schema.map(str::to_string),
+                table_name: "events".to_string(),
+                cascade,
+                identifier_quote: None,
+            })
+        };
+
+        assert_eq!(drop_sql(DatabaseType::Mysql, None, None), "DROP TABLE `events`;");
+        assert_eq!(drop_sql(DatabaseType::Postgres, Some("public"), None), "DROP TABLE \"public\".\"events\";");
+        assert_eq!(drop_sql(DatabaseType::Oracle, Some("APP"), None), "DROP TABLE \"APP\".\"events\";");
+        assert_eq!(drop_sql(DatabaseType::SqlServer, Some("dbo"), None), "DROP TABLE [dbo].[events];");
+        assert_eq!(drop_sql(DatabaseType::Sqlite, None, None), "DROP TABLE \"events\";");
+        assert_eq!(drop_sql(DatabaseType::DuckDb, None, None), "DROP TABLE \"events\";");
+        // No database type: the ANSI shape, with the default double-quote from
+        // `qualified_name_with_quote`, and no CASCADE.
+        assert_eq!(
+            build_drop_table_sql(TableAdminSqlOptions {
+                database_type: None,
+                schema: None,
+                table_name: "events".to_string(),
+                cascade: Some(true),
+                identifier_quote: None,
+            }),
+            "DROP TABLE \"events\";"
+        );
+
+        // CASCADE stays limited to the PostgreSQL-family profiles. Oracle spells it
+        // `CASCADE CONSTRAINTS` and is deliberately excluded; Firebird, Vertica and Exasol
+        // share the PostgreSQL profile but opt out.
+        assert_eq!(
+            drop_sql(DatabaseType::Postgres, Some("public"), Some(true)),
+            "DROP TABLE \"public\".\"events\" CASCADE;"
+        );
+        assert_eq!(drop_sql(DatabaseType::OpenGauss, None, Some(true)), "DROP TABLE \"events\" CASCADE;");
+        assert_eq!(drop_sql(DatabaseType::Firebird, None, Some(true)), "DROP TABLE \"events\";");
+        assert_eq!(drop_sql(DatabaseType::Vertica, None, Some(true)), "DROP TABLE \"events\";");
+        assert_eq!(drop_sql(DatabaseType::Oracle, None, Some(true)), "DROP TABLE \"events\";");
+        assert_eq!(drop_sql(DatabaseType::DuckDb, None, Some(true)), "DROP TABLE \"events\";");
+
+        // InfluxDB drops a measurement; the profile template carries the whole shape.
+        assert_eq!(drop_sql(DatabaseType::InfluxDb, None, None), "DROP MEASUREMENT \"events\";");
+    }
+
     #[test]
     fn builds_mysql_auto_increment_sql_and_rejects_invalid_values() {
         for value in ["1", "9007199254740993", "18446744073709551615"] {
@@ -2072,6 +2153,8 @@ mod tests {
                 target_name: "users_copy".to_string(),
                 table_comment: None,
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE `users_copy` LIKE `users`;"
@@ -2084,6 +2167,8 @@ mod tests {
                 target_name: "users_copy".to_string(),
                 table_comment: None,
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE \"public\".\"users_copy\" (LIKE \"public\".\"users\" INCLUDING ALL);"
@@ -2096,6 +2181,8 @@ mod tests {
                 target_name: "connection_test_copy".to_string(),
                 table_comment: None,
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE `dbx_demo`.`connection_test_copy` LIKE `dbx_demo`.`connection_test`;"
@@ -2108,6 +2195,8 @@ mod tests {
                 target_name: "orders_copy".to_string(),
                 table_comment: None,
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE `dbx_demo`.`orders_copy` LIKE `dbx_demo`.`orders`;"
@@ -2120,6 +2209,8 @@ mod tests {
                 target_name: "customer_orders_copy".to_string(),
                 table_comment: Some("  Customer's orders; archive  ".to_string()),
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE \"public\".\"customer_orders_copy\" (LIKE \"public\".\"customer_orders\" INCLUDING ALL);\nCOMMENT ON TABLE \"public\".\"customer_orders_copy\" IS '  Customer''s orders; archive  ';"
@@ -2132,6 +2223,8 @@ mod tests {
                 target_name: "users_copy".to_string(),
                 table_comment: None,
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE \"public\".\"users_copy\" (LIKE \"public\".\"users\" INCLUDING ALL);"
@@ -2144,6 +2237,8 @@ mod tests {
                 target_name: "users_copy".to_string(),
                 table_comment: None,
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "SELECT TOP 0 * INTO [dbo].[users_copy] FROM [dbo].[users];"
@@ -2156,9 +2251,53 @@ mod tests {
                 target_name: "USERS_COPY".to_string(),
                 table_comment: None,
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE \"HR\".USERS_COPY AS SELECT * FROM \"HR\".\"USERS\" WHERE 1=0"
+        );
+        assert_eq!(
+            build_duplicate_table_structure_sql(DuplicateTableStructureSqlOptions {
+                database_type: Some(DatabaseType::SqlServer),
+                schema: Some("dbo".to_string()),
+                source_name: "users".to_string(),
+                target_name: "users_copy".to_string(),
+                table_comment: None,
+                column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
+                identifier_quote: None,
+            }),
+            "SELECT TOP 0 * INTO [dbo].[users_copy] FROM [dbo].[users];"
+        );
+        assert_eq!(
+            build_duplicate_table_structure_sql(DuplicateTableStructureSqlOptions {
+                database_type: Some(DatabaseType::SqlServer),
+                schema: None,
+                source_name: "users".to_string(),
+                target_name: "users_copy".to_string(),
+                table_comment: None,
+                column_comments: vec![],
+                primary_key_columns: vec!["id".to_string(), "seq no".to_string()],
+                primary_key_constraint_name: None,
+                identifier_quote: None,
+            }),
+            "SELECT TOP 0 * INTO [users_copy] FROM [users];\nALTER TABLE [users_copy] ADD CONSTRAINT [PK_users_copy] PRIMARY KEY ([id], [seq no]);"
+        );
+        assert_eq!(
+            build_duplicate_table_structure_sql(DuplicateTableStructureSqlOptions {
+                database_type: Some(DatabaseType::SqlServer),
+                schema: None,
+                source_name: "users".to_string(),
+                target_name: "users_copy".to_string(),
+                table_comment: None,
+                column_comments: vec![],
+                primary_key_columns: vec!["id".to_string()],
+                primary_key_constraint_name: Some("PK_users_copy_2".to_string()),
+                identifier_quote: None,
+            }),
+            "SELECT TOP 0 * INTO [users_copy] FROM [users];\nALTER TABLE [users_copy] ADD CONSTRAINT [PK_users_copy_2] PRIMARY KEY ([id]);"
         );
         let dameng_sql = build_duplicate_table_structure_sql(DuplicateTableStructureSqlOptions {
             database_type: Some(DatabaseType::Dameng),
@@ -2174,6 +2313,8 @@ mod tests {
                 DuplicateTableColumnComment { name: "STATUS".to_string(), comment: "active  ".to_string() },
                 DuplicateTableColumnComment { name: "EMPTY".to_string(), comment: " \t\n".to_string() },
             ],
+            primary_key_columns: vec![],
+            primary_key_constraint_name: None,
             identifier_quote: None,
         });
         assert_eq!(
@@ -2197,6 +2338,8 @@ mod tests {
             target_name: "users_copy".to_string(),
             table_comment: Some("line1\\path\nline2".to_string()),
             column_comments: vec![],
+            primary_key_columns: vec![],
+            primary_key_constraint_name: None,
             identifier_quote: None,
         });
         assert_eq!(
@@ -2212,6 +2355,8 @@ mod tests {
                 target_name: "UsersCopy".to_string(),
                 table_comment: None,
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE \"APP\".\"UsersCopy\" AS SELECT * FROM \"APP\".\"USERS\" WHERE 1=0"
@@ -2230,6 +2375,8 @@ mod tests {
                 target_name: "copy".to_string(),
                 table_comment: Some("owner\\'s; archive".to_string()),
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             });
             let expected_literal = if database_type == DatabaseType::Redshift {
@@ -2254,6 +2401,8 @@ mod tests {
                 target_name: "tb_a_copy".to_string(),
                 table_comment: None,
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE \"SQLUSER\".\"tb_a_copy\" AS SELECT * FROM \"SQLUSER\".\"tb_a\" WHERE 1=0"
@@ -2266,6 +2415,8 @@ mod tests {
                 target_name: "users_copy".to_string(),
                 table_comment: Some("ignored by QuestDB".to_string()),
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE `users_copy` (LIKE `users`);"
@@ -2613,6 +2764,20 @@ mod tests {
             })
             .unwrap(),
             "ALTER VIEW \"SYSDBA\".\"ACTIVE_USERS\" RENAME TO \"ENABLED_USERS\";"
+        );
+        // OceanBase in Oracle mode accepts the same statement; without it the transfer
+        // rename-then-drop path has no way to back up a target table.
+        assert!(supports_object_rename(Some(DatabaseType::OceanbaseOracle), DatabaseObjectType::Table));
+        assert_eq!(
+            build_rename_object_sql(RenameObjectSqlOptions {
+                database_type: Some(DatabaseType::OceanbaseOracle),
+                object_type: DatabaseObjectType::Table,
+                schema: Some("APP".to_string()),
+                old_name: "ORDERS".to_string(),
+                new_name: "ORDERS__DBX_BAK".to_string(),
+            })
+            .unwrap(),
+            "ALTER TABLE \"APP\".\"ORDERS\" RENAME TO \"ORDERS__DBX_BAK\";"
         );
     }
 

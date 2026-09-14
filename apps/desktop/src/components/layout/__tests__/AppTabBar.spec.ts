@@ -14,11 +14,12 @@ describe("AppTabBar shared group navigation", () => {
     expect(tabBarSource).not.toContain("data-return-tab");
     expect(tabBarSource).not.toContain("createRenameDuplicateTabItems");
     expect(groupSource).toContain("<Teleport defer");
+    expect(groupSource).toContain("if (!tabBarPortal?.active.value) return undefined;");
     expect(groupSource).toContain(':disabled="!tabBarPortal?.active.value || !tabBarTarget"');
   });
 
   it("retains targets while hiding inactive special content and follows all placements", () => {
-    expect(tabBarSource).toContain('v-show="driverStoreActive || settingsPageActive"');
+    expect(tabBarSource).toContain('v-show="driverStoreActive || pluginCenterActive || settingsPageActive"');
     expect(tabBarSource).toContain("data-special-page-navigation");
     expect(tabBarSource).toContain("data-special-page-content");
     expect(tabBarSource).toContain("<slot />");
@@ -83,7 +84,8 @@ describe("Group strip special page tabs", () => {
     expect(groupTabBarSource).toContain("return !specialPageActive.value && tab.id === props.activeTabId;");
     expect(groupTabBarSource).toContain("specialPageTabClass(!!specialPageTabs?.settingsActive)");
     expect(groupTabBarSource).toContain("specialPageTabClass(!!specialPageTabs?.driverStoreActive)");
-    expect(groupTabBarSource).toContain('return active ? { boxShadow: "inset 0 -2px 0 var(--ring)" } : undefined;');
+    expect(groupTabBarSource).toContain("if (!active) return undefined;");
+    expect(groupTabBarSource).toContain('return { "--app-tab-background": activeBackground, boxShadow: "inset 0 -2px 0 color-mix(in srgb, var(--foreground) 72%, transparent)" };');
     expect(groupTabBarSource).toContain('import "./appTabBar.css"');
     expect(groupTabBarSource).toContain("dirty-tab-marker");
     expect(groupTabBarSource).toContain("dirtyTabTitleStyle");

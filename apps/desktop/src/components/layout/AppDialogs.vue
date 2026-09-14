@@ -13,6 +13,7 @@ const SqlFileExecutionDialog = defineAsyncComponent(() => import("@/components/s
 const SchemaDiagramDialog = defineAsyncComponent(() => import("@/components/diagram/SchemaDiagramDialog.vue"));
 const DatabaseDocsDialog = defineAsyncComponent(() => import("@/components/docs/DatabaseDocsDialog.vue"));
 const TableImportDialog = defineAsyncComponent(() => import("@/components/import/TableImportDialog.vue"));
+const MongoImportDialog = defineAsyncComponent(() => import("@/components/document/MongoImportDialog.vue"));
 const FieldLineageDialog = defineAsyncComponent(() => import("@/components/lineage/FieldLineageDialog.vue"));
 const ConfigPassphraseDialog = defineAsyncComponent(() => import("@/components/config/ConfigPassphraseDialog.vue"));
 const ConfigConnectionSelectDialog = defineAsyncComponent(() => import("@/components/config/ConfigConnectionSelectDialog.vue"));
@@ -31,10 +32,12 @@ import type { DriverStoreFocus } from "@/lib/connection/agentDriverInstallHint";
 import type { SqlParameterDescriptor, SqlParameterSyntax } from "@/lib/sql/sqlParameters";
 import type { ConfigTab } from "@/components/connection/ConnectionDialog.vue";
 import type { DatabaseType } from "@/types/database";
+import type { PluginCenterFocus } from "@/lib/plugins/pluginCenterNavigation";
 
 const props = defineProps<{
   showConnectionDialog: boolean;
   connectionPrefill?: ConnectionDeepLinkDraft | null;
+  connectionPluginProvider?: PluginCenterFocus | null;
   connectionInitialTab?: ConfigTab;
   showDangerDialog: boolean;
   dangerSql: string;
@@ -59,6 +62,7 @@ const emit = defineEmits<{
   connectFailed: [message: string];
   openDriverStore: [focus?: DriverStoreFocus];
   openTunnelProfileSettings: [];
+  openConnectionSettings: [connectionId: string, initialTab: "advanced"];
   openLineageTarget: [
     target: {
       connectionId: string;
@@ -138,7 +142,8 @@ const editConfig = computed(() => {
 const shouldShowConnectionDialog = computed(() => props.showConnectionDialog || !!editConfig.value);
 
 watch(editConfig, (v) => {
-  if (v) emit("update:showConnectionDialog", true);
+  if (!v) return;
+  emit("update:showConnectionDialog", true);
 });
 
 watch(
@@ -165,6 +170,7 @@ watch(
     :open="shouldShowConnectionDialog"
     :edit-config="editConfig"
     :prefill-config="connectionPrefill"
+    :plugin-provider="connectionPluginProvider"
     :initial-tab="connectionInitialTab"
     @update:open="emit('update:showConnectionDialog', $event)"
     @connect-started="emit('connectStarted', $event)"
@@ -261,6 +267,8 @@ watch(
     :prefill-connection-id="dialogs.schemaDiffPrefillConnectionId.value"
     :prefill-database="dialogs.schemaDiffPrefillDatabase.value"
     :prefill-schema="dialogs.schemaDiffPrefillSchema.value"
+    :prefill-selected-routines="dialogs.schemaDiffPrefillSelectedRoutines.value"
+    :prefill-result-tab="dialogs.schemaDiffPrefillResultTab.value || undefined"
     :session-id="dialogs.schemaDiffSessionId.value"
   />
   <DataCompareDialog
@@ -292,6 +300,7 @@ watch(
     :prefill-schema="dialogs.tableImportPrefillSchema.value"
     :prefill-table="dialogs.tableImportPrefillTable.value"
   />
+  <MongoImportDialog v-model:open="dialogs.showMongoImportDialog.value" :connection-id="dialogs.mongoImportPrefillConnectionId.value" :database="dialogs.mongoImportPrefillDatabase.value" :collection="dialogs.mongoImportPrefillCollection.value" />
   <DataGenerateDialog
     v-if="dialogs.showTableDataGenerateDialog.value"
     v-model:open="dialogs.showTableDataGenerateDialog.value"
@@ -327,6 +336,7 @@ watch(
     :prefill-table="dialogs.databaseExportPrefillTable.value"
     :prefill-tables="dialogs.databaseExportPrefillTables.value"
     :prefill-all-databases="dialogs.databaseExportAllDatabases.value"
+    @open-connection-settings="emit('openConnectionSettings', $event, 'advanced')"
   />
   <ConfigConnectionSelectDialog
     v-if="dialogs.showConfigConnectionSelectDialog.value"

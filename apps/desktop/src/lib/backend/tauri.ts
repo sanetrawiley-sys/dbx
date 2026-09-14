@@ -1,4 +1,11 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { assertUpdateAllowsCommand } from "@/lib/app/updatePreparation";
+import { collectBrowserSupportInfo } from "@/lib/app/supportInfo";
+
+function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  assertUpdateAllowsCommand(command);
+  return tauriInvoke<T>(command, args);
+}
 import type { DetachedTabHandoff } from "@/lib/app/detachedTabHandoff";
 import { BackendErrorException, type BackendError } from "@/lib/backend/errorUtils";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -75,6 +82,22 @@ import type { SidebarObjectKind } from "@/lib/database/databaseObjectCapabilitie
 import type { AiChatSelectionState, AiConfig, AiConfigItem, AiEffortCapability, AiEffortLevel, AiTestConnectionResult } from "@/types/ai";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
 import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
+import type {
+  ActivePluginSession,
+  PluginBinaryEvent,
+  PluginConnectionActionResult,
+  PluginEvent,
+  PluginFilesystemListResult,
+  PluginFilesystemMutationResult,
+  PluginFilesystemReadResult,
+  PluginInstallResult,
+  PluginMarketplaceInstallRequest,
+  PluginRepository,
+  PluginRepositoryCatalogResult,
+  PluginRollbackResult,
+  PluginTrustedKey,
+  PluginUiAssetPayload,
+} from "@/types/database";
 import type {
   DataGridColumnDistinctValuesSqlOptions,
   DataGridColumnValueFilterConditionOptions,
@@ -365,6 +388,10 @@ export interface AppSupportInfo {
   osName: string;
   osVersion?: string | null;
   arch: string;
+  userAgent?: string;
+  databaseTypes?: string[];
+  localDriverVersions?: Array<{ dbType: string; version: string }>;
+  aiProviders?: string[];
 }
 
 export interface QueryPagination {
@@ -560,6 +587,7 @@ export async function aiAgentStream(
   confirmedDatabase?: string,
   confirmedSchema?: string,
   _signal?: AbortSignal,
+  selectedDatabases?: string[],
 ): Promise<string> {
   const unlisten: UnlistenFn = await listen<TauriAgentEvent>("ai-agent-event", (event) => {
     const payload = event.payload;
@@ -583,6 +611,7 @@ export async function aiAgentStream(
       confirmedConnectionId,
       confirmedDatabase,
       confirmedSchema,
+      selectedDatabases,
     });
   } catch (e) {
     unlisten();
@@ -717,6 +746,14 @@ export async function loadMaxAgentTurns(): Promise<number> {
   return invoke("load_max_agent_turns");
 }
 
+export async function loadSqlFileUploadMaxBytes(): Promise<number> {
+  return 200 * 1024 * 1024;
+}
+
+export async function saveSqlFileUploadMaxMb(_sqlFileUploadMaxMb: number): Promise<void> {
+  // No-op on desktop: SQL files are streamed directly from disk, no server upload cap applies.
+}
+
 export async function saveMaxAgentTurns(maxAgentTurns: number): Promise<void> {
   return invoke("save_max_agent_turns", { maxAgentTurns });
 }
@@ -738,6 +775,27 @@ export async function loadEditorSettings(): Promise<unknown | null> {
 
 export async function saveEditorSettings(settings: unknown): Promise<void> {
   return invoke("save_editor_settings", { settings });
+}
+
+export interface BackgroundImageInfo {
+  storedPath: string;
+  fileName: string;
+}
+
+export async function saveBackgroundImage(sourcePath: string): Promise<BackgroundImageInfo> {
+  return invoke("save_background_image", { sourcePath });
+}
+
+export async function clearBackgroundImage(storedPath: string): Promise<void> {
+  return invoke("clear_background_image", { storedPath });
+}
+
+export async function readBackgroundImage(storedPath: string): Promise<string> {
+  return invoke("read_background_image", { storedPath });
+}
+
+export async function checkBackgroundImage(storedPath: string): Promise<boolean> {
+  return invoke("check_background_image", { storedPath });
 }
 
 export async function loadOpenTabsState(): Promise<OpenTabsStatePayload | null> {
@@ -949,16 +1007,16 @@ export type ExternalSqlFileStatus = { kind: "present"; sizeBytes: number; modifi
 
 export type ExternalSqlFileWriteResult = { kind: "written"; version: ExternalSqlFileVersion } | { kind: "conflict"; currentVersion: ExternalSqlFileVersion } | { kind: "missing" };
 
-export async function readExternalSqlFileSnapshot(path: string): Promise<ExternalSqlFileSnapshot> {
-  const result = await invoke<{ kind: "content"; content: string; version: ExternalSqlFileVersion } | { kind: "tooLarge"; sizeBytes: number; maxSizeBytes: number }>("read_external_sql_file", { path });
+export async function readExternalSqlFileSnapshot(path: string, maxSizeBytes?: number): Promise<ExternalSqlFileSnapshot> {
+  const result = await invoke<{ kind: "content"; content: string; version: ExternalSqlFileVersion } | { kind: "tooLarge"; sizeBytes: number; maxSizeBytes: number }>("read_external_sql_file", { path, maxSizeBytes });
   if (result.kind === "tooLarge") {
     throw new ExternalSqlFileTooLargeError(result.sizeBytes, result.maxSizeBytes);
   }
   return { content: result.content, version: result.version };
 }
 
-export async function readExternalSqlFile(path: string): Promise<string> {
-  return (await readExternalSqlFileSnapshot(path)).content;
+export async function readExternalSqlFile(path: string, maxSizeBytes?: number): Promise<string> {
+  return (await readExternalSqlFileSnapshot(path, maxSizeBytes)).content;
 }
 
 export async function inspectExternalSqlFile(path: string): Promise<ExternalSqlFileStatus> {
@@ -1009,6 +1067,8 @@ export interface AiChatMessage {
   mentions?: unknown[];
   reasoning?: string;
   kind?: "contextSummary" | "writeSqlConfirmation" | "productionWriteBlocked";
+  /** Set on the assistant message whose generation failed; persisted (mirrors dbx-core `AiChatMessage.failed`). */
+  failed?: boolean;
 }
 
 export interface AiConversation {
@@ -1840,11 +1900,23 @@ export async function analyzeEditableQueryEditability(sql: string): Promise<Quer
   return invoke("analyze_editable_query_editability", { sql });
 }
 
+/// A server-side check that must pass before `statements` may run. Without a
+/// primary key a row is addressed by matching every column value, so the same
+/// predicate can match rows outside the loaded page; `sql` counts the matches
+/// of a predicate the save actually sends, and the save must be refused with
+/// `message` unless the returned count is at most `maxMatchedRows`.
+export interface DataGridSaveGuard {
+  sql: string;
+  maxMatchedRows: number;
+  message: string;
+}
+
 export interface DataGridSavePreparation {
   validationError?: string;
   statements: string[];
   rollbackStatements: string[];
   executionSchema?: string;
+  keylessGuards?: DataGridSaveGuard[];
 }
 
 export async function prepareDataGridSave(options: DataGridSaveStatementOptions, driverProfile?: string): Promise<DataGridSavePreparation> {
@@ -2180,6 +2252,124 @@ export async function listPlugins(): Promise<InstalledPlugin[]> {
   return invoke("list_plugins");
 }
 
+export async function listPluginTrustedKeys(): Promise<PluginTrustedKey[]> {
+  return invoke("list_plugin_trusted_keys");
+}
+
+export async function savePluginTrustedKey(keyId: string, publicKey: string): Promise<PluginTrustedKey[]> {
+  return invoke("save_plugin_trusted_key", { keyId, publicKey });
+}
+
+export async function removePluginTrustedKey(keyId: string): Promise<PluginTrustedKey[]> {
+  return invoke("remove_plugin_trusted_key", { keyId });
+}
+
+export async function listPluginRepositories(): Promise<PluginRepository[]> {
+  return invoke("list_plugin_repositories");
+}
+
+export async function savePluginRepository(repository: PluginRepository): Promise<PluginRepository[]> {
+  return invoke("save_plugin_repository", { repository });
+}
+
+export async function removePluginRepository(repositoryId: string): Promise<PluginRepository[]> {
+  return invoke("remove_plugin_repository", { repositoryId });
+}
+
+export async function fetchPluginMarketplaceCatalogs(): Promise<PluginRepositoryCatalogResult[]> {
+  return invoke("fetch_plugin_marketplace_catalogs");
+}
+
+export async function installMarketplacePlugin(request: PluginMarketplaceInstallRequest): Promise<PluginInstallResult> {
+  return invoke("install_marketplace_plugin", { request });
+}
+
+export async function installPluginPackage(pathOrFile: string | File, allowUnsigned = false): Promise<PluginInstallResult> {
+  if (typeof pathOrFile !== "string") throw new Error("Desktop plugin installation requires a local .dbxp file path");
+  return invoke("install_plugin_package", { path: pathOrFile, allowUnsigned });
+}
+
+export async function rollbackPlugin(pluginId: string): Promise<PluginRollbackResult> {
+  return invoke("rollback_plugin", { pluginId });
+}
+
+export async function uninstallPlugin(pluginId: string): Promise<InstalledPlugin[]> {
+  return invoke("uninstall_plugin", { pluginId });
+}
+
+export async function activatePlugin(pluginId: string): Promise<ActivePluginSession[]> {
+  return invoke("activate_plugin", { pluginId });
+}
+
+export async function listActivePlugins(): Promise<ActivePluginSession[]> {
+  return invoke("list_active_plugins");
+}
+
+export async function stopPlugin(pluginId: string): Promise<void> {
+  return invoke("stop_plugin", { pluginId });
+}
+
+export async function invokePlugin<T = unknown>(pluginId: string, method: string, params: unknown = null, timeoutMs?: number): Promise<T> {
+  return invoke("invoke_plugin", { pluginId, method, params, timeoutMs });
+}
+
+export async function invokePluginConnectionAction(config: ConnectionConfig, actionId: string): Promise<PluginConnectionActionResult> {
+  return invoke("invoke_plugin_connection_action", { config, actionId });
+}
+
+export async function notifyPlugin(pluginId: string, method: string, params: unknown = null): Promise<void> {
+  return invoke("notify_plugin", { pluginId, method, params });
+}
+
+export async function sendPluginBinary(pluginId: string, channel: string, dataBase64: string): Promise<void> {
+  return invoke("send_plugin_binary", { pluginId, channel, dataBase64 });
+}
+
+export async function listPluginFilesystemEntries(pluginId: string, providerId: string, options: { connectionId?: string; uri?: string; cursor?: string; limit?: number } = {}): Promise<PluginFilesystemListResult> {
+  return invoke("list_plugin_filesystem_entries", { pluginId, providerId, ...options });
+}
+
+export async function readPluginFilesystemFile(pluginId: string, providerId: string, uri: string, options: { connectionId?: string; maxBytes?: number } = {}): Promise<PluginFilesystemReadResult> {
+  return invoke("read_plugin_filesystem_file", { pluginId, providerId, uri, ...options });
+}
+
+export async function writePluginFilesystemFile(pluginId: string, providerId: string, uri: string, dataBase64: string, options: { connectionId?: string; create?: boolean; overwrite?: boolean; etag?: string } = {}): Promise<PluginFilesystemMutationResult> {
+  return invoke("write_plugin_filesystem_file", { pluginId, providerId, uri, dataBase64, create: options.create === true, overwrite: options.overwrite === true, connectionId: options.connectionId, etag: options.etag });
+}
+
+export async function createPluginFilesystemDirectory(pluginId: string, providerId: string, uri: string, connectionId?: string): Promise<PluginFilesystemMutationResult> {
+  return invoke("create_plugin_filesystem_directory", { pluginId, providerId, uri, connectionId });
+}
+
+export async function deletePluginFilesystemEntry(pluginId: string, providerId: string, uri: string, options: { connectionId?: string; recursive?: boolean } = {}): Promise<PluginFilesystemMutationResult> {
+  return invoke("delete_plugin_filesystem_entry", { pluginId, providerId, uri, connectionId: options.connectionId, recursive: options.recursive === true });
+}
+
+export async function renamePluginFilesystemEntry(pluginId: string, providerId: string, sourceUri: string, targetUri: string, options: { connectionId?: string; overwrite?: boolean } = {}): Promise<PluginFilesystemMutationResult> {
+  return invoke("rename_plugin_filesystem_entry", { pluginId, providerId, sourceUri, targetUri, connectionId: options.connectionId, overwrite: options.overwrite === true });
+}
+
+export async function readPluginAsset(pluginId: string, path: string): Promise<PluginUiAssetPayload> {
+  return invoke("read_plugin_asset", { pluginId, path });
+}
+
+export async function readPluginUiEntry(pluginId: string): Promise<PluginUiAssetPayload> {
+  return invoke("read_plugin_ui_entry", { pluginId });
+}
+
+export async function readPluginUiAsset(pluginId: string, path: string): Promise<PluginUiAssetPayload> {
+  return invoke("read_plugin_ui_asset", { pluginId, path });
+}
+
+export async function subscribePluginEvents(onEvent: (event: PluginEvent) => void, onBinary?: (event: PluginBinaryEvent) => void): Promise<UnlistenFn> {
+  const unlistenEvent = await listen<PluginEvent>("dbx-plugin-event", (event) => onEvent(event.payload));
+  const unlistenBinary = await listen<PluginBinaryEvent>("dbx-plugin-binary", (event) => onBinary?.(event.payload));
+  return () => {
+    unlistenEvent();
+    unlistenBinary();
+  };
+}
+
 export async function listJdbcDrivers(): Promise<JdbcDriverInfo[]> {
   return invoke("list_jdbc_drivers");
 }
@@ -2384,8 +2574,8 @@ export async function revealPathInFileManager(path: string): Promise<void> {
   return invoke("reveal_path_in_file_manager", { path });
 }
 
-export async function deleteDatabaseBackupFiles(paths: string[]): Promise<number> {
-  return invoke("delete_database_backup_files", { paths });
+export async function deleteDatabaseBackupFiles(paths: string[], allowedRoots: string[] = []): Promise<number> {
+  return invoke("delete_database_backup_files", { paths, allowedRoots });
 }
 
 export async function isSqliteDatabaseFile(path: string): Promise<boolean> {
@@ -2426,7 +2616,18 @@ export interface UpdateInfo {
 
 export type UpdateDownloadSource = "official" | "cnb";
 
+export interface DownloadedUpdate {
+  cache_id: string;
+  version: string;
+  portable_mode: boolean;
+  release_url: string;
+  release_notes: string;
+  downloaded_at: number;
+}
+
 export interface UpdateDownloadProgress {
+  attempt_id: string;
+  version: string;
   downloaded: number;
   total: number | null;
 }
@@ -2473,16 +2674,24 @@ export async function getSystemProxyUrl(): Promise<string | null> {
   return invoke("get_system_proxy_url");
 }
 
-export async function downloadUpdate(source: UpdateDownloadSource, latestVersion?: string): Promise<void> {
-  return invoke("download_update", { source, latestVersion });
+export async function downloadUpdate(source: UpdateDownloadSource, latestVersion: string, attemptId: string, releaseNotes?: string): Promise<DownloadedUpdate> {
+  return invoke("download_update", { source, latestVersion, attemptId, releaseNotes });
 }
 
 export async function cancelUpdateDownload(): Promise<void> {
   return invoke("cancel_update_download");
 }
 
-export async function installDownloadedUpdate(): Promise<void> {
-  return invoke("install_downloaded_update");
+export async function getDownloadedUpdate(): Promise<DownloadedUpdate | null> {
+  return invoke("get_downloaded_update");
+}
+
+export async function discardDownloadedUpdate(cacheId: string): Promise<void> {
+  return invoke("discard_downloaded_update", { cacheId });
+}
+
+export async function installDownloadedUpdate(cacheId: string, expectedVersion: string): Promise<void> {
+  return invoke("install_downloaded_update", { cacheId, expectedVersion });
 }
 
 export async function getAppVersion(): Promise<string> {
@@ -2491,7 +2700,8 @@ export async function getAppVersion(): Promise<string> {
 }
 
 export async function getAppSupportInfo(): Promise<AppSupportInfo> {
-  return invoke<AppSupportInfo>("get_app_support_info");
+  const info = await invoke<AppSupportInfo>("get_app_support_info");
+  return { ...info, userAgent: collectBrowserSupportInfo() };
 }
 
 // --- Redis ---
@@ -2534,6 +2744,11 @@ export interface RedisHashItem {
 export interface RedisZsetItem {
   score: string;
   member: RedisBlob;
+}
+
+export interface RedisKeysExpiryResult {
+  applied: number;
+  missing_key_raws: string[];
 }
 
 export interface RedisStreamField {
@@ -2824,6 +3039,14 @@ export async function redisSetExpireAt(connectionId: string, db: number, keyRaw:
   return invoke("redis_set_expire_at", { connectionId, db, keyRaw, expireAt });
 }
 
+export async function redisSetKeysTtl(connectionId: string, db: number, keyRaws: string[], ttl: number): Promise<RedisKeysExpiryResult> {
+  return invoke("redis_set_keys_ttl", { connectionId, db, keyRaws, ttl });
+}
+
+export async function redisSetKeysExpireAt(connectionId: string, db: number, keyRaws: string[], expireAt: number): Promise<RedisKeysExpiryResult> {
+  return invoke("redis_set_keys_expire_at", { connectionId, db, keyRaws, expireAt });
+}
+
 export async function redisDeleteKeys(connectionId: string, db: number, keyRaws: string[]): Promise<number> {
   return invoke("redis_delete_keys", { connectionId, db, keyRaws });
 }
@@ -2858,9 +3081,9 @@ export async function redisPubSubPublish(connectionId: string, db: number, chann
   return invoke("redis_pubsub_publish", { connectionId, db, channel, message });
 }
 
-export async function redisPubSubConnect(connectionId: string): Promise<WebSocket> {
+export async function redisPubSubConnect(connectionId: string, monitor = false): Promise<WebSocket> {
   const port = await invoke<number>("redis_pubsub_server_port");
-  return new WebSocket(`ws://127.0.0.1:${port}/api/redis/pubsub/ws?connectionId=${encodeURIComponent(connectionId)}`);
+  return new WebSocket(`ws://127.0.0.1:${port}/api/redis/pubsub/ws?connectionId=${encodeURIComponent(connectionId)}&monitor=${monitor}`);
 }
 
 export async function redisSlowlogGet(connectionId: string, count: number, nodeHost?: string, nodePort?: number): Promise<RedisSlowlogEntry[]> {
@@ -3883,7 +4106,7 @@ export async function vectorRenameCollection(connectionId: string, database: str
 
 export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {
   const collections = await documentListCollections(connectionId, "default");
-  return collections.map((c) => c.name);
+  return [...new Set(collections.flatMap((collection) => [collection.name, ...(collection.aliases ?? [])].filter((name) => name.trim())))];
 }
 
 /** Lists every Meilisearch index visible to the current connection credentials. */
@@ -4515,6 +4738,16 @@ export interface SqlFileRequest {
   database: string;
   filePath: string;
   continueOnError: boolean;
+  selectedTables?: SqlFileTable[];
+}
+
+export interface SqlFileTable {
+  database: string | null;
+  name: string;
+}
+
+export async function inspectSqlFileTables(filePath: string): Promise<SqlFileTable[]> {
+  return invoke("inspect_sql_file_tables", { filePath });
 }
 
 export interface SqlFilePreview {
@@ -4591,11 +4824,17 @@ export interface TransferRequest {
   quoteTargetColumnNames: boolean;
   ownershipPolicy?: TransferOwnershipPolicy;
   batchSize: number;
+  dropTargetBeforeCreate: boolean;
+  dropTargetConfirmed: boolean;
 }
 
 export interface TransferOwnershipPreview {
   missingOwners: string[];
   targetOwner: string;
+  rebuild?: {
+    sql: string;
+    tables: Array<{ sourceTable: string; targetTable: string; backupTable?: string }>;
+  };
 }
 
 export interface TransferProgress {
@@ -4797,6 +5036,190 @@ export async function releaseTableImportSource(_sourceRef: string): Promise<bool
   return false;
 }
 
+export type MongoImportFormat = "csv" | "json" | "ndjson";
+export type MongoImportTypeMode = "string" | "auto" | "extendedJson";
+export type MongoImportInferredType = "boolean" | "integer" | "decimal" | "date" | "object" | "array" | "string";
+export type MongoImportStatus = "running" | "done" | "error" | "cancelled";
+export type MongoImportPhase = "preparing" | "parsing" | "writing" | "done";
+export type MongoExportFormat = "csv" | "ndjson";
+export type MongoExportStatus = "running" | "done" | "error" | "cancelled";
+
+export interface MongoImportIssue {
+  code: string;
+  message: string;
+  row?: number | null;
+  column?: string | null;
+  value?: string | null;
+  batch?: number | null;
+  retryable?: boolean;
+}
+
+export interface MongoImportParseOptions {
+  encoding?: TableImportTextEncoding | null;
+  delimiter?: string | null;
+  hasHeader?: boolean | null;
+  trim?: boolean | null;
+  emptyAsNull?: boolean | null;
+  typeMode?: MongoImportTypeMode | null;
+  recognizeObjectIdHex?: boolean | null;
+  skipErrorRows?: boolean | null;
+}
+
+export interface MongoImportPreviewRequest {
+  filePath: string;
+  sourceRef?: string | null;
+  format: MongoImportFormat;
+  parseOptions?: MongoImportParseOptions;
+  previewLimit?: number | null;
+}
+
+export interface MongoImportColumn {
+  name: string;
+  inferredType: MongoImportInferredType;
+  sampleValues?: unknown[];
+}
+
+export interface MongoImportPreview {
+  sourceRef?: string | null;
+  format: MongoImportFormat;
+  detectedEncoding?: TableImportTextEncoding | null;
+  fileName: string;
+  filePath: string;
+  sizeBytes: number;
+  columns: MongoImportColumn[];
+  rows: Record<string, unknown>[];
+  rowNumbers?: number[];
+  warnings: MongoImportIssue[];
+  errors: MongoImportIssue[];
+  estimatedRows?: number | null;
+  estimatedRowsExact: boolean;
+}
+
+export interface MongoImportRequest {
+  importId: string;
+  connectionId: string;
+  database: string;
+  collection: string;
+  filePath: string;
+  sourceRef?: string | null;
+  format: MongoImportFormat;
+  parseOptions?: MongoImportParseOptions;
+  batchSize: number;
+  executionId?: string | null;
+}
+
+export interface MongoImportProgress {
+  importId: string;
+  phase: MongoImportPhase;
+  status: MongoImportStatus;
+  rowsRead: number;
+  rowsInserted: number;
+  rowsFailed: number;
+  batchesCommitted: number;
+  totalRows?: number | null;
+  errorRows?: MongoImportIssue[];
+  errorMessage?: string | null;
+  elapsedMs: number;
+}
+
+export interface MongoImportSummary {
+  importId: string;
+  rowsInserted: number;
+  rowsFailed: number;
+  batchesCommitted: number;
+  elapsedMs: number;
+}
+
+export interface MongoExportRequest {
+  exportId: string;
+  connectionId: string;
+  database: string;
+  collection: string;
+  filter?: string | null;
+  sort?: string | null;
+  projection?: string | null;
+  collation?: string | null;
+  format: MongoExportFormat;
+  includeHeader?: boolean;
+  filePath: string;
+  executionId?: string | null;
+}
+
+export interface MongoExportProgress {
+  exportId: string;
+  status: MongoExportStatus;
+  documentsRead: number;
+  bytesWritten: number;
+  totalDocuments?: number | null;
+  errorMessage?: string | null;
+  elapsedMs: number;
+}
+
+export interface MongoExportSummary {
+  exportId: string;
+  documentsExported: number;
+  filePath: string;
+  elapsedMs: number;
+}
+
+export async function previewMongodbImportFile(filePathOrRequest: string | File | MongoImportPreviewRequest, options: Partial<MongoImportPreviewRequest> = {}): Promise<MongoImportPreview> {
+  if (typeof filePathOrRequest !== "string" && !("filePath" in filePathOrRequest)) {
+    throw new Error("previewMongodbImportFile in desktop mode requires a file path, not a File object");
+  }
+  const request: MongoImportPreviewRequest = typeof filePathOrRequest === "string" ? { format: options.format ?? "csv", ...options, filePath: filePathOrRequest } : filePathOrRequest;
+  return invoke("preview_mongodb_import_file", { request });
+}
+
+export async function importMongodbFile(request: MongoImportRequest, onProgress: (progress: MongoImportProgress) => void): Promise<MongoImportSummary> {
+  const unlisten: UnlistenFn = await listen<MongoImportProgress>("mongo-import-progress", (event) => {
+    if (event.payload.importId === request.importId) {
+      onProgress(event.payload);
+      if (event.payload.status === "done" || event.payload.status === "error" || event.payload.status === "cancelled") {
+        unlisten();
+      }
+    }
+  });
+  try {
+    const summary = await invoke<MongoImportSummary>("import_mongodb_file", { request });
+    unlisten();
+    return summary;
+  } catch (e) {
+    unlisten();
+    throw e instanceof BackendErrorException ? e : new BackendErrorException(e);
+  }
+}
+
+export async function cancelMongodbImport(importId: string): Promise<boolean> {
+  return invoke("cancel_mongodb_import", { importId });
+}
+
+export async function releaseMongodbImportSource(_sourceRef: string): Promise<boolean> {
+  return false;
+}
+
+export async function exportMongodbQuery(request: MongoExportRequest, onProgress: (progress: MongoExportProgress) => void): Promise<MongoExportSummary> {
+  const unlisten: UnlistenFn = await listen<MongoExportProgress>("mongo-export-progress", (event) => {
+    if (event.payload.exportId === request.exportId) {
+      onProgress(event.payload);
+      if (event.payload.status === "done" || event.payload.status === "error" || event.payload.status === "cancelled") {
+        unlisten();
+      }
+    }
+  });
+  try {
+    const summary = await invoke<MongoExportSummary>("export_mongodb_query", { request });
+    unlisten();
+    return summary;
+  } catch (e) {
+    unlisten();
+    throw e instanceof BackendErrorException ? e : new BackendErrorException(e);
+  }
+}
+
+export async function cancelMongodbExport(exportId: string): Promise<boolean> {
+  return invoke("cancel_mongodb_export", { exportId });
+}
+
 // --- Database Export ---
 export interface DatabaseExportRequest {
   exportId: string;
@@ -4813,9 +5236,11 @@ export interface DatabaseExportRequest {
   dropTableIfExists?: boolean;
   omitAutoIncrement?: boolean;
   failOnError?: boolean;
+  preventOverwrite?: boolean;
   outputCompression?: "none" | "gzip";
   snapshotSessionId?: string;
   batchSize: number;
+  splitMaxMb?: number;
 }
 
 export interface DatabaseBackupSnapshot {
@@ -4866,6 +5291,7 @@ export interface TableExportRequest {
   dateTimeFormat?: string;
   numericColumnRightAlign?: boolean;
   autoFilter?: boolean;
+  splitMaxMb?: number;
 }
 
 export interface TableCsvExportOptions {
@@ -5041,6 +5467,10 @@ export async function cancelDatabaseExport(exportId: string): Promise<void> {
 
 export async function clearDatabaseExportCancellation(exportId: string): Promise<void> {
   await invoke("clear_database_export_cancellation", { exportId });
+}
+
+export async function databaseExportDestinationNeedsConfirmation(directory: string): Promise<boolean> {
+  return invoke("database_export_destination_needs_confirmation", { directory });
 }
 
 export async function recordDatabaseExportDestination(directory: string): Promise<void> {
