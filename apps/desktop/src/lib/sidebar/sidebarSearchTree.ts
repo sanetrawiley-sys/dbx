@@ -1,6 +1,7 @@
 import type { TableInfo, TreeNode, TreeNodeType } from "@/types/database";
 import { createSidebarLabelMatcher, matchSidebarLabel, type SidebarLabelMatcher, type SidebarSearchMatcherOptions } from "@/lib/sidebar/sidebarSearch";
 import { buildTableTreeNodes } from "@/lib/table/tableTree";
+import { stripTableVGroupsFromChildren } from "@/lib/table/tableVGroup";
 
 const preserveMatchedSubtreeTypes = new Set(["connection", "database", "schema", "table", "view", "mongo-db", "mongo-collection"]);
 const hiddenSearchNodeTypes = new Set<TreeNodeType>(["user-admin", "dameng-job-admin"]);
@@ -84,15 +85,21 @@ export function filterLocallySearchedTables(nodes: TreeNode[], options: { enable
     const indexed = options.indexedResults[node.id];
     // matchSidebarLabel compares case-insensitively internally and needs the
     // ORIGINAL label (and entry name) so camelCase boundaries stay detectable.
+    // Table comments participate in matching, mirroring the global sidebar
+    // search and the backend's name-or-comment metadata filter.
+    const entryMatches = (name: string, comment?: string | null) => !!matchSidebarLabel(name, query) || (!!comment && !!matchSidebarLabel(comment, query));
+    // Grouped tables are flattened before matching so virtual groups stay
+    // transparent during local table search.
+    const flatChildren = stripTableVGroupsFromChildren(children);
     const matchingChildren =
       indexed === null
-        ? children.filter((child) => localTableSearchChildTypes.has(child.type) && !!matchSidebarLabel(child.label, query))
+        ? flatChildren.filter((child) => localTableSearchChildTypes.has(child.type) && entryMatches(child.label, child.comment))
         : indexed
           ? reuseLiveSidebarTreeNodes(
-              buildSidebarIndexedTableNodes({ parentNodeId: node.id, nodeType: node.type, connectionId: node.connectionId || "", database: node.database || "", schema: node.schema, catalog: node.catalog, entries: indexed.filter((entry) => !!matchSidebarLabel(entry.name, query)) }),
-              children,
+              buildSidebarIndexedTableNodes({ parentNodeId: node.id, nodeType: node.type, connectionId: node.connectionId || "", database: node.database || "", schema: node.schema, catalog: node.catalog, entries: indexed.filter((entry) => entryMatches(entry.name, entry.comment)) }),
+              flatChildren,
             )
-          : children.filter((child) => localTableSearchChildTypes.has(child.type) && !!matchSidebarLabel(child.label, query));
+          : flatChildren.filter((child) => localTableSearchChildTypes.has(child.type) && entryMatches(child.label, child.comment));
     return { ...node, children: matchingChildren };
   });
 }

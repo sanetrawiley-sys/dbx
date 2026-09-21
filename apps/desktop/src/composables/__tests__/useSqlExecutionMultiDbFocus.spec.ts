@@ -2,7 +2,7 @@
  * Issue #6189 — SQL Server "focus jumps to the message result".
  *
  * Background:
- *  - `crates/dbx-core/src/db/sqlserver.rs:523-542` synthesizes a pseudo result with a
+ *  - `crates/dbx-drivers/src/db/sqlserver.rs:523-542` synthesizes a pseudo result with a
  *    single "Message" column and `server_message: true` for any batch segment that
  *    produced only server messages (PRINT / "DBCC execution completed" / ...).
  *  - `stores/queryStore.ts:4727` then picks the first result that HAS COLUMNS as the
@@ -98,6 +98,31 @@ describe("SQL Server result focus: doExecute vs executeTargetSql", () => {
   beforeEach(() => {
     installLocalStorage();
     setActivePinia(createPinia());
+  });
+
+  it("opens message-only executeTargetSql output in the messages view", async () => {
+    const tab = { ...queryTab(), sql: "PRINT N'x'" };
+    const connection = sqlServerConnection();
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart" | "messages">("result");
+    const queryStore = useQueryStore();
+    const { messageResult } = sqlServerMessageFirstResults();
+    vi.spyOn(queryStore, "executeTabSql").mockImplementation(async () => {
+      tab.result = messageResult;
+      return true;
+    });
+    vi.spyOn(queryStore, "getExecutionTab").mockReturnValue(tab);
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+    const execution = useSqlExecution({
+      activeTab: computed(() => tab as QueryTab | undefined),
+      activeConnection: computed(() => connection),
+      executableSql: computed(() => tab.sql),
+      activeOutputView,
+    });
+
+    await execution.executeTargetSql({ tab, connection, sql: tab.sql });
+
+    expect(activeOutputView.value).toBe("messages");
+    expect(tab.result?.rows).toEqual([["x"]]);
   });
 
   // ---- control: the single-connection editor path (fixed by be3336c1e) ----

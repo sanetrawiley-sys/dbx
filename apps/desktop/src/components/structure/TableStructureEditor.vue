@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import { applyDdlStoragePreference } from "@/lib/sql/ddlStorage";
+import DdlStorageToggle from "@/components/objects/DdlStorageToggle.vue";
+
 import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, shallowRef, watch } from "vue";
 import { uuid } from "@/lib/common/utils";
 import { useI18n } from "vue-i18n";
@@ -7,7 +10,7 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { AlertTriangle, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Copy, Database, Info, KeyRound, ListChevronsUpDown, Loader2, Maximize2, Pencil, Plus, RefreshCw, RotateCcw, Save, Search, Settings, SlidersHorizontal, Trash2, UserRound, X } from "@lucide/vue";
+import { AlertTriangle, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, ClipboardList, Copy, Database, Info, KeyRound, ListChevronsUpDown, Loader2, Maximize2, Pencil, Plus, RefreshCw, RotateCcw, Rows3, Save, Search, Settings, SlidersHorizontal, Trash2, UserRound, X } from "@lucide/vue";
 import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -25,18 +28,30 @@ import { useTheme } from "@/composables/useTheme";
 import { editorFontTheme, loadEditorTheme } from "@/lib/editor/editorThemes";
 import { createDbxCodeMirrorSqlDialect } from "@/lib/editor/codemirrorSqlDialect";
 import { useToast } from "@/composables/useToast";
+import { useVerticalOverlayScrollbar } from "@/composables/useVerticalOverlayScrollbar";
 import { type SqlHighlighter, createShikiSqlHighlighter } from "@/lib/sql/sqlHighlighter";
 import { joinSqlStatementsForScript } from "@/lib/sql/sqlBatchScript";
-import { formatGeneratedDdlIdentifierQuotes } from "@/lib/sql/ddlDisplay";
+import { applyDdlDatabaseQualifier, formatGeneratedDdlIdentifierQuotes, omitDdlIdentifierQuotes } from "@/lib/sql/ddlDisplay";
 import { splitSqlStatementRanges } from "@/lib/sql/sqlStatementRanges";
 import { copyToClipboard } from "@/lib/common/clipboard";
-import { formatSqlForDisplay, sqlFormatDialectForDbType } from "@/lib/sql/sqlFormatter";
+import DataGridCopyColumnNamesDialog from "@/components/grid/DataGridCopyColumnNamesDialog.vue";
+import { formatSqlForDisplay, sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import { queryTimeoutSecsForConcurrentIndex, queryTimeoutSecsForConnection } from "@/lib/sql/queryTimeout";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import { invalidateObjectDdl, loadObjectDdl } from "@/lib/metadata/objectDdlCache";
 import { invalidateObjectMetadataCache, loadObjectMetadataFacet, type ObjectMetadataFacet } from "@/lib/metadata/objectMetadataCache";
 import { invalidateTableMetadataCache } from "@/lib/metadata/tableMetadataCache";
-import { type BuildTableStructureChangeSqlOptions, type EditableStructureColumn, type EditableStructureForeignKey, type EditableStructureIndex, type EditableStructureTrigger } from "@/lib/table/tableStructureEditorSql";
+import {
+  type BuildTableStructureChangeSqlOptions,
+  type EditableStructureColumn,
+  type EditableStructureForeignKey,
+  type EditableStructureIndex,
+  type EditableStructureTrigger,
+  type TablePartitionBoundDraft,
+  type TablePartitionOperation,
+  type TablePartitionOperationKind,
+  type TablePartitionSqlOptions,
+} from "@/lib/table/tableStructureEditorSql";
 import { buildMysqlAutoIncrementCounterStatement, canEditMysqlAutoIncrementCounter, refreshMysqlAutoIncrementCounterDraft } from "@/lib/table/mysqlAutoIncrementCounter";
 import { mysqlTableCollationSql, parseMysqlTableCollation } from "@/lib/table/mysqlTableCollation";
 import { MYSQL_STORAGE_ENGINES_SQL, mysqlTableEngineSql, mysqlTableEngineSqlOption, parseMysqlTableEngineMetadata, refreshMysqlTableEngineDraft, supportsMysqlTableEngine } from "@/lib/table/mysqlTableEngine";
@@ -46,6 +61,8 @@ import { getPostgresDataTypeHelp, gaussdbMTypeDisplayName } from "@/lib/table/po
 import { getSqliteDataTypeHelp } from "@/lib/table/sqliteDataTypeHelp";
 import { getTableMetadataCapabilities, firstStructureMetadataTab, isStructureMetadataTabSupported } from "@/lib/table/tableMetadataCapabilities";
 import { constraintsForConstraintsTab } from "@/lib/table/constraintPresentation";
+import { PARTITION_TREE_INDENT_PX, flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionRowHint, splitPgPartitionBoundValues, visiblePgPartitionRows, type PgPartitionTreeRow } from "@/lib/table/pgPartitionPresentation";
+import { formatBytes } from "@/lib/database/serverMetrics";
 import { hasTableStructureRefreshWork, unloadedTableStructureRefreshScope, visibleTableStructureRefreshScope, type TableStructureRefreshScope } from "@/lib/table/tableStructureMetadataLoading";
 import { canAddTableStructureColumn, getTableStructureCapabilities, hasLocalTableColumnOrderChange, isPhysicalTableColumnOrderChange, sanitizeStructureIndexesForCapabilities, supportsLocalTableColumnReorder } from "@/lib/table/tableStructureCapabilities";
 import { getConcurrentIndexAvailability, concurrentIndexNamesInStatements, normalizeUnsupportedConcurrentIndexes, type ConcurrentIndexAvailability } from "@/lib/table/concurrentIndexAvailability";
@@ -53,7 +70,7 @@ import { orderedColumnIndexes, uniqueDataGridColumnOrderKeys } from "@/lib/dataG
 import { loadTableDataGridColumnOrder, notifyTableDataGridColumnOrderChanged, removeTableDataGridColumnOrder, saveTableDataGridColumnOrder, tableDataGridColumnOrderScopeKey } from "@/lib/dataGrid/dataGridColumnLayoutStorage";
 import { codeMirrorSqlDialectForConnection, connectionObjectTreeQuerySchema, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { postgresListRolesSql, usersFromPostgresRolesResult } from "@/lib/database/databaseUserAdmin";
-import type { ColumnInfo, ConstraintInfo, TableInfo, TableInfoTab, TableStructureEditorDraft, TableStructureEditorTarget, TableStructureEditorViewport } from "@/types/database";
+import type { ColumnInfo, ConstraintInfo, PgPartitionKind, PgPartitionNode, PgTablePartitioning, TableInfo, TableInfoTab, TableStructureEditorDraft, TableStructureEditorTarget, TableStructureEditorViewport } from "@/types/database";
 import {
   applyManticoreDdlColumnExtras,
   buildStructureTargetLabel,
@@ -100,8 +117,12 @@ import {
   structureColumnSelectionRange,
   isSyntheticContextMenuClick,
   resolveColumnSelectionActiveId,
+  structureColumnCommentsForCopy,
+  structureColumnNamesForCopy,
   tableStructureIdentifierComparisonKey,
   toColumnNames,
+  copySourceColumnDetails,
+  matchesCopySourceColumnSearch,
 } from "@/lib/table/tableStructureEditorState";
 import { CREATE_DATABASE_CHARSET_OPTIONS, createDatabaseCollationOptionsForCharset, fallbackCreateDatabaseCharsetMetadata, normalizeCreateDatabaseCharsetKey, parseCreateDatabaseCharsetMetadata } from "@/lib/database/createDatabaseCharsetOptions";
 import type { CreateDatabaseCharsetMetadata } from "@/lib/database/createDatabaseCharsetOptions";
@@ -123,8 +144,12 @@ const indexesScrollerRef = ref<StructureScrollerRef>();
 const foreignKeysScrollerRef = ref<StructureScrollerRef>();
 const constraintsScrollerRef = ref<StructureScrollerRef>();
 const triggersScrollerRef = ref<StructureScrollerRef>();
+const partitionsScrollerRef = ref<StructureScrollerRef>();
 const ddlScrollerRef = ref<StructureScrollerRef>();
 const structureHorizontalScrollbarTrackRef = ref<HTMLDivElement>();
+const columnsTableRef = ref<HTMLElement | null>(null);
+const indexesTableRef = ref<HTMLElement | null>(null);
+const structureVerticalScrollbarTrackRef = ref<HTMLElement | null>(null);
 const structureHorizontalScrollbarThumbRef = ref<HTMLDivElement>();
 const hasStructureHorizontalOverflow = ref(false);
 const dynamicDataTypeOptionsCache = new Map<string, string[]>();
@@ -161,9 +186,26 @@ const emit = defineEmits<{
   saved: [commentChanged: boolean];
   close: [];
   openSettings: [initialTab?: string, initialSection?: string];
+  /** Jump from the DDL view to the table's data tab (issue #6724). */
+  viewData: [];
 }>();
 
 const activeTab = ref<TableInfoTab>("columns");
+
+// DBX hides native scrollbars, so the columns/indexes tables only had the custom
+// horizontal bar. Render the same overlay affordance vertically for whichever
+// table tab is active; the bar occupies the tab panel's second grid column.
+const activeStructureTableScrollerRef = computed<HTMLElement | null>(() => structureScrollerElement(activeTab.value === "indexes" ? indexesScrollerRef.value : columnsScrollerRef.value) ?? null);
+const activeStructureTableContentRef = computed<HTMLElement | null>(() => (activeTab.value === "indexes" ? indexesTableRef.value : columnsTableRef.value) ?? null);
+const {
+  hasOverflow: hasStructureVerticalOverflow,
+  isScrolling: isStructureVerticalScrollbarScrolling,
+  isDragging: isStructureVerticalScrollbarDragging,
+  thumbStyle: structureVerticalScrollbarThumbStyle,
+  onScroll: onStructureVerticalScrollerScroll,
+  onTrackPointerDown: onStructureVerticalScrollbarTrackPointerDown,
+  onThumbPointerDown: onStructureVerticalScrollbarThumbPointerDown,
+} = useVerticalOverlayScrollbar(activeStructureTableScrollerRef, activeStructureTableContentRef, structureVerticalScrollbarTrackRef);
 const loading = ref(false);
 const saving = ref(false);
 const postSaveRefreshing = ref(false);
@@ -173,7 +215,9 @@ const indexesLoading = ref(false);
 const foreignKeysLoading = ref(false);
 const constraintsLoading = ref(false);
 const triggersLoading = ref(false);
-const ddlContent = ref("");
+const rawDdlContent = ref("");
+const ddlStorageExcluded = ref(settingsStore.editorSettings.excludeDdlStorage);
+const ddlContent = computed(() => applyDdlStoragePreference(rawDdlContent.value, databaseType.value, ddlStorageExcluded.value));
 const ddlLoading = ref(false);
 const ddlEditorContainer = ref<HTMLDivElement>();
 const ddlSearchPanelRef = ref<InstanceType<typeof EditorSearchPanel>>();
@@ -194,6 +238,12 @@ const ddlDraft = ref<string | null>(null);
  */
 const ddlEditingEnabled = computed(() => !isCreateMode.value && !!ddlContent.value.trim());
 const ddlDirty = computed(() => ddlDraft.value !== null && ddlDraft.value.trim() !== ddlContent.value.trim());
+watch([() => settingsStore.editorSettings.excludeDdlStorage, ddlDirty], ([exclude, dirty]) => {
+  if (!dirty && ddlStorageExcluded.value !== exclude) {
+    ddlDraft.value = null;
+    ddlStorageExcluded.value = exclude;
+  }
+});
 
 function ddlEditorDocument(): string {
   return ddlDraft.value ?? (ddlContent.value || t("structureEditor.emptyReadonly"));
@@ -330,6 +380,17 @@ function scheduleDdlEditorInit() {
   });
 }
 
+/**
+ * Applies the DDL display preferences (database qualifier + identifier quoting)
+ * to DDL shown by the structure editor, whether loaded from the server or
+ * generated from the pending structure changes.
+ */
+function formatDdlForDisplay(sql: string, dialect: SqlFormatDialect, generated = false): string {
+  const unqualified = applyDdlDatabaseQualifier(sql, dialect, databaseType.value, settingsStore.editorSettings.generateSqlIncludeDatabaseName, props.database, props.catalog);
+  if (settingsStore.editorSettings.generateSqlQuoteIdentifiers) return unqualified;
+  return generated ? formatGeneratedDdlIdentifierQuotes(unqualified, dialect, false, { preserveCaseSensitiveIdentifiers: tableStoresCaseSensitiveIdentifiers.value }) : omitDdlIdentifierQuotes(unqualified, dialect);
+}
+
 function ddlRequest() {
   return {
     connectionId: props.connectionId,
@@ -346,10 +407,12 @@ async function fetchDdl(force = false) {
   ddlLoading.value = true;
   try {
     const { ddl } = await loadObjectDdl(ddlRequest(), { force });
-    ddlContent.value = await formatSqlForDisplay(ddl, sqlFormatDialectForDbType(databaseType.value), settingsStore.editorSettings.sqlFormatter);
+    const dialect = sqlFormatDialectForDbType(databaseType.value);
+    const formatted = await formatSqlForDisplay(ddl, dialect, settingsStore.editorSettings.sqlFormatter);
+    rawDdlContent.value = formatDdlForDisplay(formatted, dialect);
     ddlFetched.value = true;
   } catch (e: any) {
-    ddlContent.value = `-- Error: ${e?.message || e}`;
+    rawDdlContent.value = `-- Error: ${e?.message || e}`;
     ddlFetched.value = true;
   } finally {
     ddlLoading.value = false;
@@ -381,6 +444,51 @@ const indexes = ref<EditableStructureIndex[]>([]);
  * is rejected by the server on such tables, so the option is disabled here and
  * the SQL builder refuses any concurrent request on it (fail closed). */
 const isPartitionedParent = ref(false);
+// True when the edited table is itself a member partition of another table.
+const isTablePartition = ref(false);
+// The partition-status probe has settled (success or failure), so the tab can
+// be hidden without hiding it merely because the probe is still in flight.
+const partitionStatusResolved = ref(false);
+
+/**
+ * Standalone partition-status probe for entry points that intentionally skip
+ * `loadStructure` (opening directly on the DDL tab). It only decides whether the
+ * Partitions tab is offered; the Concurrent-index normalization still runs from
+ * `loadStructure` when an editable tab loads.
+ */
+let partitionTabProbeRequestId = 0;
+async function probePartitionsTabVisibility() {
+  if (!tableMetadataCapabilities.value.partitions || isCreateMode.value) {
+    isPartitionedParent.value = false;
+    isTablePartition.value = false;
+    partitionStatusResolved.value = true;
+    return;
+  }
+  const connectionId = props.connectionId;
+  const database = props.database;
+  const tableName = props.tableName;
+  if (!connectionId || !database || !tableName) {
+    partitionStatusResolved.value = true;
+    return;
+  }
+  const requestId = ++partitionTabProbeRequestId;
+  try {
+    const status = await api.getTablePartitionStatus(connectionId, database, metadataSchema.value, tableName);
+    if (requestId !== partitionTabProbeRequestId) return;
+    isPartitionedParent.value = status.isPartitionedParent;
+    isTablePartition.value = status.isPartition;
+    partitionStatusResolved.value = true;
+  } catch {
+    if (requestId !== partitionTabProbeRequestId) return;
+    isPartitionedParent.value = false;
+    isTablePartition.value = false;
+    // A failed probe leaves the concurrent-index availability unknown, so keep
+    // the documented fail-closed behavior (disable Concurrent) instead of
+    // assuming the table is a plain, non-partitioned one.
+    partitionStatusKnown.value = false;
+    partitionStatusResolved.value = true;
+  }
+}
 /** Whether the last partition-status probe succeeded. When it cannot be
  * verified (probe failed), Concurrent is disabled — we must not assume a
  * non-partitioned table we could not check. */
@@ -398,6 +506,269 @@ const sqliteSchemaRevision = ref<string>();
 const foreignKeys = ref<EditableStructureForeignKey[]>([]);
 const constraints = ref<ConstraintInfo[]>([]);
 const constraintsLoaded = ref(false);
+// Structured PostgreSQL partitioning view (partitioned parent, its descendant
+// partitions, or a member partition's parent/bound). Read-only for now.
+const partitioning = ref<PgTablePartitioning | null>(null);
+const partitionsLoading = ref(false);
+const partitionsError = ref("");
+// Pending partition operations (not yet saved). Unlike columns/indexes these
+// are explicit actions on the live catalog, so they are never diffed — they
+// accumulate here until Save, then are cleared and the tree reloaded.
+const partitionOperations = ref<TablePartitionOperation[]>([]);
+// Create-mode partitioning declaration (`CREATE TABLE ... PARTITION BY ...`).
+const createPartitioningEnabled = ref(false);
+const createPartitioningKind = ref<PgPartitionKind>("range");
+const createPartitioningColumns = ref<string[]>([]);
+const createPartitioningExpression = ref("");
+
+const partitionTreeRows = computed(() =>
+  flattenPgPartitionNodes(partitioning.value?.partitions ?? [], {
+    schema: metadataSchema.value,
+    name: props.tableName || "",
+  }),
+);
+// Folded parents, so a large partition hierarchy can be navigated by level.
+const collapsedPartitionKeys = ref<Set<string>>(new Set());
+
+function togglePartitionRow(key: string) {
+  const next = new Set(collapsedPartitionKeys.value);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  collapsedPartitionKeys.value = next;
+}
+
+watch(
+  () => partitioning.value,
+  () => {
+    collapsedPartitionKeys.value = new Set();
+  },
+);
+
+const partitionVisibleRows = computed(() => visiblePgPartitionRows(partitionTreeRows.value, collapsedPartitionKeys.value));
+const partitionCreatableColumns = computed(() => columns.value.filter((column) => !column.markedForDrop && !!column.name.trim()).map((column) => column.name.trim()));
+
+function partitionStrategyLabel(kind?: PgPartitionKind): string {
+  const key = pgPartitionKindLabelKey(kind);
+  return key ? t(key) : "";
+}
+
+// --- Partition maintenance -------------------------------------------------
+const partitionDialogOpen = ref(false);
+const partitionDialogMode = ref<TablePartitionOperationKind>("create");
+const partitionDialogName = ref("");
+const partitionDialogSchema = ref("");
+const partitionDialogParentSchema = ref("");
+const partitionDialogParentTable = ref("");
+const partitionDialogBoundKind = ref<PgPartitionKind | "default">("range");
+const partitionDialogRangeFrom = ref("");
+const partitionDialogRangeTo = ref("");
+const partitionDialogListValues = ref("");
+const partitionDialogModulus = ref("2");
+const partitionDialogRemainder = ref("0");
+const partitionDialogConcurrently = ref(false);
+const partitionDialogError = ref("");
+
+const canManagePartitions = computed(() => {
+  if (!tableMetadataCapabilities.value.partitions) return false;
+  if (isCreateMode.value) return createPartitioningEnabled.value;
+  return !!partitioning.value && (partitioning.value.isPartitioned || partitioning.value.isPartition);
+});
+const partitionSupportsConcurrentDetach = computed(() => databaseType.value === "postgres" && (partitioning.value?.serverVersionNum ?? 0) >= 140000 && !partitioning.value?.defaultPartition);
+const partitionDialogNeedsBound = computed(() => partitionDialogMode.value === "create" || partitionDialogMode.value === "attach");
+
+function resetPartitionDialog() {
+  partitionDialogName.value = "";
+  partitionDialogSchema.value = "";
+  partitionDialogParentSchema.value = "";
+  partitionDialogParentTable.value = "";
+  partitionDialogBoundKind.value = isCreateMode.value ? createPartitioningKind.value : "range";
+  partitionDialogRangeFrom.value = "";
+  partitionDialogRangeTo.value = "";
+  partitionDialogListValues.value = "";
+  partitionDialogModulus.value = "2";
+  partitionDialogRemainder.value = "0";
+  partitionDialogConcurrently.value = false;
+  partitionDialogError.value = "";
+}
+
+function openPartitionDialog(mode: TablePartitionOperationKind, boundKind?: PgPartitionKind) {
+  resetPartitionDialog();
+  partitionDialogMode.value = mode;
+  partitionDialogBoundKind.value = boundKind ?? (isCreateMode.value ? createPartitioningKind.value : partitioning.value?.strategy) ?? "range";
+  partitionDialogOpen.value = true;
+}
+
+function openPartitionRowOperation(mode: TablePartitionOperationKind, row: PgPartitionTreeRow) {
+  openPartitionDialog(mode);
+  partitionDialogName.value = row.node.name;
+  partitionDialogSchema.value = row.node.schema;
+  partitionDialogParentSchema.value = row.parentSchema ?? "";
+  partitionDialogParentTable.value = row.parentName ?? "";
+}
+
+/** Detaching the partition currently being edited: the parent is not the
+ * edited table, so it must be named explicitly. */
+function openDetachSelfPartitionDialog() {
+  openPartitionDialog("detach");
+  partitionDialogName.value = props.tableName || "";
+  partitionDialogSchema.value = metadataSchema.value;
+  partitionDialogParentSchema.value = partitioning.value?.parentSchema ?? "";
+  partitionDialogParentTable.value = partitioning.value?.parentTable ?? "";
+}
+
+/** `reportError` separates the confirm path (which surfaces validation
+ * messages) from the live SQL preview (which stays quiet while the user is
+ * still typing). */
+function partitionDialogBound(reportError: boolean): TablePartitionBoundDraft | undefined {
+  const kind = partitionDialogBoundKind.value;
+  if (kind === "default") return { kind: "default" };
+  if (kind === "range") {
+    const from = splitPgPartitionBoundValues(partitionDialogRangeFrom.value);
+    const to = splitPgPartitionBoundValues(partitionDialogRangeTo.value);
+    if (!from.length || from.length !== to.length) {
+      if (reportError) partitionDialogError.value = t("structureEditor.partitionRangeBoundInvalid");
+      return undefined;
+    }
+    return { kind: "range", from, to };
+  }
+  if (kind === "list") {
+    const values = splitPgPartitionBoundValues(partitionDialogListValues.value);
+    if (!values.length) {
+      if (reportError) partitionDialogError.value = t("structureEditor.partitionListBoundInvalid");
+      return undefined;
+    }
+    return { kind: "list", values };
+  }
+  const modulus = Number.parseInt(partitionDialogModulus.value, 10);
+  const remainder = Number.parseInt(partitionDialogRemainder.value, 10);
+  if (!Number.isInteger(modulus) || modulus <= 0 || !Number.isInteger(remainder) || remainder < 0 || remainder >= modulus) {
+    if (reportError) partitionDialogError.value = t("structureEditor.partitionHashBoundInvalid");
+    return undefined;
+  }
+  return { kind: "hash", modulus, remainder };
+}
+
+function partitionDialogOperation(reportError: boolean, id: string): TablePartitionOperation | undefined {
+  const mode = partitionDialogMode.value;
+  const name = partitionDialogName.value.trim();
+  if (!name) {
+    if (reportError) partitionDialogError.value = t("structureEditor.partitionNameRequired");
+    return undefined;
+  }
+  let bound: TablePartitionBoundDraft | undefined;
+  if (partitionDialogNeedsBound.value) {
+    bound = partitionDialogBound(reportError);
+    if (!bound) return undefined;
+  }
+  return {
+    id,
+    kind: mode,
+    parentSchema: partitionDialogParentSchema.value.trim(),
+    parentTable: partitionDialogParentTable.value.trim(),
+    schema: partitionDialogSchema.value.trim(),
+    name,
+    bound,
+    concurrently: mode === "detach" && partitionDialogConcurrently.value && partitionSupportsConcurrentDetach.value,
+  };
+}
+
+function confirmPartitionDialog() {
+  partitionDialogError.value = "";
+  const operation = partitionDialogOperation(true, `partition-op:${uuid()}`);
+  if (!operation) return;
+  partitionOperations.value = [...partitionOperations.value, operation];
+  partitionDialogOpen.value = false;
+  scheduleSqlPreviewRefresh();
+  syncDraftToParent();
+}
+
+const partitionDialogSql = ref("");
+const partitionDialogSqlWarnings = ref<string[]>([]);
+let partitionDialogSqlTimer: ReturnType<typeof setTimeout> | undefined;
+let partitionDialogSqlRequestId = 0;
+
+/** Rebuilds the statement the dialog would queue, using the same backend
+ * builder the save path uses, so the preview can never drift from execution. */
+async function refreshPartitionDialogSql() {
+  if (!partitionDialogOpen.value) {
+    partitionDialogSql.value = "";
+    partitionDialogSqlWarnings.value = [];
+    return;
+  }
+  const operation = partitionDialogOperation(false, "partition-preview");
+  if (!operation) {
+    partitionDialogSql.value = "";
+    partitionDialogSqlWarnings.value = [];
+    return;
+  }
+  const requestId = ++partitionDialogSqlRequestId;
+  try {
+    const result = await api.buildTablePartitionOperationSql({ ...partitionSqlOptions(), operations: [operation] });
+    if (requestId !== partitionDialogSqlRequestId) return;
+    partitionDialogSql.value = result.statements.join("\n");
+    partitionDialogSqlWarnings.value = result.warnings;
+  } catch (error: any) {
+    if (requestId !== partitionDialogSqlRequestId) return;
+    partitionDialogSql.value = "";
+    partitionDialogSqlWarnings.value = [error?.message || String(error)];
+  }
+}
+
+function schedulePartitionDialogSqlRefresh() {
+  if (partitionDialogSqlTimer) clearTimeout(partitionDialogSqlTimer);
+  partitionDialogSqlTimer = setTimeout(() => {
+    partitionDialogSqlTimer = undefined;
+    void refreshPartitionDialogSql();
+  }, 150);
+}
+
+function removePartitionOperation(id: string) {
+  partitionOperations.value = partitionOperations.value.filter((operation) => operation.id !== id);
+  scheduleSqlPreviewRefresh();
+  syncDraftToParent();
+}
+
+watch(
+  [
+    partitionDialogOpen,
+    partitionDialogMode,
+    partitionDialogName,
+    partitionDialogSchema,
+    partitionDialogParentSchema,
+    partitionDialogParentTable,
+    partitionDialogBoundKind,
+    partitionDialogRangeFrom,
+    partitionDialogRangeTo,
+    partitionDialogListValues,
+    partitionDialogModulus,
+    partitionDialogRemainder,
+    partitionDialogConcurrently,
+  ],
+  () => schedulePartitionDialogSqlRefresh(),
+  { flush: "post" },
+);
+
+function partitionOperationLabel(kind: TablePartitionOperationKind): string {
+  switch (kind) {
+    case "create":
+      return t("structureEditor.partitionAdd");
+    case "attach":
+      return t("structureEditor.partitionAttach");
+    case "detach":
+      return t("structureEditor.partitionDetach");
+    case "drop":
+      return t("structureEditor.partitionDrop");
+  }
+}
+
+function partitionOperationSummary(operation: TablePartitionOperation): string {
+  return `${partitionOperationLabel(operation.kind)}: ${operation.name}`;
+}
+
+/** Size/count estimates live in the row's hover hint so the row stays two lines. */
+function partitionRowHint(node: PgPartitionNode): string | undefined {
+  return pgPartitionRowHint(node, t, formatBytes);
+}
 // The Constraints tab hides foreign keys when the dedicated Foreign Keys tab
 // is also shown, mirroring DataGrid/ObjectBrowser.
 const constraintsForTab = computed(() => constraintsForConstraintsTab(constraints.value, tableMetadataCapabilities.value.foreignKeys));
@@ -432,7 +803,7 @@ watch(
 function selectTrigger(trigger: EditableStructureTrigger) {
   selectedTriggerId.value = trigger.id;
 }
-const secondaryMetadataLoading = computed(() => indexesLoading.value || foreignKeysLoading.value || constraintsLoading.value || triggersLoading.value);
+const secondaryMetadataLoading = computed(() => indexesLoading.value || foreignKeysLoading.value || constraintsLoading.value || triggersLoading.value || partitionsLoading.value);
 
 function sameList(left: string[] | null | undefined, right: string[] | null | undefined): boolean {
   const a = left ?? [];
@@ -506,6 +877,9 @@ function captureStructureRefreshScope(): TableStructureRefreshScope {
     // so refresh the tab if it was ever loaded rather than leaving it stale.
     constraints: constraintsLoaded.value,
     triggers: triggers.value.some(triggerChanged),
+    // Read-only tab with no editable draft; refresh it whenever it was loaded
+    // so a save that rebuilds partitions can't leave stale rows behind.
+    partitions: loadedMetadataFacets.has("partitions"),
     tableComment: tableComment.value !== originalTableComment.value,
   };
 }
@@ -1117,6 +1491,30 @@ const triggerEventOptions = ["INSERT", "UPDATE", "DELETE"];
 const metadataSchema = computed(() => connectionObjectTreeQuerySchema(connection.value, props.database, props.schema));
 const refreshVersion = computed(() => (props.connectionId && props.tableName ? queryStore.tableStructureRefreshVersion(props.connectionId, props.database, props.schema, props.tableName) : 0));
 const isCreateMode = computed(() => !props.tableName);
+// Hidden for an existing table that is not partitioned: the tab could only ever
+// render an empty state. Create mode keeps it so partitioning can be declared.
+const showPartitionsTab = computed(() => tableMetadataCapabilities.value.partitions && (isCreateMode.value || isPartitionedParent.value || isTablePartition.value));
+
+/**
+ * Whether the edited table already stores a lowercase or mixed-case identifier.
+ * Oracle folds bare identifiers to uppercase, so dequoting such a name points at
+ * a column that does not exist (`CNAME` instead of `"cName"`, ORA-00904) or
+ * silently creates a differently-cased column for a newly added field (#9649).
+ * Tables whose names are all in the dialect's default case keep the
+ * PL/SQL-Developer-style folding requested in #8997.
+ */
+const tableStoresCaseSensitiveIdentifiers = computed(() => {
+  if (isCreateMode.value) return false;
+  const databaseInfo = connection.value?.database_info;
+  const requiresQuotesForIdentity = (name: string | null | undefined) => !!name && tableStructureIdentifierComparisonKey(name, databaseType.value, databaseInfo).startsWith("quoted:");
+  // 外键的引用侧（被引用 schema/表/列）与约束名一样进入生成的 REFERENCES
+  // 子句，同样需要纳入大小写敏感扫描，否则会被折叠改写身份。
+  const foreignKeyIdentifiers = foreignKeys.value.flatMap((foreignKey) => {
+    const original = foreignKey.original;
+    return original ? [original.name, original.ref_schema, original.ref_table, original.ref_column] : [];
+  });
+  return [props.tableName, ...columns.value.map((column) => column.original?.name), ...indexes.value.map((index) => index.original?.name), ...foreignKeyIdentifiers, ...triggers.value.map((trigger) => trigger.original?.name)].some(requiresQuotesForIdentity);
+});
 const usesSqliteRebuildStrategy = computed(() => !isCreateMode.value && structureCapabilities.value.alterStrategy === "sqlite-rebuild");
 const hasSqliteTypeChange = computed(() => usesSqliteRebuildStrategy.value && hasExistingColumnTypeChange(columns.value));
 const canAddColumn = computed(() => canAddTableStructureColumn(databaseType.value, isCreateMode.value));
@@ -1245,6 +1643,7 @@ function structureScrollerForTab(tab: TableInfoTab): HTMLElement | undefined {
   if (tab === "foreignKeys") return structureScrollerElement(foreignKeysScrollerRef.value);
   if (tab === "constraints") return structureScrollerElement(constraintsScrollerRef.value);
   if (tab === "triggers") return structureScrollerElement(triggersScrollerRef.value);
+  if (tab === "partitions") return structureScrollerElement(partitionsScrollerRef.value);
   if (tab === "ddl") return structureScrollerElement(ddlScrollerRef.value);
   return undefined;
 }
@@ -1366,7 +1765,10 @@ function restoreStructureScrollPosition(tab = activeTab.value) {
 function onStructureContentScroll(tab: TableInfoTab, event: Event) {
   const target = event.currentTarget;
   if (!(target instanceof HTMLElement)) return;
-  if (tab === "columns" || tab === "indexes") updateStructureHorizontalScrollbar(target);
+  if (tab === "columns" || tab === "indexes") {
+    updateStructureHorizontalScrollbar(target);
+    if (activeTab.value === tab) onStructureVerticalScrollerScroll();
+  }
   const position: TableStructureEditorViewport = {
     scrollTop: Math.max(0, Math.round(target.scrollTop)),
     scrollLeft: Math.max(0, Math.round(target.scrollLeft)),
@@ -1392,6 +1794,8 @@ function createCurrentDraft(initialized = true): TableStructureEditorDraft {
     // Only carried alongside an actual edit: without a draft the baseline is
     // refetched, and copying every table's DDL into every draft is pure weight.
     ddlContent: ddlDraft.value === null ? undefined : ddlContent.value,
+    rawDdlContent: ddlDraft.value === null ? undefined : rawDdlContent.value,
+    excludeDdlStorage: ddlStorageExcluded.value,
     newTableName: newTableName.value,
     tableComment: tableComment.value,
     originalTableComment: originalTableComment.value,
@@ -1408,6 +1812,11 @@ function createCurrentDraft(initialized = true): TableStructureEditorDraft {
     constraintsLoaded: constraintsLoaded.value,
     triggers: cloneDraftValue(triggers.value),
     triggersLoaded: triggersLoaded.value,
+    partitionOperations: cloneDraftValue(partitionOperations.value),
+    createPartitioningEnabled: createPartitioningEnabled.value,
+    createPartitioningKind: createPartitioningKind.value,
+    createPartitioningColumns: cloneDraftValue(createPartitioningColumns.value),
+    createPartitioningExpression: createPartitioningExpression.value,
     loadedMetadataFacets: [...loadedMetadataFacets],
     scrollPositions: cloneDraftValue(structureScrollPositions.value),
     appliedInitialTabRequestId: lastAppliedInitialTabRequestId,
@@ -1431,7 +1840,8 @@ function restoreDraft(draft: TableStructureEditorDraft) {
   // Restore the DDL baseline alongside the edit, otherwise the restored script
   // would read as dirty (or clean) against the wrong reference text.
   if (draft.ddlContent) {
-    ddlContent.value = draft.ddlContent;
+    rawDdlContent.value = draft.rawDdlContent ?? draft.ddlContent;
+    ddlStorageExcluded.value = draft.excludeDdlStorage ?? false;
     ddlFetched.value = true;
   }
   ddlDraft.value = draft.ddlDraft ?? null;
@@ -1461,6 +1871,11 @@ function restoreDraft(draft: TableStructureEditorDraft) {
   triggers.value = cloneDraftValue(draft.triggers || []);
   // Drafts created before lazy trigger loading always contained live trigger metadata.
   triggersLoaded.value = draft.triggersLoaded ?? true;
+  partitionOperations.value = cloneDraftValue(draft.partitionOperations || []);
+  createPartitioningEnabled.value = draft.createPartitioningEnabled ?? false;
+  createPartitioningKind.value = draft.createPartitioningKind ?? "range";
+  createPartitioningColumns.value = cloneDraftValue(draft.createPartitioningColumns || []);
+  createPartitioningExpression.value = draft.createPartitioningExpression ?? "";
   loadedMetadataFacets.clear();
   if (draft.loadedMetadataFacets) {
     for (const facet of draft.loadedMetadataFacets) loadedMetadataFacets.add(facet);
@@ -1500,7 +1915,9 @@ async function hydrateRestoredDraftFromDatabase() {
     if (databaseType.value === "manticoresearch" && tableMetadataCapabilities.value.ddl) {
       try {
         const { ddl } = await loadObjectDdl({ connectionId, database, schema, tableName, catalog });
-        ddlContent.value = await formatSqlForDisplay(ddl, sqlFormatDialectForDbType(databaseType.value), settingsStore.editorSettings.sqlFormatter);
+        const dialect = sqlFormatDialectForDbType(databaseType.value);
+        const formatted = await formatSqlForDisplay(ddl, dialect, settingsStore.editorSettings.sqlFormatter);
+        rawDdlContent.value = formatDdlForDisplay(formatted, dialect);
         ddlFetched.value = true;
         nextColumns = applyManticoreDdlColumnExtras(nextColumns, ddl);
       } catch {
@@ -1525,7 +1942,17 @@ function markDraftHydratedAndSync() {
 
 function hasPendingStructureChanges(): boolean {
   if (isCreateMode.value) {
-    return !!newTableName.value.trim() || !!tableComment.value.trim() || mysqlTableEngine.value !== originalMysqlTableEngine.value || columns.value.length > 0 || indexes.value.length > 0 || foreignKeys.value.length > 0 || triggers.value.length > 0;
+    return (
+      !!newTableName.value.trim() ||
+      !!tableComment.value.trim() ||
+      mysqlTableEngine.value !== originalMysqlTableEngine.value ||
+      columns.value.length > 0 ||
+      indexes.value.length > 0 ||
+      foreignKeys.value.length > 0 ||
+      triggers.value.length > 0 ||
+      createPartitioningEnabled.value ||
+      partitionOperations.value.length > 0
+    );
   }
   const scope = captureStructureRefreshScope();
   return (
@@ -1534,6 +1961,7 @@ function hasPendingStructureChanges(): boolean {
     scope.foreignKeys ||
     scope.triggers ||
     scope.tableComment ||
+    partitionOperations.value.length > 0 ||
     mysqlTableEngine.value.toLowerCase() !== originalMysqlTableEngine.value.toLowerCase() ||
     (canBuildMysqlAutoIncrement.value && mysqlAutoIncrementValue.value !== originalMysqlAutoIncrementValue.value) ||
     (supportsTableOwner.value && tableOwner.value.trim() !== originalTableOwner.value.trim())
@@ -1694,6 +2122,20 @@ function structureChangeOptions(): BuildTableStructureChangeSqlOptions {
   };
 }
 
+function partitionSqlOptions(): TablePartitionSqlOptions {
+  return {
+    databaseType: databaseType.value,
+    driverProfile: connection.value?.driver_profile,
+    // `metadataSchema` normalizes the fallback (database as schema, empty → public
+    // on the backend), so DDL stays schema-qualified like every other statement.
+    schema: metadataSchema.value,
+    // Create mode has no table yet: the pending partition operations target the
+    // new table's name.
+    tableName: isCreateMode.value ? newTableName.value.trim() : props.tableName || "",
+    operations: partitionOperations.value,
+  };
+}
+
 async function refreshSqlPreview() {
   const requestId = ++sqlPreviewRequestId;
   if (concurrentAvailabilityInvalidated.value) {
@@ -1741,9 +2183,16 @@ async function refreshSqlPreview() {
   }
   sqlPreviewLoading.value = true;
   const options = structureChangeOptions();
+  const partitionResultPromise = partitionOperations.value.length > 0 ? api.buildTablePartitionOperationSql(partitionSqlOptions()) : Promise.resolve({ statements: [], warnings: [] });
   try {
-    const [result, ownerResult, mysqlAutoIncrementStatement] = await Promise.all([
-      isCreateMode.value ? api.buildCreateTableSql(options) : hasSqliteTypeChange.value ? api.previewSqliteTableStructureChange(props.connectionId, props.database, options) : api.buildTableStructureChangeSql(options),
+    const [result, ownerResult, mysqlAutoIncrementStatement, partitionResult] = await Promise.all([
+      isCreateMode.value
+        ? createPartitioningEnabled.value
+          ? api.buildCreatePartitionedTableSql({ options, partitioning: { kind: createPartitioningKind.value, columns: createPartitioningColumns.value, expression: createPartitioningExpression.value } })
+          : api.buildCreateTableSql(options)
+        : hasSqliteTypeChange.value
+          ? api.previewSqliteTableStructureChange(props.connectionId, props.database, options)
+          : api.buildTableStructureChangeSql(options),
       supportsTableOwner.value
         ? api.buildTableOwnerChangeSql({
             databaseType: databaseType.value,
@@ -1763,12 +2212,13 @@ async function refreshSqlPreview() {
         tableName: props.tableName || "",
         buildSql: api.buildMysqlAutoIncrementSql,
       }),
+      partitionResultPromise,
     ]);
     if (requestId !== sqlPreviewRequestId) return;
-    const statements = [...result.statements, ...ownerResult.statements, ...(mysqlAutoIncrementStatement ? [mysqlAutoIncrementStatement] : [])];
+    const statements = [...result.statements, ...ownerResult.statements, ...(mysqlAutoIncrementStatement ? [mysqlAutoIncrementStatement] : []), ...partitionResult.statements];
     // SQLite type-change apply regenerates this revision-checked plan, so its preview must stay byte-for-byte aligned.
-    pendingStatements.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers !== false || hasSqliteTypeChange.value ? statements : statements.map((statement) => formatGeneratedDdlIdentifierQuotes(statement, sqlFormatDialectForDbType(databaseType.value), false));
-    warnings.value = [...result.warnings, ...ownerResult.warnings];
+    pendingStatements.value = hasSqliteTypeChange.value ? statements : statements.map((statement) => formatDdlForDisplay(statement, sqlFormatDialectForDbType(databaseType.value), true));
+    warnings.value = [...result.warnings, ...ownerResult.warnings, ...partitionResult.warnings];
     sqliteSchemaRevision.value = "schemaRevision" in result && typeof result.schemaRevision === "string" ? result.schemaRevision : undefined;
   } catch (e: any) {
     if (requestId !== sqlPreviewRequestId) return;
@@ -1815,9 +2265,13 @@ function resetState() {
   foreignKeysLoading.value = false;
   constraintsLoading.value = false;
   triggersLoading.value = false;
+  partitionsLoading.value = false;
+  partitionsError.value = "";
   errorMessage.value = "";
   secondaryMetadataErrors.value = {};
   isPartitionedParent.value = false;
+  isTablePartition.value = false;
+  partitionStatusResolved.value = false;
   partitionStatusKnown.value = true;
   concurrentAvailabilityInvalidated.value = false;
   columns.value = [];
@@ -1828,10 +2282,16 @@ function resetState() {
   foreignKeys.value = [];
   constraints.value = [];
   constraintsLoaded.value = false;
+  partitioning.value = null;
   triggers.value = [];
   triggersLoaded.value = false;
+  partitionOperations.value = [];
+  createPartitioningEnabled.value = false;
+  createPartitioningKind.value = "range";
+  createPartitioningColumns.value = [];
+  createPartitioningExpression.value = "";
   clearColumnSelection();
-  ddlContent.value = "";
+  rawDdlContent.value = "";
   ddlDraft.value = null;
   ddlFetched.value = false;
   loadedMetadataFacets.clear();
@@ -1879,6 +2339,12 @@ async function reloadStructureFromDatabase() {
     constraints.value = [];
     constraintsLoaded.value = false;
   }
+  if (activeTab.value !== "partitions") {
+    partitioning.value = null;
+  }
+  // Refreshing from the database discards every other draft; pending partition
+  // operations must not survive it and still be applied on save.
+  partitionOperations.value = [];
   const refreshDdl = activeTab.value === "ddl";
   const metadataMatch = { connectionId: props.connectionId, database: props.database, schema: metadataSchema.value, tableName: props.tableName };
   invalidateTableMetadataCache(metadataMatch);
@@ -1901,6 +2367,7 @@ function setSecondaryMetadataLoading(scope: TableStructureRefreshScope, value: b
   if (scope.foreignKeys && tableMetadataCapabilities.value.foreignKeys) foreignKeysLoading.value = value;
   if (scope.constraints && tableMetadataCapabilities.value.constraints) constraintsLoading.value = value;
   if (scope.triggers && tableMetadataCapabilities.value.triggers) triggersLoading.value = value;
+  if (scope.partitions && tableMetadataCapabilities.value.partitions) partitionsLoading.value = value;
 }
 
 function withRequiredPostgresPrimaryKeyMetadata(scope: TableStructureRefreshScope): TableStructureRefreshScope {
@@ -2096,6 +2563,7 @@ async function loadStructure(
   setSecondaryMetadataLoading(effectiveScope, true);
   errorMessage.value = "";
   secondaryMetadataErrors.value = {};
+  partitionsError.value = "";
   let secondaryMetadataScheduled = false;
   let loadedSuccessfully = false;
   let columnsServedFromCache = false;
@@ -2107,7 +2575,7 @@ async function loadStructure(
     const metadataRequest = ddlRequest();
     const forceMetadata = options.forceMetadata === true;
     const partitionStatusPromise =
-      databaseType.value === "postgres" && !isCreateMode.value
+      tableMetadataCapabilities.value.partitions && !isCreateMode.value
         ? api
             .getTablePartitionStatus(connectionId, database, schema, tableName)
             // No reactive mutation inside the catch: a stale request must not
@@ -2145,6 +2613,11 @@ async function loadStructure(
         ? loadObjectMetadataFacet(metadataRequest, "triggers", () => api.listTriggers(connectionId, database, schema, tableName, catalog), { force: forceMetadata }).then((result) => result.value)
         : Promise.resolve([])
       : Promise.resolve(undefined);
+    // Partition metadata is a live catalog read (not persisted), so it is
+    // fetched directly rather than through the object metadata cache.
+    // Create mode has no catalog entry to read; the Partitions tab edits a
+    // local `PARTITION BY` declaration instead.
+    const partitioningPromise = effectiveScope.partitions && !isCreateMode.value ? (tableMetadataCapabilities.value.partitions ? api.getTablePartitioning(connectionId, database, schema, tableName) : Promise.resolve(undefined)) : Promise.resolve(undefined);
     const tableCommentLoad = effectiveScope.tableComment && structureCapabilities.value.comment ? loadCachedTableComment(metadataRequest, forceMetadata) : undefined;
     const tableCommentPromise = tableCommentLoad
       ? tableCommentLoad.then((result) => {
@@ -2158,7 +2631,9 @@ async function loadStructure(
       if (databaseType.value === "manticoresearch" && tableMetadataCapabilities.value.ddl) {
         try {
           const { ddl } = await loadObjectDdl({ connectionId, database, schema, tableName, catalog }, { force: options.forceDdl });
-          ddlContent.value = await formatSqlForDisplay(ddl, sqlFormatDialectForDbType(databaseType.value), settingsStore.editorSettings.sqlFormatter);
+          const dialect = sqlFormatDialectForDbType(databaseType.value);
+          const formatted = await formatSqlForDisplay(ddl, dialect, settingsStore.editorSettings.sqlFormatter);
+          rawDdlContent.value = formatDdlForDisplay(formatted, dialect);
           ddlFetched.value = true;
           nextColumns = applyManticoreDdlColumnExtras(nextColumns, ddl);
         } catch {
@@ -2189,6 +2664,8 @@ async function loadStructure(
     if (requestId === structureLoadRequestId) {
       partitionStatusKnown.value = partitionStatus.known;
       isPartitionedParent.value = partitionStatus.status.isPartitionedParent;
+      isTablePartition.value = partitionStatus.status.isPartition;
+      partitionStatusResolved.value = true;
       // Availability inputs changed: fail closed while the status is unknown,
       // but preserve the user's Concurrent intent so a later successful probe
       // can regenerate the same SQL. Definitive unsupported states still clear
@@ -2200,7 +2677,7 @@ async function loadStructure(
       }
     }
     const applySecondaryMetadata = async () => {
-      const [indexesResult, foreignKeysResult, constraintsResult, triggersResult] = await Promise.allSettled([indexesPromise, foreignKeysPromise, constraintsPromise, triggersPromise]);
+      const [indexesResult, foreignKeysResult, constraintsResult, triggersResult, partitioningResult] = await Promise.allSettled([indexesPromise, foreignKeysPromise, constraintsPromise, triggersPromise, partitioningPromise]);
       if (requestId !== structureLoadRequestId) return;
 
       type SecondaryMetadataResult = { facet: ObjectMetadataFacet; result: PromiseSettledResult<unknown> };
@@ -2241,6 +2718,17 @@ async function loadStructure(
         triggers.value = createTriggerDrafts(nextTriggers);
         triggersLoaded.value = true;
         loadedMetadataFacets.add("triggers");
+      }
+      if (partitioningResult.status === "fulfilled" && partitioningResult.value !== undefined) {
+        partitioning.value = partitioningResult.value;
+        loadedMetadataFacets.add("partitions");
+      } else if (partitioningResult.status === "rejected") {
+        console.warn("[DBX][structure-editor:partitions-metadata-failed]", partitioningResult.reason);
+        if (showErrors) partitionsError.value = partitioningResult.reason?.message || String(partitioningResult.reason);
+        // Mark the facet loaded even on failure: the tab-activation watcher
+        // only refetches unloaded facets, so leaving it unloaded would retry in
+        // a loop. The toolbar Refresh clears the facet and retries explicitly.
+        loadedMetadataFacets.add("partitions");
       }
     };
 
@@ -2295,6 +2783,7 @@ async function revalidateCachedStructureMetadata(loadRequestId: number, scope: {
   const revalidationId = ++structureMetadataRevalidationId;
   const metadataRequest = { connectionId, database, schema, tableName, catalog };
   try {
+    await store.ensureConnected(connectionId);
     // Force alone only clears this facet's own key; the web backend keeps its
     // own backend-columns/backend-comment entries under the same table prefix
     // and would serve them to the forced re-fetch. Drop the whole table scope
@@ -2444,14 +2933,14 @@ const copyableSourceColumns = computed(() => {
   const existingNames = new Set(columns.value.filter((column) => !column.markedForDrop).map((column) => tableStructureIdentifierComparisonKey(column.name, databaseType.value, databaseInfo)));
   return copySourceColumns.value.map((column) => ({
     column,
+    details: copySourceColumnDetails(column, databaseType.value),
     alreadyExists: existingNames.has(tableStructureIdentifierComparisonKey(column.name, databaseType.value, databaseInfo)),
   }));
 });
 
 const filteredCopyableSourceColumns = computed(() => {
-  const search = normalizedColumnSearch(copySourceColumnSearch.value);
-  if (!search) return copyableSourceColumns.value;
-  return copyableSourceColumns.value.filter(({ column }) => [column.name, column.data_type, column.comment ?? ""].some((value) => normalizedColumnSearch(value).includes(search)));
+  if (!normalizedColumnSearch(copySourceColumnSearch.value)) return copyableSourceColumns.value;
+  return copyableSourceColumns.value.filter(({ column }) => matchesCopySourceColumnSearch(column, copySourceColumnSearch.value, databaseType.value));
 });
 
 const copyableSourceColumnNames = computed(() => copyableSourceColumns.value.filter(({ alreadyExists }) => !alreadyExists).map(({ column }) => column.name));
@@ -3652,6 +4141,20 @@ async function recordStructureHistory(sql: string, start: number, success: boole
   }
 }
 
+const copyColumnNamesDialogOpen = ref(false);
+// Fields marked for drop no longer exist after saving, so they are excluded.
+const copyableStructureColumnNames = computed(() => structureColumnNamesForCopy(columns.value));
+const copyableStructureColumnComments = computed(() => structureColumnCommentsForCopy(columns.value));
+
+async function copyColumnNamesText(text: string) {
+  try {
+    await copyToClipboard(text);
+    toast(t("grid.copied"));
+  } catch (e: any) {
+    toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
 async function copyPreviewSql() {
   if (sqlPreviewPending.value || sqlPreviewLoading.value || !previewSqlText.value.trim()) return;
   try {
@@ -3708,11 +4211,18 @@ async function applyChanges() {
   // A hand-written DDL script can change anything about the table, and the
   // structure draft it was applied from is clean, so the change-derived scope
   // would be empty: reload every facet instead of leaving the tabs stale.
-  const refreshScope = ddlDirty.value ? { columns: true, indexes: true, foreignKeys: true, constraints: true, triggers: true, tableComment: true } : captureStructureRefreshScope();
+  const refreshScope = ddlDirty.value ? { columns: true, indexes: true, foreignKeys: true, constraints: true, triggers: true, partitions: true, tableComment: true } : captureStructureRefreshScope();
   // Plan A guard: concurrent builds only run with a long-enough query timeout
   // (a cancelled build leaves an INVALID index behind), and are blocked
   // up-front when a same-name INVALID index already exists.
   const hasConcurrentIndexBuild = pendingStatements.value.some((statement) => statement.includes("CONCURRENTLY"));
+  // Partition DDL (create parent + initial partitions, attach/detach/drop
+  // chains, ...) must land atomically: a mid-batch failure would otherwise
+  // leave a half-created hierarchy behind. CONCURRENTLY statements cannot run
+  // inside a transaction block, so their presence keeps the batch on the
+  // auto-commit path (the core also refuses that combination).
+  const partitionDdlPending = partitionOperations.value.length > 0 || (isCreateMode.value && createPartitioningEnabled.value);
+  const useTransaction = !hasConcurrentIndexBuild && partitionDdlPending;
   if (hasConcurrentIndexBuild && !isCreateMode.value && databaseType.value === "postgres" && props.tableName) {
     const concurrentIndexNames = concurrentIndexNamesInStatements(pendingStatements.value);
     if (concurrentIndexNames.length > 0) {
@@ -3750,7 +4260,7 @@ async function applyChanges() {
     const result =
       hasSqliteTypeChange.value && !ddlDirty.value
         ? await api.applySqliteTableStructureChange(props.connectionId, props.database, structureChangeOptions(), sqliteSchemaRevision.value!)
-        : await api.executeBatch(props.connectionId, props.database, pendingStatements.value, props.schema, executionTimeoutSecs);
+        : await api.executeBatch(props.connectionId, props.database, pendingStatements.value, props.schema, executionTimeoutSecs, useTransaction);
     await recordStructureHistory(sql, startedAt, true, result);
     if (!isCreateMode.value && props.tableName) {
       const metadataMatch = { connectionId: props.connectionId, database: props.database, schema: metadataSchema.value, tableName: props.tableName };
@@ -3765,8 +4275,11 @@ async function applyChanges() {
     pendingStatements.value = [];
     warnings.value = [];
     sqliteSchemaRevision.value = undefined;
+    // Partition operations are applied in place; drop them now so the reload
+    // below reflects the new catalog state instead of replaying them.
+    partitionOperations.value = [];
     ddlFetched.value = false;
-    ddlContent.value = "";
+    rawDdlContent.value = "";
     ddlDraft.value = null;
     if (isCreateMode.value) {
       clearDraft();
@@ -3917,15 +4430,23 @@ onMounted(() => {
   void loadTableOwnerRoles();
   void loadMysqlTableEngine(props.draft?.mysqlTableEngine !== undefined);
   if (props.draft?.initialized) {
-    void hydrateRestoredDraftFromDatabase().then(() => {
+    // A clean persisted editor snapshot is not a live schema cache. After an
+    // MCP DDL, restoring its loaded-facet flags would otherwise bypass the
+    // invalidated backend cache entirely. Legacy/dirty drafts remain intact.
+    const revalidateRestoredColumns = props.draft.dirty === false && !isCreateMode.value && loadedMetadataFacets.has("columns") && !(databaseType.value === "manticoresearch" && tableMetadataCapabilities.value.ddl);
+    void hydrateRestoredDraftFromDatabase().then(async () => {
       applyInitialStructureTarget();
       void loadMysqlAutoIncrementCounter(true);
-      void loadActiveTableStructureMetadataIfNeeded();
+      await loadActiveTableStructureMetadataIfNeeded();
+      if (revalidateRestoredColumns) {
+        // The existing revalidation checks again for edits made while loading.
+        void revalidateCachedStructureMetadata(structureLoadRequestId, { columns: true, tableComment: false }, undefined);
+      }
     });
   } else if (isCreateMode.value) {
     markDraftHydratedAndSync();
   } else if (activeTab.value === "ddl") {
-    void Promise.all([fetchDdl(), loadVisibleTableComment()]).then(markDraftHydratedAndSync);
+    void Promise.all([fetchDdl(), loadVisibleTableComment(), probePartitionsTabVisibility()]).then(markDraftHydratedAndSync);
   } else {
     void loadStructure(false, visibleTableStructureRefreshScope(activeTab.value), true, { blockSecondaryMetadata: true }).then(() => applyInitialStructureTarget());
   }
@@ -3962,6 +4483,7 @@ onDeactivated(() => {
 });
 onBeforeUnmount(() => {
   clearCopySourceTableSearchTimer();
+  if (partitionDialogSqlTimer) clearTimeout(partitionDialogSqlTimer);
   stopColumnDragTracking();
   stopStructureHorizontalScrollbarDrag();
   structureHorizontalScrollbarObserverGeneration += 1;
@@ -4048,6 +4570,14 @@ watch(tableMetadataCapabilities, (capabilities) => {
   if (!localIsStructureMetadataTabSupported(activeTab.value, capabilities)) activeTab.value = localFirstStructureMetadataTab(capabilities);
 });
 
+// The Partitions tab vanishes for a non-partitioned table, so an active (or
+// navigation-requested) partitions tab must fall back once the probe settles.
+watch([activeTab, partitionStatusResolved, isPartitionedParent, isTablePartition], () => {
+  if (activeTab.value !== "partitions" || isCreateMode.value || !partitionStatusResolved.value) return;
+  if (isPartitionedParent.value || isTablePartition.value) return;
+  activeTab.value = localFirstStructureMetadataTab();
+});
+
 watch(structureCapabilities, () => {
   // Capability loss (e.g. PostgreSQL < 11 without concurrent index support)
   // invalidates any selected Concurrent flag the same way a probe failure
@@ -4095,6 +4625,11 @@ watch(
     indexes,
     foreignKeys,
     triggers,
+    partitionOperations,
+    createPartitioningEnabled,
+    createPartitioningKind,
+    createPartitioningColumns,
+    createPartitioningExpression,
   ],
   () => {
     scheduleSqlPreviewRefresh();
@@ -4158,13 +4693,17 @@ watch(refreshVersion, (version, previous) => {
     constraints.value = [];
     constraintsLoaded.value = false;
   }
+  if (activeTab.value !== "partitions") {
+    partitioning.value = null;
+    loadedMetadataFacets.delete("partitions");
+  }
   void loadStructure(true, visibleTableStructureRefreshScope(activeTab.value));
 });
 
 async function loadActiveTableStructureMetadataIfNeeded() {
   if (!structureEditorReady || isCreateMode.value) return;
   if (activeTab.value === "ddl") {
-    await Promise.all([ddlLoading.value ? Promise.resolve() : fetchDdl(), loadVisibleTableComment(false, true)]);
+    await Promise.all([ddlLoading.value ? Promise.resolve() : fetchDdl(), loadVisibleTableComment(false, true), probePartitionsTabVisibility()]);
     return;
   }
   if (loading.value || secondaryMetadataLoading.value) return;
@@ -4297,8 +4836,8 @@ watch(
 
     <div v-else class="flex min-h-0 flex-1 flex-col gap-2 overflow-hidden">
       <div class="min-h-0 min-w-0 flex-1 overflow-hidden rounded-md border">
-        <Tabs v-model="activeTab" class="flex h-full min-h-0 flex-col">
-          <div class="flex shrink-0 items-center justify-between gap-2 border-b px-2 py-[var(--structure-header-py)]">
+        <Tabs v-model="activeTab" class="structure-tabs h-full min-h-0">
+          <div class="col-start-1 row-start-1 flex shrink-0 items-center justify-between gap-2 border-b px-2 py-[var(--structure-header-py)]">
             <TabsList>
               <TabsTrigger v-if="tableMetadataCapabilities.ddl && !isCreateMode" value="ddl">
                 DDL
@@ -4309,8 +4848,13 @@ watch(
               <TabsTrigger v-if="tableMetadataCapabilities.foreignKeys" value="foreignKeys">{{ t("structureEditor.foreignKeys") }}</TabsTrigger>
               <TabsTrigger v-if="tableMetadataCapabilities.constraints" value="constraints">{{ t("structureEditor.constraints") }}</TabsTrigger>
               <TabsTrigger v-if="tableMetadataCapabilities.triggers" value="triggers">{{ t("structureEditor.triggers") }}</TabsTrigger>
+              <TabsTrigger v-if="showPartitionsTab" value="partitions">{{ t("structureEditor.partitions") }}</TabsTrigger>
             </TabsList>
             <div class="flex shrink-0 items-center gap-1.5">
+              <Button v-if="!isCreateMode" size="sm" variant="outline" :class="structureToolbarButtonClass" data-structure-view-data @click="emit('viewData')">
+                <Rows3 :class="structureIconClass" />
+                {{ t("contextMenu.viewData") }}
+              </Button>
               <div class="flex items-center gap-1.5">
                 <SlidersHorizontal :class="[structureIconClass, 'text-muted-foreground']" />
                 <div ref="structureDensityMenuRef" class="relative">
@@ -4376,6 +4920,10 @@ watch(
                 <Copy :class="structureIconClass" />
                 {{ t("structureEditor.copyColumns") }}
               </Button>
+              <Button v-if="activeTab === 'columns'" size="sm" variant="outline" :class="structureToolbarButtonClass" :disabled="copyableStructureColumnNames.length === 0" @click="copyColumnNamesDialogOpen = true">
+                <ClipboardList :class="structureIconClass" />
+                {{ t("grid.copyColumnNames") }}
+              </Button>
               <Button v-if="isCreateMode && activeTab === 'columns'" size="sm" variant="outline" :class="structureToolbarButtonClass" :disabled="!canAddColumn" @click="applyColumnTemplate(PRESET_FIELDS_TEMPLATE_ID)">
                 <Copy :class="structureIconClass" />
                 {{ t("structureEditor.columnTemplates") }}
@@ -4416,8 +4964,8 @@ watch(
             </div>
           </div>
 
-          <TabsContent ref="columnsScrollerRef" v-if="tableMetadataCapabilities.columns" value="columns" class="structure-table-scroller m-0 min-h-0 flex-1 overflow-auto p-0" @scroll.passive="onStructureContentScroll('columns', $event)">
-            <table class="structure-edit-grid border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: visibleColWidths.reduce((a, w) => a + w, 0) + 'px' }">
+          <TabsContent ref="columnsScrollerRef" v-if="tableMetadataCapabilities.columns" value="columns" class="col-start-1 row-start-2 structure-table-scroller m-0 min-h-0 flex-1 overflow-auto p-0" @scroll.passive="onStructureContentScroll('columns', $event)">
+            <table ref="columnsTableRef" class="structure-edit-grid border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: visibleColWidths.reduce((a, w) => a + w, 0) + 'px' }">
               <thead class="sticky top-0 z-10 bg-background">
                 <tr>
                   <th
@@ -4874,7 +5422,7 @@ watch(
             </table>
           </TabsContent>
 
-          <TabsContent ref="indexesScrollerRef" v-if="tableMetadataCapabilities.indexes" value="indexes" class="structure-table-scroller m-0 min-h-0 flex-1 overflow-auto p-0" @scroll.passive="onStructureContentScroll('indexes', $event)">
+          <TabsContent ref="indexesScrollerRef" v-if="tableMetadataCapabilities.indexes" value="indexes" class="col-start-1 row-start-2 structure-table-scroller m-0 min-h-0 flex-1 overflow-auto p-0" @scroll.passive="onStructureContentScroll('indexes', $event)">
             <div v-if="indexesLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("common.loading") }}
@@ -4882,7 +5430,7 @@ watch(
             <div v-else-if="secondaryMetadataErrors.indexes" class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
               {{ secondaryMetadataErrors.indexes }}
             </div>
-            <table v-else class="structure-edit-grid border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: indexColWidths.reduce((a, w) => a + w, 0) + 'px' }">
+            <table v-else ref="indexesTableRef" class="structure-edit-grid border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: indexColWidths.reduce((a, w) => a + w, 0) + 'px' }">
               <thead class="sticky top-0 z-10 bg-background">
                 <tr>
                   <th
@@ -4988,11 +5536,27 @@ watch(
             </table>
           </TabsContent>
 
-          <div v-if="hasStructureHorizontalOverflow && (activeTab === 'columns' || activeTab === 'indexes')" ref="structureHorizontalScrollbarTrackRef" class="structure-horizontal-scrollbar" @pointerdown="startStructureHorizontalScrollbarDrag">
+          <div v-if="hasStructureHorizontalOverflow && (activeTab === 'columns' || activeTab === 'indexes')" ref="structureHorizontalScrollbarTrackRef" class="structure-horizontal-scrollbar col-start-1 row-start-3" @pointerdown="startStructureHorizontalScrollbarDrag">
             <div ref="structureHorizontalScrollbarThumbRef" class="structure-horizontal-scrollbar__thumb" />
           </div>
 
-          <TabsContent ref="foreignKeysScrollerRef" v-if="tableMetadataCapabilities.foreignKeys" value="foreignKeys" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('foreignKeys', $event)">
+          <div
+            v-if="hasStructureVerticalOverflow && (activeTab === 'columns' || activeTab === 'indexes')"
+            ref="structureVerticalScrollbarTrackRef"
+            class="structure-vertical-scrollbar col-start-2 row-start-2"
+            :class="{ 'structure-vertical-scrollbar--scrolling': isStructureVerticalScrollbarScrolling, 'structure-vertical-scrollbar--dragging': isStructureVerticalScrollbarDragging }"
+            @pointerdown="onStructureVerticalScrollbarTrackPointerDown"
+          >
+            <div class="structure-vertical-scrollbar__thumb" :style="structureVerticalScrollbarThumbStyle" @pointerdown.stop="onStructureVerticalScrollbarThumbPointerDown" />
+          </div>
+
+          <TabsContent
+            ref="foreignKeysScrollerRef"
+            v-if="tableMetadataCapabilities.foreignKeys"
+            value="foreignKeys"
+            class="col-start-1 row-start-2 structure-card-scroller m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]"
+            @scroll.passive="onStructureContentScroll('foreignKeys', $event)"
+          >
             <div v-if="foreignKeysLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("common.loading") }}
@@ -5045,7 +5609,13 @@ watch(
             </div>
           </TabsContent>
 
-          <TabsContent ref="constraintsScrollerRef" v-if="tableMetadataCapabilities.constraints" value="constraints" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('constraints', $event)">
+          <TabsContent
+            ref="constraintsScrollerRef"
+            v-if="tableMetadataCapabilities.constraints"
+            value="constraints"
+            class="col-start-1 row-start-2 structure-card-scroller m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]"
+            @scroll.passive="onStructureContentScroll('constraints', $event)"
+          >
             <div v-if="constraintsLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("common.loading") }}
@@ -5071,7 +5641,7 @@ watch(
             </div>
           </TabsContent>
 
-          <TabsContent ref="triggersScrollerRef" v-if="tableMetadataCapabilities.triggers" value="triggers" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('triggers', $event)">
+          <TabsContent ref="triggersScrollerRef" v-if="tableMetadataCapabilities.triggers" value="triggers" class="col-start-1 row-start-2 structure-card-scroller m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('triggers', $event)">
             <div v-if="triggersLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("common.loading") }}
@@ -5157,13 +5727,164 @@ watch(
             </div>
           </TabsContent>
 
-          <TabsContent ref="ddlScrollerRef" v-if="tableMetadataCapabilities.ddl" value="ddl" force-mount class="relative m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)] data-[state=inactive]:hidden" @scroll.passive="onStructureContentScroll('ddl', $event)">
+          <TabsContent ref="partitionsScrollerRef" v-if="showPartitionsTab" value="partitions" class="col-start-1 row-start-2 structure-card-scroller m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('partitions', $event)">
+            <div v-if="isCreateMode" class="space-y-3">
+              <label class="flex items-center gap-2 text-[length:var(--structure-font-size)]">
+                <input v-model="createPartitioningEnabled" type="checkbox" />
+                {{ t("structureEditor.partitionEnable") }}
+              </label>
+              <template v-if="createPartitioningEnabled">
+                <div class="space-y-1">
+                  <label class="text-sm">{{ t("structureEditor.partitionKind") }}</label>
+                  <Select v-model="createPartitioningKind">
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="range">{{ t("structureEditor.partitionKindRange") }}</SelectItem>
+                      <SelectItem value="list">{{ t("structureEditor.partitionKindList") }}</SelectItem>
+                      <SelectItem value="hash">{{ t("structureEditor.partitionKindHash") }}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div class="space-y-1">
+                  <label class="text-sm">{{ t("structureEditor.partitionKeyColumns") }}</label>
+                  <div class="flex flex-wrap gap-3">
+                    <label v-for="column in partitionCreatableColumns" :key="column" class="flex items-center gap-1 text-sm">
+                      <input v-model="createPartitioningColumns" type="checkbox" :value="column" :disabled="!!createPartitioningExpression.trim()" />
+                      <span class="font-mono">{{ column }}</span>
+                    </label>
+                  </div>
+                  <p v-if="partitionCreatableColumns.length === 0" class="text-sm text-muted-foreground">{{ t("structureEditor.partitionKeyNoColumns") }}</p>
+                </div>
+                <div class="space-y-1">
+                  <label class="text-sm">{{ t("structureEditor.partitionKeyExpression") }}</label>
+                  <Input v-model="createPartitioningExpression" class="font-mono" placeholder="date_trunc('month', ts)" />
+                </div>
+                <div class="flex items-center justify-between">
+                  <span class="text-[length:var(--structure-font-size)] font-medium">{{ t("structureEditor.partitionInitialPartitions") }}</span>
+                  <Button variant="outline" size="sm" :class="structureToolbarButtonClass" @click="openPartitionDialog('create', createPartitioningKind)">
+                    <Plus :class="[structureIconClass, 'mr-1']" />
+                    {{ t("structureEditor.partitionAdd") }}
+                  </Button>
+                </div>
+                <div v-if="partitionOperations.length" class="rounded-md border border-primary/40 bg-primary/5 px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
+                  <div v-for="operation in partitionOperations" :key="operation.id" class="flex items-center justify-between gap-2 py-0.5">
+                    <span class="truncate font-mono">{{ partitionOperationSummary(operation) }}</span>
+                    <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionRemoveOperation')" @click="removePartitionOperation(operation.id)">
+                      <Trash2 :class="structureIconClass" />
+                    </Button>
+                  </div>
+                </div>
+                <p v-else class="text-sm text-muted-foreground">{{ t("structureEditor.partitionInitialPartitionsEmpty") }}</p>
+              </template>
+            </div>
+            <template v-else>
+              <div v-if="partitionsLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
+                <Loader2 class="h-4 w-4 animate-spin" />
+                {{ t("common.loading") }}
+              </div>
+              <div v-else-if="partitionsError" class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                {{ partitionsError }}
+              </div>
+              <div v-else-if="!partitioning || (!partitioning.isPartitioned && !partitioning.isPartition)" class="py-10 text-center text-muted-foreground">
+                {{ t("structureEditor.partitionsEmpty") }}
+              </div>
+              <div v-else class="space-y-2">
+                <div class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <div class="flex flex-wrap items-center gap-1.5">
+                      <Badge v-if="partitioning.isPartitioned" variant="outline">{{ partitionStrategyLabel(partitioning.strategy) }}</Badge>
+                      <Badge v-else variant="outline">{{ t("structureEditor.partitionMemberBadge") }}</Badge>
+                      <span v-if="partitioning.keyDefinition" class="truncate font-mono">{{ partitioning.keyDefinition }}</span>
+                    </div>
+                    <div v-if="canManagePartitions" class="flex shrink-0 items-center gap-1.5">
+                      <Button v-if="partitioning.isPartitioned" variant="outline" size="sm" :class="structureToolbarButtonClass" @click="openPartitionDialog('create')">
+                        <Plus :class="[structureIconClass, 'mr-1']" />
+                        {{ t("structureEditor.partitionAdd") }}
+                      </Button>
+                      <Button v-if="partitioning.isPartitioned" variant="outline" size="sm" :class="structureToolbarButtonClass" @click="openPartitionDialog('attach')">
+                        <ListChevronsUpDown :class="[structureIconClass, 'mr-1']" />
+                        {{ t("structureEditor.partitionAttach") }}
+                      </Button>
+                      <Button v-if="partitioning.isPartition" variant="outline" size="sm" :class="structureToolbarButtonClass" @click="openDetachSelfPartitionDialog">
+                        <X :class="[structureIconClass, 'mr-1']" />
+                        {{ t("structureEditor.partitionDetachSelf") }}
+                      </Button>
+                    </div>
+                  </div>
+                  <div v-if="partitioning.parent" class="mt-1 truncate font-mono text-muted-foreground">{{ t("structureEditor.partitionsParent") }}: {{ partitioning.parent }}</div>
+                  <div v-if="partitioning.ownBound" class="mt-1 truncate font-mono text-muted-foreground">{{ t("structureEditor.partitionsOwnBound") }}: {{ pgPartitionBoundText(partitioning.ownBound) }}</div>
+                  <div v-if="partitioning.defaultPartition" class="mt-1 truncate font-mono text-muted-foreground">{{ t("structureEditor.partitionsDefault") }}: {{ partitioning.defaultPartition }}</div>
+                </div>
+                <div v-if="partitionOperations.length" class="rounded-md border border-primary/40 bg-primary/5 px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
+                  <div class="mb-1 font-medium">{{ t("structureEditor.partitionPendingOperations") }}</div>
+                  <div v-for="operation in partitionOperations" :key="operation.id" class="flex items-center justify-between gap-2 py-0.5">
+                    <span class="truncate font-mono">{{ partitionOperationSummary(operation) }}</span>
+                    <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionRemoveOperation')" @click="removePartitionOperation(operation.id)">
+                      <Trash2 :class="structureIconClass" />
+                    </Button>
+                  </div>
+                </div>
+                <div v-if="partitionTreeRows.length === 0" class="py-10 text-center text-muted-foreground">
+                  {{ t("structureEditor.partitionsEmptyChildren") }}
+                </div>
+                <div v-if="partitionTreeRows.length > 0" class="divide-y overflow-hidden rounded-md border">
+                  <div v-for="row in partitionVisibleRows" :key="row.key" :title="partitionRowHint(row.node)" class="flex items-start gap-1 px-[var(--structure-cell-px)] py-1.5 text-[length:var(--structure-font-size)]">
+                    <span :data-partition-depth="row.depth" :style="{ width: `${row.depth * PARTITION_TREE_INDENT_PX}px` }" class="shrink-0 self-stretch" aria-hidden="true"></span>
+                    <button
+                      v-if="row.node.children.length"
+                      type="button"
+                      class="mt-px h-4 w-4 shrink-0 self-start text-muted-foreground transition-colors hover:text-foreground"
+                      :aria-label="collapsedPartitionKeys.has(row.key) ? t('structureEditor.partitionExpand') : t('structureEditor.partitionCollapse')"
+                      :title="collapsedPartitionKeys.has(row.key) ? t('structureEditor.partitionExpand') : t('structureEditor.partitionCollapse')"
+                      @click="togglePartitionRow(row.key)"
+                    >
+                      <ChevronRight v-if="collapsedPartitionKeys.has(row.key)" :class="structureIconClass" />
+                      <ChevronDown v-else :class="structureIconClass" />
+                    </button>
+                    <span v-else class="mt-px h-4 w-4 shrink-0 self-start" aria-hidden="true"></span>
+                    <div class="min-w-0 flex-1">
+                      <div class="flex flex-wrap items-center justify-between gap-1.5">
+                        <div class="flex flex-wrap items-center gap-1.5">
+                          <span class="font-mono font-medium">{{ row.node.name }}</span>
+                          <Badge v-if="row.node.children.length" variant="outline" class="text-muted-foreground">{{ t("structureEditor.partitionChildCount", { count: row.node.children.length }) }}</Badge>
+                          <Badge v-if="row.depth > 0" variant="outline" class="border-dashed text-muted-foreground">{{ t("structureEditor.partitionSubPartitionBadge") }}</Badge>
+                          <Badge v-if="row.node.strategy" variant="outline">{{ partitionStrategyLabel(row.node.strategy) }}</Badge>
+                          <Badge v-if="row.node.bound?.kind === 'default'" variant="outline" class="text-muted-foreground">{{ t("structureEditor.partitionBoundDefault") }}</Badge>
+                        </div>
+                        <div v-if="canManagePartitions && partitioning.isPartitioned" class="flex shrink-0 items-center gap-0.5">
+                          <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionDetach')" @click="openPartitionRowOperation('detach', row)">
+                            <X :class="structureIconClass" />
+                          </Button>
+                          <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionDrop')" @click="openPartitionRowOperation('drop', row)">
+                            <Trash2 :class="structureIconClass" />
+                          </Button>
+                        </div>
+                      </div>
+                      <div v-if="pgPartitionNodeBoundText(row.node)" class="mt-0.5 truncate font-mono text-muted-foreground">{{ pgPartitionNodeBoundText(row.node) }}</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </TabsContent>
+
+          <TabsContent
+            ref="ddlScrollerRef"
+            v-if="tableMetadataCapabilities.ddl"
+            value="ddl"
+            force-mount
+            class="col-start-1 row-start-2 structure-card-scroller relative m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)] data-[state=inactive]:hidden"
+            @scroll.passive="onStructureContentScroll('ddl', $event)"
+          >
             <div v-if="ddlLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("common.loading") }}
             </div>
             <template v-else>
               <div v-if="ddlContent && !ddlSearchOpen" class="absolute right-3 top-3 z-10 flex items-center gap-1.5">
+                <DdlStorageToggle :database-type="databaseType" :disabled="ddlDirty" />
                 <Button v-if="ddlDirty" variant="outline" size="sm" class="h-7 gap-1 px-2" :title="t('structureEditor.resetDdl')" @click="resetDdlDraft">
                   <RotateCcw class="h-3.5 w-3.5" />
                   {{ t("structureEditor.resetDdl") }}
@@ -5248,6 +5969,7 @@ watch(
       </Button>
     </div>
 
+    <DataGridCopyColumnNamesDialog v-model:open="copyColumnNamesDialogOpen" :column-names="copyableStructureColumnNames" :database-type="databaseType" :column-comments="copyableStructureColumnComments" @copy="copyColumnNamesText" />
     <Dialog v-model:open="copyColumnsDialogOpen">
       <DialogContent class="max-w-xl">
         <DialogHeader>
@@ -5327,10 +6049,18 @@ watch(
               {{ t("structureEditor.copyColumnsNoMatchingFields") }}
             </div>
             <div v-else class="max-h-72 overflow-y-auto rounded-md border">
-              <label v-for="{ column, alreadyExists } in filteredCopyableSourceColumns" :key="column.name" class="flex cursor-pointer items-center gap-2 border-b px-3 py-2 last:border-b-0 hover:bg-muted/50" :class="alreadyExists ? 'cursor-not-allowed opacity-60' : ''">
-                <input v-model="selectedCopySourceColumnNames" type="checkbox" :value="column.name" :disabled="alreadyExists" class="size-4 rounded border-input" />
-                <span class="min-w-0 flex-1 truncate font-mono text-sm">{{ column.name }}</span>
-                <span class="shrink-0 text-xs text-muted-foreground">{{ column.data_type }}</span>
+              <label v-for="{ column, details, alreadyExists } in filteredCopyableSourceColumns" :key="column.name" class="flex cursor-pointer items-start gap-2 border-b px-3 py-2 last:border-b-0 hover:bg-muted/50" :class="alreadyExists ? 'cursor-not-allowed opacity-60' : ''">
+                <input v-model="selectedCopySourceColumnNames" type="checkbox" :value="column.name" :disabled="alreadyExists" class="mt-0.5 size-4 shrink-0 rounded border-input" />
+                <span class="min-w-0 flex-1">
+                  <span class="flex min-w-0 items-center gap-2">
+                    <span class="min-w-0 flex-1 truncate font-mono text-sm">{{ column.name }}</span>
+                    <span class="shrink-0 text-xs text-muted-foreground">{{ column.data_type }}</span>
+                  </span>
+                  <span v-if="(columnEditorControls.defaultValue && details.defaultValue) || (columnEditorControls.comment && details.comment)" class="mt-0.5 flex min-w-0 items-center gap-3 text-xs text-muted-foreground">
+                    <span v-if="columnEditorControls.defaultValue && details.defaultValue" class="min-w-0 truncate" :title="`${t('structureEditor.defaultValue')}: ${details.defaultValue}`">{{ t("structureEditor.defaultValue") }}: {{ details.defaultValue }}</span>
+                    <span v-if="columnEditorControls.comment && details.comment" class="min-w-0 truncate" :title="`${t('structureEditor.comment')}: ${details.comment}`">{{ t("structureEditor.comment") }}: {{ details.comment }}</span>
+                  </span>
+                </span>
                 <Badge v-if="alreadyExists" variant="secondary" class="shrink-0 text-[10px]">{{ t("structureEditor.copyColumnsAlreadyExists") }}</Badge>
               </label>
             </div>
@@ -5342,6 +6072,76 @@ watch(
           <Button :disabled="copySourceColumnsLoading || selectedCopySourceColumns.length === 0" @click="applyCopiedColumns">
             {{ t("structureEditor.copyColumnsApply", { count: selectedCopySourceColumns.length }) }}
           </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <Dialog v-model:open="partitionDialogOpen">
+      <DialogContent class="max-w-md">
+        <DialogHeader>
+          <DialogTitle>{{ partitionOperationLabel(partitionDialogMode) }}</DialogTitle>
+        </DialogHeader>
+        <div class="space-y-3">
+          <div class="space-y-1">
+            <label class="text-sm">{{ t("structureEditor.partitionName") }}</label>
+            <Input v-model="partitionDialogName" class="font-mono" :disabled="partitionDialogMode === 'detach' || partitionDialogMode === 'drop'" :placeholder="t('structureEditor.partitionNamePlaceholder')" />
+          </div>
+          <template v-if="partitionDialogNeedsBound">
+            <div class="space-y-1">
+              <label class="text-sm">{{ t("structureEditor.partitionBoundKind") }}</label>
+              <Select v-model="partitionDialogBoundKind">
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="range">{{ t("structureEditor.partitionKindRange") }}</SelectItem>
+                  <SelectItem value="list">{{ t("structureEditor.partitionKindList") }}</SelectItem>
+                  <SelectItem value="hash">{{ t("structureEditor.partitionKindHash") }}</SelectItem>
+                  <SelectItem value="default">{{ t("structureEditor.partitionBoundDefault") }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <template v-if="partitionDialogBoundKind === 'range'">
+              <div class="space-y-1">
+                <label class="text-sm">{{ t("structureEditor.partitionBoundFrom") }}</label>
+                <Input v-model="partitionDialogRangeFrom" class="font-mono" placeholder="MINVALUE / '2025-01-01'" />
+              </div>
+              <div class="space-y-1">
+                <label class="text-sm">{{ t("structureEditor.partitionBoundTo") }}</label>
+                <Input v-model="partitionDialogRangeTo" class="font-mono" placeholder="'2026-01-01' / MAXVALUE" />
+              </div>
+            </template>
+            <div v-else-if="partitionDialogBoundKind === 'list'" class="space-y-1">
+              <label class="text-sm">{{ t("structureEditor.partitionBoundValues") }}</label>
+              <Input v-model="partitionDialogListValues" class="font-mono" placeholder="1, 2, 3" />
+            </div>
+            <div v-else-if="partitionDialogBoundKind === 'hash'" class="grid grid-cols-2 gap-2">
+              <div class="space-y-1">
+                <label class="text-sm">{{ t("structureEditor.partitionBoundModulus") }}</label>
+                <Input v-model="partitionDialogModulus" class="font-mono" inputmode="numeric" />
+              </div>
+              <div class="space-y-1">
+                <label class="text-sm">{{ t("structureEditor.partitionBoundRemainder") }}</label>
+                <Input v-model="partitionDialogRemainder" class="font-mono" inputmode="numeric" />
+              </div>
+            </div>
+          </template>
+          <label v-else-if="partitionDialogMode === 'detach' && partitionSupportsConcurrentDetach" class="flex items-center gap-2 text-sm">
+            <input v-model="partitionDialogConcurrently" type="checkbox" />
+            {{ t("structureEditor.partitionDetachConcurrently") }}
+          </label>
+          <p v-if="partitionDialogMode === 'detach'" class="text-sm text-muted-foreground">{{ t("structureEditor.partitionDetachWarning") }}</p>
+          <p v-if="partitionDialogMode === 'drop'" class="text-sm text-destructive">{{ t("structureEditor.partitionDropWarning") }}</p>
+          <div v-if="partitionDialogSql || partitionDialogSqlWarnings.length" class="space-y-1">
+            <span class="text-sm text-muted-foreground">{{ t("structureEditor.partitionSqlPreview") }}</span>
+            <pre v-if="partitionDialogSql" class="max-h-40 overflow-auto rounded-md border bg-muted/40 p-2 text-xs font-mono whitespace-pre-wrap break-all">{{ partitionDialogSql }}</pre>
+            <p v-for="warning in partitionDialogSqlWarnings" :key="warning" class="text-xs text-destructive">{{ warning }}</p>
+          </div>
+          <p v-if="partitionDialogError" class="text-sm text-destructive">{{ partitionDialogError }}</p>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" @click="partitionDialogOpen = false">{{ t("common.cancel") }}</Button>
+          <Button :variant="partitionDialogMode === 'drop' ? 'destructive' : 'default'" @click="confirmPartitionDialog">{{ t("common.confirm") }}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -5370,9 +6170,124 @@ watch(
   background: var(--dbx-editor-selection-background, rgba(59, 130, 246, 0.35)) !important;
 }
 
+/* DDL (CodeMirror) scrollbars match the grid scroller style. */
+.structure-ddl-editor :deep(.cm-scroller::-webkit-scrollbar) {
+  width: 10px;
+  height: 10px;
+}
+
+.structure-ddl-editor :deep(.cm-scroller::-webkit-scrollbar-track) {
+  background: transparent;
+}
+
+.structure-ddl-editor :deep(.cm-scroller::-webkit-scrollbar-thumb) {
+  background: rgba(82, 82, 82, 0.3);
+  background: color-mix(in oklab, var(--foreground) 30%, transparent);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
+}
+
+.structure-ddl-editor :deep(.cm-scroller::-webkit-scrollbar-thumb:hover) {
+  background: rgba(82, 82, 82, 0.48);
+  background: color-mix(in oklab, var(--foreground) 48%, transparent);
+  border-width: 2px;
+  background-clip: padding-box;
+}
+
+.structure-table-scroller {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+/* Tab panel layout: toolbar, scrollable content and the custom horizontal bar
+   stack in the first column, while the custom vertical bar occupies the second
+   column of the content row. */
+.structure-tabs {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+/* Both native scrollbars are replaced: the horizontal one by
+   `.structure-horizontal-scrollbar`, the vertical one by
+   `.structure-vertical-scrollbar`. */
 .structure-table-scroller::-webkit-scrollbar {
-  width: 8px;
+  width: 0;
   height: 0;
+}
+
+/* Foreign keys / constraints / triggers card lists: both scrollbars match. */
+.structure-card-scroller::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.structure-card-scroller::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.structure-card-scroller::-webkit-scrollbar-thumb {
+  background: rgba(82, 82, 82, 0.3);
+  background: color-mix(in oklab, var(--foreground) 30%, transparent);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
+}
+
+.structure-card-scroller::-webkit-scrollbar-thumb:hover {
+  background: rgba(82, 82, 82, 0.48);
+  background: color-mix(in oklab, var(--foreground) 48%, transparent);
+  border-width: 2px;
+  background-clip: padding-box;
+}
+
+.structure-table-scroller::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.structure-table-scroller::-webkit-scrollbar-thumb {
+  background: rgba(82, 82, 82, 0.3);
+  background: color-mix(in oklab, var(--foreground) 30%, transparent);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
+}
+
+.structure-table-scroller::-webkit-scrollbar-thumb:hover {
+  background: rgba(82, 82, 82, 0.48);
+  background: color-mix(in oklab, var(--foreground) 48%, transparent);
+  border-width: 2px;
+  background-clip: padding-box;
+}
+
+.structure-vertical-scrollbar {
+  position: relative;
+  width: 10px;
+  cursor: default;
+  touch-action: none;
+}
+
+.structure-vertical-scrollbar__thumb {
+  position: absolute;
+  left: 3px;
+  width: 4px;
+  min-height: 24px;
+  border-radius: 999px;
+  background: rgba(82, 82, 82, 0.3);
+  background: color-mix(in oklab, var(--foreground) 30%, transparent);
+  transition:
+    left 120ms ease,
+    width 120ms ease,
+    background-color 120ms ease;
+}
+
+.structure-vertical-scrollbar:hover .structure-vertical-scrollbar__thumb,
+.structure-vertical-scrollbar--dragging .structure-vertical-scrollbar__thumb {
+  left: 2px;
+  width: 6px;
+  background: rgba(82, 82, 82, 0.48);
+  background: color-mix(in oklab, var(--foreground) 48%, transparent);
 }
 
 .structure-horizontal-scrollbar {
@@ -5381,7 +6296,7 @@ watch(
   flex-shrink: 0;
   cursor: pointer;
   touch-action: none;
-  background: var(--background);
+  background: transparent;
 }
 
 .structure-horizontal-scrollbar__thumb {
@@ -5390,6 +6305,7 @@ watch(
   height: 4px;
   min-width: 24px;
   border-radius: 999px;
+  background: rgba(82, 82, 82, 0.3);
   background: color-mix(in oklab, var(--foreground) 30%, transparent);
   transition:
     top 120ms ease,
@@ -5401,6 +6317,7 @@ watch(
 .structure-horizontal-scrollbar--dragging .structure-horizontal-scrollbar__thumb {
   top: 2px;
   height: 6px;
+  background: rgba(82, 82, 82, 0.48);
   background: color-mix(in oklab, var(--foreground) 48%, transparent);
 }
 
@@ -5450,5 +6367,51 @@ watch(
 /* Inputs are bg-transparent; give them a solid surface on the selected row so fields stay readable. */
 .structure-column-search-current :is(input, button, [role="combobox"], [data-slot="select-trigger"]) {
   background-color: var(--background);
+}
+</style>
+
+<style>
+/* Non-scoped so the scrollbar pseudo-elements on CodeMirror's cm-scroller actually match in WebView2.
+   Matches the grid / card scroller scrollbar style (10px track, 4px thumb, 6px on hover). */
+.structure-ddl-editor .cm-scroller::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.structure-ddl-editor .cm-scroller::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.structure-ddl-editor .cm-scroller::-webkit-scrollbar-thumb {
+  background: rgba(82, 82, 82, 0.3);
+  background: color-mix(in oklab, var(--foreground) 30%, transparent);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
+}
+
+.structure-ddl-editor .cm-scroller::-webkit-scrollbar-thumb:hover {
+  background: rgba(82, 82, 82, 0.48);
+  background: color-mix(in oklab, var(--foreground) 48%, transparent);
+  border-width: 2px;
+  background-clip: padding-box;
+}
+
+html.dbx-legacy-webview.dark .structure-ddl-editor .cm-scroller::-webkit-scrollbar-thumb,
+html.dbx-legacy-webview.dark .structure-card-scroller::-webkit-scrollbar-thumb,
+html.dbx-legacy-webview.dark .structure-table-scroller::-webkit-scrollbar-thumb,
+html.dbx-legacy-webview.dark .structure-horizontal-scrollbar__thumb,
+html.dbx-legacy-webview.dark .structure-vertical-scrollbar__thumb {
+  background: rgba(212, 212, 216, 0.3);
+}
+
+html.dbx-legacy-webview.dark .structure-ddl-editor .cm-scroller::-webkit-scrollbar-thumb:hover,
+html.dbx-legacy-webview.dark .structure-card-scroller::-webkit-scrollbar-thumb:hover,
+html.dbx-legacy-webview.dark .structure-table-scroller::-webkit-scrollbar-thumb:hover,
+html.dbx-legacy-webview.dark .structure-horizontal-scrollbar:hover .structure-horizontal-scrollbar__thumb,
+html.dbx-legacy-webview.dark .structure-horizontal-scrollbar--dragging .structure-horizontal-scrollbar__thumb,
+html.dbx-legacy-webview.dark .structure-vertical-scrollbar:hover .structure-vertical-scrollbar__thumb,
+html.dbx-legacy-webview.dark .structure-vertical-scrollbar--dragging .structure-vertical-scrollbar__thumb {
+  background: rgba(212, 212, 216, 0.48);
 }
 </style>

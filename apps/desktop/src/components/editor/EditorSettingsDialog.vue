@@ -13,16 +13,19 @@ import {
   ChevronUp,
   CircleHelp,
   Cloud,
+  Code,
   Copy,
   Download,
   ExternalLink,
   Eye,
   Filter,
+  Globe,
   GripVertical,
   Loader2,
   Moon,
   PackageSearch,
   Palette,
+  PanelLeft,
   Pencil,
   Plus,
   RefreshCw,
@@ -32,6 +35,7 @@ import {
   Sun,
   Star,
   SunMoon,
+  Table,
   Terminal,
   Trash2,
   Upload,
@@ -79,6 +83,7 @@ import {
   type DesktopIconTheme,
   type InterfaceLayout,
   type DisconnectTabHandlingMode,
+  type DeleteConnectionTabHandlingMode,
   type DataTabReuseMode,
   type DataGridFilterEditorView,
   type MultiStatementDefaultView,
@@ -99,6 +104,7 @@ import {
   type ClickTableNavigationTarget,
   type EditorSettings,
   type SqlCompletionTriggerMode,
+  type TableHoverLookupMode,
   SIDEBAR_INDENT_MIN,
   SIDEBAR_INDENT_MAX,
   SIDEBAR_FONT_SIZE_MIN,
@@ -108,6 +114,7 @@ import { EDITOR_FONT_FAMILY_CSS_VAR, EDITOR_FONT_SIZE_CSS_VAR, createRunStatemen
 import { orderAiConfigsForDisplay } from "@/lib/ai/aiConfigOrdering";
 import { isAiConnectionTestConfigCurrent } from "@/lib/ai/aiConnectionTest";
 import { MAX_AGENT_TURNS_DEFAULT, MAX_AGENT_TURNS_MAX, MAX_AGENT_TURNS_MIN, maxAgentTurnsOutOfRange, normalizeMaxAgentTurns } from "@/lib/ai/maxAgentTurns";
+import type { DriverStoreTab } from "@/lib/connection/agentDriverInstallHint";
 import ThemeCustomizerDialog from "./ThemeCustomizerDialog.vue";
 import DataGridTypeColorSchemeDialog from "@/components/grid/DataGridTypeColorSchemeDialog.vue";
 import { DATA_GRID_TYPE_COLOR_SCHEME_AUTO_ID, cloneDataGridTypeColorSchemes, type DataGridTypeColorScheme } from "@/lib/dataGrid/dataGridTypeColorScheme";
@@ -167,11 +174,13 @@ import {
   type WebDavConfig,
 } from "@/lib/backend/api";
 import { eventToModifierOnlyShortcut, eventToShortcut } from "@/lib/editor/keyboardShortcuts";
-import { SHORTCUT_DEFINITIONS, findShortcutConflict, normalizeShortcutSettings, type ShortcutActionId } from "@/lib/editor/shortcutRegistry";
+import { SHORTCUT_DEFINITIONS, countShortcutConflictPairs, findCrossScopeShortcutConflicts, findShortcutConflict, isReservedShortcut, normalizeShortcutSettings, type ShortcutActionId, type ShortcutDefinition, type ShortcutScope } from "@/lib/editor/shortcutRegistry";
+import LightTooltip from "@/components/ui/LightTooltip.vue";
 import { formatShortcutDisplay } from "@/lib/editor/shortcutDisplay";
 import { COLUMN_NAME_COPY_SEPARATOR_LABELS, COLUMN_NAME_COPY_SEPARATOR_OPTIONS, isColumnNameCopySeparator, type ColumnNameCopySeparator } from "@/lib/dataGrid/dataGridColumnNameCopy";
 import { normalizeSidebarHiddenTablePrefixes } from "@/lib/sidebar/sidebarTableNameDisplay";
 import { normalizeRedisKeyTemplates } from "@/lib/redis/redisKeyTemplates";
+import { REDIS_DATABASE_DISPLAY_LIMIT_MIN, REDIS_DATABASE_DISPLAY_LIMIT_MAX, REDIS_DATABASE_DISPLAY_LIMIT_OPTIONS } from "@/lib/redis/redisDatabaseAlias";
 import { currentStatementFrameRangeTo } from "@/lib/sql/currentStatementFrame";
 import { currentStatementFrameLayer } from "@/lib/editor/codemirrorCurrentStatementFrameLayer";
 import { buildQueryEditorLineNumbersExtension } from "@/lib/editor/queryEditorLineNumbers";
@@ -181,15 +190,45 @@ import { currentExecutableStatementRange, type SqlTextRange } from "@/lib/sql/sq
 import { executableStatementRangeCacheForDoc, executableStatementRangeStartingAt, type ExecutableStatementRangeCache } from "@/lib/sql/executableStatementRangeCache";
 import { EMPTY_TABLE_COLUMN_TEMPLATE_DATA_TYPE, parseTableColumnTemplateFields, TABLE_COLUMN_TEMPLATE_DATABASE_TYPES, tableColumnTemplateRowsToSettings } from "@/lib/table/tableColumnTemplates";
 import { DEFAULT_SQL_VARIABLE_SYNTAX_TOGGLES, normalizeSqlVariableSyntaxOverrides, SQL_VARIABLE_SYNTAX_DATABASE_TYPES, SQL_VARIABLE_SYNTAX_KEYS, SQL_VARIABLE_SYNTAX_TOKENS, type SqlVariableSyntaxOverrides, type SqlVariableSyntaxToggles } from "@/lib/sql/sqlVariableSyntax";
-import { buildMcpCherryStudioConfig, buildMcpCodexConfig, buildMcpDeepSeekHarnessConfig, buildMcpJsonConfig, buildMcpOpenCodeConfig, buildMcpPiConfig, buildMcpQoderConfig, buildMcpTraeConfig, buildMcpVsCodeConfig, mcpWebBackendUrl, type McpLaunchConfig } from "@/lib/mcp/mcpConfigTemplates";
+import {
+  buildMcpCherryStudioConfig,
+  buildMcpCodexConfig,
+  buildMcpDeepSeekHarnessConfig,
+  buildMcpJsonConfig,
+  buildMcpOpenCodeConfig,
+  buildMcpPiConfig,
+  buildMcpQoderConfig,
+  buildMcpTraeConfig,
+  buildMcpVsCodeConfig,
+  buildMcpWorkBuddyConfig,
+  mcpWebBackendUrl,
+  type McpLaunchConfig,
+} from "@/lib/mcp/mcpConfigTemplates";
 import { beginMcpStatusRequest, mcpUpdateAvailability } from "@/lib/mcp/mcpUpdateStatus";
+import { notifyComponentUpdatesChanged } from "@/lib/updates/componentUpdateEvents";
 import { isMcpPolicyMutationBlocked, MCP_CAPABILITY_ROWS, MCP_EXECUTION_MODE_COLUMNS, MCP_TOOL_OPTIONS, mcpExecutionModeFromPolicy, mcpPolicyFieldsForExecutionMode, toggleMcpAllowedToolName, type McpExecutionMode } from "@/lib/mcp/mcpPolicySelection";
 import { isMacOS, isWindows } from "@/lib/backend/platform";
 import { combineDataTypeForDatabase, dataTypeLengthInputValue, getDataTypeOptions, getDefaultLengthForType, isDataTypeLengthDisabled, splitDataType } from "@/lib/table/tableStructureEditorState";
 import { useToast } from "@/composables/useToast";
 import type { DatabaseType, SqlShortcutAction, SqlSnippet } from "@/types/database";
 import { uuid } from "@/lib/common/utils";
-import { findSqlShortcutConflicts, hasSqlShortcutConflicts as sqlShortcutsHaveConflicts, SQL_SHORTCUT_TABLE_TOKEN } from "@/lib/sql/sqlShortcutActions";
+import { DEFAULT_SQL_SHORTCUT_SELECT_LIMIT } from "@/lib/sql/sqlDialectSelectLimit";
+import {
+  BUILTIN_SQL_SHORTCUT_COUNT_ID,
+  BUILTIN_SQL_SHORTCUT_SELECT_LIMIT_ID,
+  canonicalSqlShortcutSql,
+  DEFAULT_SQL_SHORTCUTS,
+  findSqlShortcutConflicts,
+  hasSqlShortcutConflicts as sqlShortcutsHaveConflicts,
+  isBuiltinSqlShortcut,
+  mergeDefaultSqlShortcuts,
+  normalizeSqlShortcutLimit,
+  resolveSqlShortcutBody,
+  SQL_SHORTCUT_TABLE_TOKEN,
+  sqlShortcutDisplaySql,
+  deriveSqlShortcutDatabaseTypes,
+} from "@/lib/sql/sqlShortcutActions";
+import { applySqlShortcutBodyToAllSelected, buildSqlShortcutBodiesForSave, clearSqlShortcutFormDatabaseTypes as clearSqlShortcutFormBodies, switchSqlShortcutEditingDatabaseType, toggleSqlShortcutFormDatabaseType, type SqlShortcutFormBodies } from "@/lib/sql/sqlShortcutFormBodies";
 import { DEFAULT_SQL_SNIPPETS } from "@/lib/sql/sqlCompletion";
 import AiProviderLogo from "@/components/icons/AiProviderLogo.vue";
 import AppLogo from "@/components/icons/AppLogo.vue";
@@ -216,6 +255,7 @@ import {
 import { applyEditorSettingsDraftToRefs, type EditorSettingsDraftRefMap } from "@/lib/settings/applyEditorSettingsDraft";
 import { serializeSettingsTransfer, sortTransferCategories, transferCategoryForKey, type SettingsTransferCategoryId } from "@/lib/settings/settingsTransfer";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { usePromptTemplateStore } from "@/stores/promptTemplateStore";
 import { useTunnelProfileStore } from "@/stores/tunnelProfileStore";
@@ -239,6 +279,7 @@ import { DEFAULT_DATA_GRID_FONT_FAMILY, DEFAULT_UI_FONT_FAMILY, normalizeCustomF
 import { buildFontFamilyOptions, displayFontFamily, isPresetFontFamily, loadSystemFontNames } from "@/lib/app/fontFamilyOptions";
 import { buildAppSupportInfoRows, formatAppSupportInfoForClipboard, type AppSupportInfoLabels } from "@/lib/app/supportInfo";
 import { useUiFontFamilyPreview } from "@/composables/useUiFontFamilyPreview";
+import { useMeasuredWidth } from "@/composables/useMeasuredWidth";
 import { DateTimePatterns, normalizeSupportedDateTimePattern } from "@/lib/dataGrid/columnFormatter";
 import { MAX_RESULT_PAGE_SIZE, MIN_RESULT_PAGE_SIZE } from "@/lib/dataGrid/paginationPageSize";
 import { MAX_QUERY_RESULT_MAX_ROWS } from "@/lib/dataGrid/queryResultRowLimit";
@@ -253,6 +294,7 @@ const { t, locale } = useI18n();
 const { toast } = useToast();
 const settingsStore = useSettingsStore();
 const connectionStore = useConnectionStore();
+const hasSqlServerConnection = computed(() => connectionStore.connections.some((connection) => effectiveDatabaseTypeForConnection(connection) === "sqlserver"));
 const savedSqlStore = useSavedSqlStore();
 const promptTemplateStore = usePromptTemplateStore();
 const tunnelProfileStore = useTunnelProfileStore();
@@ -346,13 +388,59 @@ const props = defineProps<{
   aiConfigRequestId?: number;
   appVersion?: string;
   checkingUpdates?: boolean;
+  updatingAllUpdates?: boolean;
+  appUpdateAvailable?: boolean;
+  appUpdateVersion?: string;
+  driverUpdateCount?: number;
+  jdbcUpdateAvailable?: boolean;
+  mcpUpdateAvailable?: boolean;
+  pluginUpdateCount?: number;
 }>();
 
 const emit = defineEmits<{
   "update:open": [value: boolean];
   "check-updates": [];
+  "update-all": [];
+  "open-driver-store": [target?: DriverStoreTab];
+  "open-plugin-center": [];
+  "open-mcp-settings": [];
+  "open-update-center": [];
   "ai-config-deep-link-handled": [];
 }>();
+
+const hasAnyUpdate = computed(() => Boolean(props.appUpdateAvailable || (props.driverUpdateCount || 0) > 0 || props.jdbcUpdateAvailable || props.mcpUpdateAvailable || (props.pluginUpdateCount || 0) > 0));
+const updateCheckItemKeys = ["app", "drivers", "jdbc", "mcp", "plugins"] as const;
+type UpdateCheckItem = (typeof updateCheckItemKeys)[number];
+const updateCheckLoading = ref<Record<UpdateCheckItem, boolean>>({ app: false, drivers: false, jdbc: false, mcp: false, plugins: false });
+let updateCheckRevealTimers: ReturnType<typeof setTimeout>[] = [];
+let updateCheckWasActive = false;
+
+watch(
+  () => props.checkingUpdates,
+  (checking) => {
+    for (const timer of updateCheckRevealTimers) clearTimeout(timer);
+    updateCheckRevealTimers = [];
+    if (checking) {
+      updateCheckWasActive = true;
+      for (const key of updateCheckItemKeys) updateCheckLoading.value[key] = true;
+      return;
+    }
+    if (!updateCheckWasActive) return;
+    updateCheckWasActive = false;
+    updateCheckItemKeys.forEach((key, index) => {
+      updateCheckRevealTimers.push(
+        setTimeout(() => {
+          updateCheckLoading.value[key] = false;
+        }, index * 120),
+      );
+    });
+  },
+  { immediate: true },
+);
+
+onUnmounted(() => {
+  for (const timer of updateCheckRevealTimers) clearTimeout(timer);
+});
 
 const isSettingsPage = computed(() => props.variant === "page");
 const settingsVisible = computed(() => isSettingsPage.value || props.open === true);
@@ -484,6 +572,8 @@ const editShowCurrentStatementFrame = ref(settingsStore.editorSettings.showCurre
 const editShowInsertValueHints = ref(settingsStore.editorSettings.showInsertValueHints);
 const editAutoAliasTables = ref(settingsStore.editorSettings.autoAliasTables);
 const editInsertSpaceAfterCompletion = ref(settingsStore.editorSettings.insertSpaceAfterCompletion);
+const editSqlServerSpaceConfirmsCompletion = ref(settingsStore.editorSettings.sqlServerSpaceConfirmsCompletion);
+const showSqlServerSpaceConfirmsCompletion = computed(() => hasSqlServerConnection.value || settingsStore.editorSettings.sqlServerSpaceConfirmsCompletion || editSqlServerSpaceConfirmsCompletion.value);
 const editSortCompletionColumnsAlphabetically = ref(settingsStore.editorSettings.sortCompletionColumnsAlphabetically);
 const editSelectFirstCompletionOnOpen = ref(settingsStore.editorSettings.selectFirstCompletionOnOpen);
 const editCompletionTriggerMode = ref<SqlCompletionTriggerMode>(settingsStore.editorSettings.completionTriggerMode);
@@ -496,6 +586,7 @@ const completionTriggerModeDescription = computed(() => {
   return t(key, { shortcut: formatShortcutDisplay(editShortcuts.value.triggerCompletion) });
 });
 const editWordWrap = ref(settingsStore.editorSettings.wordWrap);
+const editShowWhitespace = ref(settingsStore.editorSettings.showWhitespace);
 const editVimModeEnabled = ref(settingsStore.editorSettings.vimModeEnabled);
 const editAutoCloseBrackets = ref(settingsStore.editorSettings.autoCloseBrackets);
 const editSqlSemanticDiagnosticsMode = ref<SqlSemanticDiagnosticsMode>(settingsStore.editorSettings.sqlSemanticDiagnosticsMode);
@@ -543,6 +634,9 @@ const editDataGridCellDetailButtonVisible = ref(settingsStore.editorSettings.dat
 const editDataGridCrosshairHighlight = ref(settingsStore.editorSettings.dataGridCrosshairHighlight);
 const editPageSize = ref(settingsStore.editorSettings.pageSize);
 const editTableOpenPageSize = ref(settingsStore.editorSettings.tableOpenPageSize);
+const editTableOpenSortMode = ref(settingsStore.editorSettings.tableOpenSortMode);
+const editTableDatabaseSortDirection = ref(settingsStore.editorSettings.tableDatabaseSortDirection);
+const editTableLocalSortDirection = ref(settingsStore.editorSettings.tableLocalSortDirection);
 const editQueryResultMaxRowsEnabled = ref(settingsStore.editorSettings.queryResultMaxRowsEnabled);
 const editQueryResultMaxRows = ref(settingsStore.editorSettings.queryResultMaxRows);
 const editExternalSqlEditorMaxMb = ref(settingsStore.editorSettings.externalSqlEditorMaxMb);
@@ -631,6 +725,15 @@ const editAutoSelectActiveSidebarNode = ref(settingsStore.editorSettings.autoSel
 const editSidebarBrowseObjectsOnDatabaseActivation = ref(settingsStore.editorSettings.sidebarBrowseObjectsOnDatabaseActivation);
 const editOpenTabsRestoreMode = ref<OpenTabsRestoreMode>(settingsStore.editorSettings.openTabsRestoreMode);
 const editDisconnectTabHandlingMode = ref<DisconnectTabHandlingMode>(settingsStore.editorSettings.disconnectTabHandlingMode);
+const editDeleteConnectionTabHandlingMode = ref<DeleteConnectionTabHandlingMode>(settingsStore.editorSettings.deleteConnectionTabHandlingMode);
+const editRememberConnectionDatabaseOnDelete = ref(settingsStore.editorSettings.rememberConnectionDatabaseOnDelete);
+// 「记住的连接名 → 数据库」是累积数据而非偏好设置，不进弹窗草稿；这里直接读写 store，
+// 让清除操作立即生效，不受弹窗的保存/取消影响。
+const rememberedConnectionDatabaseCount = computed(() => Object.keys(settingsStore.editorSettings.rememberedConnectionDatabases).length);
+
+function clearRememberedConnectionDatabases() {
+  settingsStore.clearRememberedConnectionDatabases();
+}
 const editDataTabReuseMode = ref<DataTabReuseMode>(settingsStore.editorSettings.dataTabReuseMode);
 const editOpenDataTabsNextToActive = ref(settingsStore.editorSettings.openDataTabsNextToActive);
 const editPrefillNewQueryWithSelect = ref(settingsStore.editorSettings.prefillNewQueryWithSelect);
@@ -638,12 +741,26 @@ const editGenerateSqlIncludeDatabaseName = ref(settingsStore.editorSettings.gene
 const editGenerateSqlQuoteIdentifiers = ref(settingsStore.editorSettings.generateSqlQuoteIdentifiers);
 const editFormatSqlOnSqlFileSave = ref(settingsStore.editorSettings.formatSqlOnSqlFileSave);
 const editShowTableDdlHoverPreview = ref(settingsStore.editorSettings.showTableDdlHoverPreview);
+const editTableHoverLookupMode = ref<TableHoverLookupMode>(settingsStore.editorSettings.tableHoverLookupMode);
+const tableHoverLookupModeDescription = computed(() => {
+  const key = {
+    current: "settings.tableHoverLookupModeCurrentDescription",
+    fallback: "settings.tableHoverLookupModeFallbackDescription",
+    always: "settings.tableHoverLookupModeAlwaysDescription",
+  }[editTableHoverLookupMode.value];
+  return t(key);
+});
 const editClickTableNavigationTarget = ref<ClickTableNavigationTarget>(settingsStore.editorSettings.clickTableNavigationTarget);
-const editUpdateNotificationsEnabled = ref(settingsStore.editorSettings.updateNotificationsEnabled);
+const editAutoUpdateApp = ref(settingsStore.editorSettings.autoUpdateApp);
+const editAutoUpdateDrivers = ref(settingsStore.editorSettings.autoUpdateDrivers);
+const editAutoUpdateJdbc = ref(settingsStore.editorSettings.autoUpdateJdbc);
+const editAutoUpdateMcp = ref(settingsStore.editorSettings.autoUpdateMcp);
+const editAutoUpdatePlugins = ref(settingsStore.editorSettings.autoUpdatePlugins);
 const editSidebarHiddenTablePrefixes = ref(settingsStore.editorSettings.sidebarHiddenTablePrefixes.join("\n"));
 const editSidebarCopyTableNameSeparator = ref<ColumnNameCopySeparator>(settingsStore.editorSettings.sidebarCopyTableNameSeparator);
 const editSidebarCopyTableNameIncludeSchema = ref(settingsStore.editorSettings.sidebarCopyTableNameIncludeSchema);
 const editRedisKeyTemplates = ref(normalizeRedisKeyTemplates(settingsStore.editorSettings.redisKeyTemplates).join("\n"));
+const editRedisDatabaseDisplayLimit = ref(settingsStore.editorSettings.redisDatabaseDisplayLimit);
 const editSidebarObjectInfoMode = ref<SidebarObjectInfoMode>(settingsStore.editorSettings.sidebarObjectInfoMode);
 const editSidebarAllowHorizontalScroll = ref(settingsStore.editorSettings.sidebarAllowHorizontalScroll);
 const editSidebarShowTooltips = ref(settingsStore.editorSettings.sidebarShowTooltips);
@@ -692,6 +809,20 @@ const disconnectTabHandlingModeDescriptionKey = computed(() => {
 
   return "disconnectTabHandlingModeCloseTabsDescription";
 });
+const deleteConnectionTabHandlingModeDescriptionKey = computed(() => {
+  switch (editDeleteConnectionTabHandlingMode.value) {
+    case "close-tabs":
+      return "deleteConnectionTabHandlingModeCloseTabsDescription";
+    case "keep-sql-tabs":
+      return "deleteConnectionTabHandlingModeKeepSqlTabsDescription";
+    case "keep-pinned-sql-tabs":
+      return "deleteConnectionTabHandlingModeKeepPinnedSqlTabsDescription";
+    case "keep-all-tabs":
+      return "deleteConnectionTabHandlingModeKeepAllTabsDescription";
+  }
+
+  return "deleteConnectionTabHandlingModeCloseTabsDescription";
+});
 const normalizedEditTableColumnTemplateFields = computed(() => tableColumnTemplateRowsToSettings(editTableColumnTemplateRows.value));
 const visibleTableColumnTemplateRows = computed(() =>
   editTableColumnTemplateRows.value.filter((row) => {
@@ -708,10 +839,79 @@ function editableSnippet(snippet: SqlSnippet): SqlSnippet {
 const editSnippets = ref<SqlSnippet[]>(settingsStore.editorSettings.snippets.map(editableSnippet));
 
 function editableSqlShortcut(action: SqlShortcutAction): SqlShortcutAction {
-  return { ...action, enabled: action.enabled !== false };
+  const next: SqlShortcutAction = { ...action, enabled: action.enabled !== false };
+  if (action.kind === "select-limit" || action.id === BUILTIN_SQL_SHORTCUT_SELECT_LIMIT_ID) {
+    next.kind = "select-limit";
+    next.limit = normalizeSqlShortcutLimit(action.limit);
+    next.sql = canonicalSqlShortcutSql(next);
+    delete next.databaseTypes;
+    delete next.sqlByDatabaseType;
+  } else {
+    delete next.kind;
+    delete next.limit;
+    if (action.sqlByDatabaseType && Object.keys(action.sqlByDatabaseType).length > 0) {
+      next.sqlByDatabaseType = { ...action.sqlByDatabaseType };
+    } else {
+      delete next.sqlByDatabaseType;
+    }
+    const databaseTypes = deriveSqlShortcutDatabaseTypes(action.databaseTypes?.length ? [...action.databaseTypes] : undefined, next.sqlByDatabaseType);
+    if (databaseTypes) next.databaseTypes = databaseTypes;
+    else delete next.databaseTypes;
+  }
+  return next;
 }
 
-const editSqlShortcuts = ref<SqlShortcutAction[]>(settingsStore.editorSettings.sqlShortcuts.map(editableSqlShortcut));
+const editSqlShortcuts = ref<SqlShortcutAction[]>(mergeDefaultSqlShortcuts(settingsStore.editorSettings.sqlShortcuts.map(editableSqlShortcut)));
+
+type SqlShortcutFormState = {
+  label: string;
+  shortcut: string;
+  /** Default fallback template (payload.sql). */
+  sql: string;
+  /** Textarea content for the current editing context. */
+  body: string;
+  kind: "template" | "select-limit";
+  limit: number;
+  databaseTypes: DatabaseType[];
+  sqlByDatabaseType: Partial<Record<DatabaseType, string>>;
+  editingDatabaseType: DatabaseType | "";
+};
+
+function emptySqlShortcutForm(): SqlShortcutFormState {
+  const sql = `SELECT * FROM ${SQL_SHORTCUT_TABLE_TOKEN}`;
+  return {
+    label: "",
+    shortcut: "",
+    sql,
+    body: sql,
+    kind: "template",
+    limit: DEFAULT_SQL_SHORTCUT_SELECT_LIMIT,
+    databaseTypes: [],
+    sqlByDatabaseType: {},
+    editingDatabaseType: "",
+  };
+}
+
+function sqlShortcutFormBodies(form: SqlShortcutFormState): SqlShortcutFormBodies {
+  return {
+    sql: form.sql,
+    body: form.body,
+    databaseTypes: form.databaseTypes,
+    sqlByDatabaseType: form.sqlByDatabaseType,
+    editingDatabaseType: form.editingDatabaseType,
+  };
+}
+
+function patchSqlShortcutFormBodies(next: SqlShortcutFormBodies) {
+  sqlShortcutForm.value = {
+    ...sqlShortcutForm.value,
+    sql: next.sql,
+    body: next.body,
+    databaseTypes: next.databaseTypes,
+    sqlByDatabaseType: next.sqlByDatabaseType,
+    editingDatabaseType: next.editingDatabaseType,
+  };
+}
 
 function currentEditorSettingsDraft(): EditorSettingsDraft {
   return {
@@ -734,10 +934,12 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     showInsertValueHints: editShowInsertValueHints.value,
     autoAliasTables: editAutoAliasTables.value,
     insertSpaceAfterCompletion: editInsertSpaceAfterCompletion.value,
+    sqlServerSpaceConfirmsCompletion: editSqlServerSpaceConfirmsCompletion.value,
     sortCompletionColumnsAlphabetically: editSortCompletionColumnsAlphabetically.value,
     selectFirstCompletionOnOpen: editSelectFirstCompletionOnOpen.value,
     completionTriggerMode: editCompletionTriggerMode.value,
     wordWrap: editWordWrap.value,
+    showWhitespace: editShowWhitespace.value,
     vimModeEnabled: editVimModeEnabled.value,
     autoCloseBrackets: editAutoCloseBrackets.value,
     sqlSemanticDiagnosticsMode: editSqlSemanticDiagnosticsMode.value,
@@ -772,6 +974,9 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     dataGridShowWhitespace: editDataGridShowWhitespace.value,
     pageSize: editPageSize.value,
     tableOpenPageSize: editTableOpenPageSize.value,
+    tableOpenSortMode: editTableOpenSortMode.value,
+    tableDatabaseSortDirection: editTableDatabaseSortDirection.value,
+    tableLocalSortDirection: editTableLocalSortDirection.value,
     queryResultMaxRowsEnabled: editQueryResultMaxRowsEnabled.value,
     queryResultMaxRows: editQueryResultMaxRows.value,
     externalSqlEditorMaxMb: editExternalSqlEditorMaxMb.value,
@@ -789,6 +994,8 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     sidebarBrowseObjectsOnDatabaseActivation: editSidebarBrowseObjectsOnDatabaseActivation.value,
     openTabsRestoreMode: editOpenTabsRestoreMode.value,
     disconnectTabHandlingMode: editDisconnectTabHandlingMode.value,
+    deleteConnectionTabHandlingMode: editDeleteConnectionTabHandlingMode.value,
+    rememberConnectionDatabaseOnDelete: editRememberConnectionDatabaseOnDelete.value,
     dataTabReuseMode: editDataTabReuseMode.value,
     openDataTabsNextToActive: editOpenDataTabsNextToActive.value,
     prefillNewQueryWithSelect: editPrefillNewQueryWithSelect.value,
@@ -796,7 +1003,14 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     generateSqlQuoteIdentifiers: editGenerateSqlQuoteIdentifiers.value,
     formatSqlOnSqlFileSave: editFormatSqlOnSqlFileSave.value,
     showTableDdlHoverPreview: editShowTableDdlHoverPreview.value,
-    updateNotificationsEnabled: editUpdateNotificationsEnabled.value,
+    tableHoverLookupMode: editTableHoverLookupMode.value,
+    updateNotificationsEnabled: editAutoUpdateApp.value,
+    autoDownloadUpdates: editAutoUpdateApp.value,
+    autoUpdateApp: editAutoUpdateApp.value,
+    autoUpdateDrivers: editAutoUpdateDrivers.value,
+    autoUpdateJdbc: editAutoUpdateJdbc.value,
+    autoUpdateMcp: editAutoUpdateMcp.value,
+    autoUpdatePlugins: editAutoUpdatePlugins.value,
     sidebarObjectInfoMode: editSidebarObjectInfoMode.value,
     sidebarAllowHorizontalScroll: editSidebarAllowHorizontalScroll.value,
     sidebarShowTooltips: editSidebarShowTooltips.value,
@@ -806,6 +1020,7 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     sidebarCopyTableNameSeparator: editSidebarCopyTableNameSeparator.value,
     sidebarCopyTableNameIncludeSchema: editSidebarCopyTableNameIncludeSchema.value,
     redisKeyTemplates: normalizeRedisKeyTemplates(editRedisKeyTemplates.value),
+    redisDatabaseDisplayLimit: editRedisDatabaseDisplayLimit.value,
     exportBatchSize: editExportBatchSize.value,
     csvQuoteMode: editCsvQuoteMode.value,
     globalDateTimeDisplayFormat: editGlobalDateTimeDisplayFormat.value,
@@ -826,6 +1041,23 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
 
 const editEditorSettingsBase = ref<EditorSettingsDraft>(editorSettingsDraftFromSettings(settingsStore.editorSettings));
 const hasEditorDraftChanges = computed(() => editorSettingsDraftChanged(currentEditorSettingsDraft(), editEditorSettingsBase.value));
+
+// Defaults can also be changed from the result-grid menu while this dialog is
+// open. Refresh untouched draft fields so both entry points stay consistent,
+// without overwriting an edit the user is actively making here.
+watch(
+  () => [settingsStore.editorSettings.pageSize, settingsStore.editorSettings.tableOpenPageSize] as const,
+  ([pageSize, tableOpenPageSize]) => {
+    if (editPageSize.value === editEditorSettingsBase.value.pageSize) {
+      editPageSize.value = pageSize;
+      editEditorSettingsBase.value.pageSize = pageSize;
+    }
+    if (editTableOpenPageSize.value === editEditorSettingsBase.value.tableOpenPageSize) {
+      editTableOpenPageSize.value = tableOpenPageSize;
+      editEditorSettingsBase.value.tableOpenPageSize = tableOpenPageSize;
+    }
+  },
+);
 
 // --- Background image draft state ---
 function cloneBackgroundImageDraft(settings: BackgroundImageSettings): BackgroundImageSettings {
@@ -914,8 +1146,10 @@ const snippetFormPrefixError = ref("");
 
 const sqlShortcutDialogOpen = ref(false);
 const sqlShortcutEditingId = ref<string | null>(null);
-const sqlShortcutForm = ref({ label: "", shortcut: "", sql: "" });
+const sqlShortcutForm = ref<SqlShortcutFormState>(emptySqlShortcutForm());
 const sqlShortcutFormLabelError = ref("");
+const sqlShortcutPreviewDatabaseType = ref<DatabaseType>("mysql");
+const sqlShortcutDatabaseTypesOpen = ref(false);
 const editingSqlShortcutInputId = ref<string | null>(null);
 const iconThemeBlackDescriptionText = computed(() => (isMacOS() ? t("settings.iconThemeBlackDescriptionMac") : t("settings.iconThemeBlackDescription")));
 const layoutDescTruncated = {
@@ -1046,54 +1280,161 @@ function confirmDeleteSnippet(snippet: SqlSnippet) {
 
 function openAddSqlShortcutDialog() {
   sqlShortcutEditingId.value = null;
-  sqlShortcutForm.value = { label: "", shortcut: "", sql: `SELECT * FROM ${SQL_SHORTCUT_TABLE_TOKEN}` };
+  sqlShortcutForm.value = emptySqlShortcutForm();
   sqlShortcutFormLabelError.value = "";
+  sqlShortcutPreviewDatabaseType.value = "mysql";
+  sqlShortcutDatabaseTypesOpen.value = false;
   editingSqlShortcutInputId.value = null;
   sqlShortcutDialogOpen.value = true;
 }
 
 function openEditSqlShortcutDialog(action: SqlShortcutAction) {
   sqlShortcutEditingId.value = action.id;
+  const databaseTypes = action.databaseTypes ? [...action.databaseTypes] : [];
+  const sqlByDatabaseType = action.sqlByDatabaseType ? { ...action.sqlByDatabaseType } : {};
+  const editingDatabaseType = databaseTypes[0] ?? "";
+  const fallbackSql = action.sql;
   sqlShortcutForm.value = {
     label: action.label,
     shortcut: action.shortcut,
-    sql: action.sql,
+    sql: fallbackSql,
+    body: editingDatabaseType ? resolveSqlShortcutBody(action, editingDatabaseType) : fallbackSql,
+    kind: action.kind === "select-limit" || action.id === BUILTIN_SQL_SHORTCUT_SELECT_LIMIT_ID ? "select-limit" : "template",
+    limit: normalizeSqlShortcutLimit(action.limit),
+    databaseTypes,
+    sqlByDatabaseType,
+    editingDatabaseType,
   };
   sqlShortcutFormLabelError.value = "";
+  sqlShortcutPreviewDatabaseType.value = databaseTypes[0] ?? "mysql";
+  sqlShortcutDatabaseTypesOpen.value = false;
   editingSqlShortcutInputId.value = null;
   sqlShortcutDialogOpen.value = true;
 }
 
+const sqlShortcutFormIsBuiltin = computed(() => !!sqlShortcutEditingId.value && isBuiltinSqlShortcut(sqlShortcutEditingId.value));
+
+const sqlShortcutFormBuiltinLabel = computed(() => {
+  if (!sqlShortcutEditingId.value) return "";
+  return sqlShortcutDisplayLabel({
+    id: sqlShortcutEditingId.value,
+    label: sqlShortcutForm.value.label,
+    shortcut: "",
+    sql: "",
+  });
+});
+
+function sqlShortcutDisplayLabel(action: SqlShortcutAction): string {
+  if (action.id === BUILTIN_SQL_SHORTCUT_SELECT_LIMIT_ID) return t("settings.sqlShortcutBuiltinSelectLimit");
+  if (action.id === BUILTIN_SQL_SHORTCUT_COUNT_ID) return t("settings.sqlShortcutBuiltinCount");
+  return action.label;
+}
+
+function onSqlShortcutEditingDatabaseTypeChange(next: DatabaseType | "") {
+  if (!next) return;
+  patchSqlShortcutFormBodies(switchSqlShortcutEditingDatabaseType(sqlShortcutFormBodies(sqlShortcutForm.value), next));
+}
+
+function toggleSqlShortcutDatabaseType(dbType: DatabaseType) {
+  patchSqlShortcutFormBodies(toggleSqlShortcutFormDatabaseType(sqlShortcutFormBodies(sqlShortcutForm.value), dbType));
+}
+
+function clearSqlShortcutDatabaseTypes() {
+  patchSqlShortcutFormBodies(clearSqlShortcutFormBodies(sqlShortcutFormBodies(sqlShortcutForm.value)));
+}
+
+function applySqlShortcutSqlToAllSelected() {
+  patchSqlShortcutFormBodies(applySqlShortcutBodyToAllSelected(sqlShortcutFormBodies(sqlShortcutForm.value)));
+  toast(t("settings.sqlShortcutsApplySqlToAllSelectedDone"), 2500);
+}
+
+const sqlShortcutFormPreviewSql = computed(() =>
+  sqlShortcutDisplaySql(
+    {
+      id: sqlShortcutEditingId.value ?? "preview",
+      label: "preview",
+      shortcut: "",
+      sql: sqlShortcutForm.value.sql,
+      kind: sqlShortcutForm.value.kind,
+      limit: sqlShortcutForm.value.limit,
+      sqlByDatabaseType: sqlShortcutForm.value.sqlByDatabaseType,
+    },
+    sqlShortcutForm.value.kind === "select-limit" ? sqlShortcutPreviewDatabaseType.value : sqlShortcutForm.value.editingDatabaseType || undefined,
+  ),
+);
+
+function sqlShortcutListSql(action: SqlShortcutAction): string {
+  return sqlShortcutDisplaySql(action);
+}
+
+function sqlShortcutDatabaseTypesLabel(action: SqlShortcutAction): string {
+  if (isBuiltinSqlShortcut(action.id) || !action.databaseTypes?.length) return t("settings.sqlShortcutsDatabaseTypesAll");
+  return action.databaseTypes.map((dbType) => dbTypeLabel(dbType)).join(", ");
+}
+
 function saveSqlShortcut() {
+  const editingId = sqlShortcutEditingId.value;
+  const existing = editingId ? editSqlShortcuts.value.find((item) => item.id === editingId) : undefined;
+  const isBuiltin = !!editingId && isBuiltinSqlShortcut(editingId);
+
+  if (isBuiltin && existing) {
+    const limit = normalizeSqlShortcutLimit(sqlShortcutForm.value.limit);
+    const payload: SqlShortcutAction = {
+      ...existing,
+      shortcut: sqlShortcutForm.value.shortcut.trim(),
+      enabled: existing.enabled !== false,
+    };
+    if (existing.id === BUILTIN_SQL_SHORTCUT_SELECT_LIMIT_ID || existing.kind === "select-limit") {
+      payload.kind = "select-limit";
+      payload.limit = limit;
+      payload.sql = canonicalSqlShortcutSql({ kind: "select-limit", limit, sql: "" });
+      delete payload.databaseTypes;
+      delete payload.sqlByDatabaseType;
+    }
+    const nextShortcuts = editSqlShortcuts.value.map((item) => (item.id === editingId ? payload : item));
+    if (sqlShortcutsHaveConflicts(nextShortcuts, editShortcuts.value)) {
+      toast(t("settings.shortcutConflict"), 3000);
+      return;
+    }
+    editSqlShortcuts.value = nextShortcuts.map(editableSqlShortcut);
+    sqlShortcutDialogOpen.value = false;
+    void commitSqlShortcuts();
+    return;
+  }
+
   const label = sqlShortcutForm.value.label.trim();
   if (!label) {
     sqlShortcutFormLabelError.value = t("settings.sqlShortcutsLabelRequired");
     return;
   }
+  const bodies = buildSqlShortcutBodiesForSave(sqlShortcutFormBodies(sqlShortcutForm.value));
   const payload: SqlShortcutAction = {
-    id: sqlShortcutEditingId.value ?? uuid(),
+    id: editingId ?? uuid(),
     label,
     shortcut: sqlShortcutForm.value.shortcut.trim(),
-    sql: sqlShortcutForm.value.sql,
-    enabled: true,
+    sql: bodies.sql,
+    enabled: existing?.enabled !== false,
   };
-  const nextShortcuts = sqlShortcutEditingId.value
-    ? editSqlShortcuts.value.map((item) =>
-        item.id === sqlShortcutEditingId.value
-          ? {
-              ...payload,
-              enabled: item.enabled !== false,
-            }
-          : item,
-      )
-    : [...editSqlShortcuts.value, payload];
+  if (bodies.databaseTypes) payload.databaseTypes = bodies.databaseTypes;
+  if (bodies.sqlByDatabaseType) payload.sqlByDatabaseType = bodies.sqlByDatabaseType;
+  const nextShortcuts = editingId ? editSqlShortcuts.value.map((item) => (item.id === editingId ? payload : item)) : [...editSqlShortcuts.value, payload];
   if (sqlShortcutsHaveConflicts(nextShortcuts, editShortcuts.value)) {
     toast(t("settings.shortcutConflict"), 3000);
     return;
   }
-  editSqlShortcuts.value = nextShortcuts;
+  editSqlShortcuts.value = nextShortcuts.map(editableSqlShortcut);
   sqlShortcutDialogOpen.value = false;
   void commitSqlShortcuts();
+}
+
+function confirmDeleteSqlShortcut(action: SqlShortcutAction) {
+  if (isBuiltinSqlShortcut(action.id)) {
+    toast(t("settings.sqlShortcutsBuiltinDeleteBlocked"), 3000);
+    return;
+  }
+  if (window.confirm(t("settings.sqlShortcutsDeleteConfirm", { name: sqlShortcutDisplayLabel(action) }))) {
+    deleteSqlShortcut(action.id);
+  }
 }
 
 function setSqlShortcutEnabled(id: string, enabled: boolean) {
@@ -1111,14 +1452,9 @@ function setSqlShortcutEnabled(id: string, enabled: boolean) {
 }
 
 function deleteSqlShortcut(id: string) {
+  if (isBuiltinSqlShortcut(id)) return;
   editSqlShortcuts.value = editSqlShortcuts.value.filter((item) => item.id !== id);
   void commitSqlShortcuts();
-}
-
-function confirmDeleteSqlShortcut(action: SqlShortcutAction) {
-  if (window.confirm(t("settings.sqlShortcutsDeleteConfirm", { name: action.label }))) {
-    deleteSqlShortcut(action.id);
-  }
 }
 
 function onSqlShortcutBindingKeydown(id: string, event: KeyboardEvent) {
@@ -1131,6 +1467,13 @@ function onSqlShortcutBindingKeydown(id: string, event: KeyboardEvent) {
   }
   const shortcut = eventToShortcut(event);
   if (!shortcut) return;
+  // macOS 上 ⌘H/⌥⌘H 属于系统 Hide 快捷键（见 MACOS_RESERVED_SHORTCUTS），
+  // 若允许记录并持久化，配置层仍会 preventDefault 并重新劫持它们，因此输入时直接拒绝。
+  if (isReservedShortcut(shortcut)) {
+    toast(t("settings.shortcutReserved"), 3000);
+    editingSqlShortcutInputId.value = null;
+    return;
+  }
   sqlShortcutForm.value = { ...sqlShortcutForm.value, shortcut };
   editingSqlShortcutInputId.value = null;
 }
@@ -1232,10 +1575,12 @@ function syncEditorSettingsDraftFromStore() {
   editShowInsertValueHints.value = settingsStore.editorSettings.showInsertValueHints;
   editAutoAliasTables.value = settingsStore.editorSettings.autoAliasTables;
   editInsertSpaceAfterCompletion.value = settingsStore.editorSettings.insertSpaceAfterCompletion;
+  editSqlServerSpaceConfirmsCompletion.value = settingsStore.editorSettings.sqlServerSpaceConfirmsCompletion;
   editSortCompletionColumnsAlphabetically.value = settingsStore.editorSettings.sortCompletionColumnsAlphabetically;
   editSelectFirstCompletionOnOpen.value = settingsStore.editorSettings.selectFirstCompletionOnOpen;
   editCompletionTriggerMode.value = settingsStore.editorSettings.completionTriggerMode;
   editWordWrap.value = settingsStore.editorSettings.wordWrap;
+  editShowWhitespace.value = settingsStore.editorSettings.showWhitespace;
   editVimModeEnabled.value = settingsStore.editorSettings.vimModeEnabled;
   editAutoCloseBrackets.value = settingsStore.editorSettings.autoCloseBrackets;
   editSqlSemanticDiagnosticsMode.value = settingsStore.editorSettings.sqlSemanticDiagnosticsMode;
@@ -1271,6 +1616,9 @@ function syncEditorSettingsDraftFromStore() {
   editDataGridShowWhitespace.value = settingsStore.editorSettings.dataGridShowWhitespace;
   editPageSize.value = settingsStore.editorSettings.pageSize;
   editTableOpenPageSize.value = settingsStore.editorSettings.tableOpenPageSize;
+  editTableOpenSortMode.value = settingsStore.editorSettings.tableOpenSortMode;
+  editTableDatabaseSortDirection.value = settingsStore.editorSettings.tableDatabaseSortDirection;
+  editTableLocalSortDirection.value = settingsStore.editorSettings.tableLocalSortDirection;
   editQueryResultMaxRowsEnabled.value = settingsStore.editorSettings.queryResultMaxRowsEnabled;
   editQueryResultMaxRows.value = settingsStore.editorSettings.queryResultMaxRows;
   editExternalSqlEditorMaxMb.value = settingsStore.editorSettings.externalSqlEditorMaxMb;
@@ -1289,6 +1637,8 @@ function syncEditorSettingsDraftFromStore() {
   editSidebarBrowseObjectsOnDatabaseActivation.value = settingsStore.editorSettings.sidebarBrowseObjectsOnDatabaseActivation;
   editOpenTabsRestoreMode.value = settingsStore.editorSettings.openTabsRestoreMode;
   editDisconnectTabHandlingMode.value = settingsStore.editorSettings.disconnectTabHandlingMode;
+  editDeleteConnectionTabHandlingMode.value = settingsStore.editorSettings.deleteConnectionTabHandlingMode;
+  editRememberConnectionDatabaseOnDelete.value = settingsStore.editorSettings.rememberConnectionDatabaseOnDelete;
   editDataTabReuseMode.value = settingsStore.editorSettings.dataTabReuseMode;
   editOpenDataTabsNextToActive.value = settingsStore.editorSettings.openDataTabsNextToActive;
   editPrefillNewQueryWithSelect.value = settingsStore.editorSettings.prefillNewQueryWithSelect;
@@ -1296,12 +1646,18 @@ function syncEditorSettingsDraftFromStore() {
   editGenerateSqlQuoteIdentifiers.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers;
   editFormatSqlOnSqlFileSave.value = settingsStore.editorSettings.formatSqlOnSqlFileSave;
   editShowTableDdlHoverPreview.value = settingsStore.editorSettings.showTableDdlHoverPreview;
+  editTableHoverLookupMode.value = settingsStore.editorSettings.tableHoverLookupMode;
   editClickTableNavigationTarget.value = settingsStore.editorSettings.clickTableNavigationTarget;
-  editUpdateNotificationsEnabled.value = settingsStore.editorSettings.updateNotificationsEnabled;
+  editAutoUpdateApp.value = settingsStore.editorSettings.autoUpdateApp;
+  editAutoUpdateDrivers.value = settingsStore.editorSettings.autoUpdateDrivers;
+  editAutoUpdateJdbc.value = settingsStore.editorSettings.autoUpdateJdbc;
+  editAutoUpdateMcp.value = settingsStore.editorSettings.autoUpdateMcp;
+  editAutoUpdatePlugins.value = settingsStore.editorSettings.autoUpdatePlugins;
   editSidebarHiddenTablePrefixes.value = settingsStore.editorSettings.sidebarHiddenTablePrefixes.join("\n");
   editSidebarCopyTableNameSeparator.value = settingsStore.editorSettings.sidebarCopyTableNameSeparator;
   editSidebarCopyTableNameIncludeSchema.value = settingsStore.editorSettings.sidebarCopyTableNameIncludeSchema;
   editRedisKeyTemplates.value = normalizeRedisKeyTemplates(settingsStore.editorSettings.redisKeyTemplates).join("\n");
+  editRedisDatabaseDisplayLimit.value = settingsStore.editorSettings.redisDatabaseDisplayLimit;
   editSidebarObjectInfoMode.value = settingsStore.editorSettings.sidebarObjectInfoMode;
   editSidebarAllowHorizontalScroll.value = settingsStore.editorSettings.sidebarAllowHorizontalScroll;
   editSidebarShowTooltips.value = settingsStore.editorSettings.sidebarShowTooltips;
@@ -1318,7 +1674,7 @@ function syncEditorSettingsDraftFromStore() {
   editUpdateDownloadSource.value = settingsStore.editorSettings.updateDownloadSource;
   editToolbarItems.value = { ...settingsStore.editorSettings.toolbarItems };
   editSnippets.value = settingsStore.editorSettings.snippets.map(editableSnippet);
-  editSqlShortcuts.value = settingsStore.editorSettings.sqlShortcuts.map(editableSqlShortcut);
+  editSqlShortcuts.value = mergeDefaultSqlShortcuts(settingsStore.editorSettings.sqlShortcuts.map(editableSqlShortcut));
   editSqlVariableSubstitutionEnabled.value = settingsStore.editorSettings.sqlVariableSubstitutionEnabled;
   editSqlVariableSyntaxOverrides.value = normalizeSqlVariableSyntaxOverrides(settingsStore.editorSettings.sqlVariableSyntaxOverrides);
   editClickTableNavigationTarget.value = settingsStore.editorSettings.clickTableNavigationTarget;
@@ -1353,9 +1709,11 @@ const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
   showInsertValueHints: editShowInsertValueHints,
   autoAliasTables: editAutoAliasTables,
   insertSpaceAfterCompletion: editInsertSpaceAfterCompletion,
+  sqlServerSpaceConfirmsCompletion: editSqlServerSpaceConfirmsCompletion,
   sortCompletionColumnsAlphabetically: editSortCompletionColumnsAlphabetically,
   selectFirstCompletionOnOpen: editSelectFirstCompletionOnOpen,
   wordWrap: editWordWrap,
+  showWhitespace: editShowWhitespace,
   vimModeEnabled: editVimModeEnabled,
   autoCloseBrackets: editAutoCloseBrackets,
   sqlSemanticDiagnosticsMode: editSqlSemanticDiagnosticsMode,
@@ -1387,6 +1745,9 @@ const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
   dataGridCrosshairHighlight: editDataGridCrosshairHighlight,
   pageSize: editPageSize,
   tableOpenPageSize: editTableOpenPageSize,
+  tableOpenSortMode: editTableOpenSortMode,
+  tableDatabaseSortDirection: editTableDatabaseSortDirection,
+  tableLocalSortDirection: editTableLocalSortDirection,
   queryResultMaxRowsEnabled: editQueryResultMaxRowsEnabled,
   queryResultMaxRows: editQueryResultMaxRows,
   externalSqlEditorMaxMb: editExternalSqlEditorMaxMb,
@@ -1405,6 +1766,8 @@ const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
   sidebarBrowseObjectsOnDatabaseActivation: editSidebarBrowseObjectsOnDatabaseActivation,
   openTabsRestoreMode: editOpenTabsRestoreMode,
   disconnectTabHandlingMode: editDisconnectTabHandlingMode,
+  deleteConnectionTabHandlingMode: editDeleteConnectionTabHandlingMode,
+  rememberConnectionDatabaseOnDelete: editRememberConnectionDatabaseOnDelete,
   dataTabReuseMode: editDataTabReuseMode,
   openDataTabsNextToActive: editOpenDataTabsNextToActive,
   prefillNewQueryWithSelect: editPrefillNewQueryWithSelect,
@@ -1412,7 +1775,14 @@ const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
   generateSqlQuoteIdentifiers: editGenerateSqlQuoteIdentifiers,
   formatSqlOnSqlFileSave: editFormatSqlOnSqlFileSave,
   showTableDdlHoverPreview: editShowTableDdlHoverPreview,
-  updateNotificationsEnabled: editUpdateNotificationsEnabled,
+  tableHoverLookupMode: editTableHoverLookupMode,
+  updateNotificationsEnabled: editAutoUpdateApp,
+  autoDownloadUpdates: editAutoUpdateApp,
+  autoUpdateApp: editAutoUpdateApp,
+  autoUpdateDrivers: editAutoUpdateDrivers,
+  autoUpdateJdbc: editAutoUpdateJdbc,
+  autoUpdateMcp: editAutoUpdateMcp,
+  autoUpdatePlugins: editAutoUpdatePlugins,
   sidebarObjectInfoMode: editSidebarObjectInfoMode,
   sidebarAllowHorizontalScroll: editSidebarAllowHorizontalScroll,
   sidebarShowTooltips: editSidebarShowTooltips,
@@ -1422,6 +1792,7 @@ const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
   sidebarCopyTableNameSeparator: editSidebarCopyTableNameSeparator,
   sidebarCopyTableNameIncludeSchema: editSidebarCopyTableNameIncludeSchema,
   redisKeyTemplates: editRedisKeyTemplates,
+  redisDatabaseDisplayLimit: editRedisDatabaseDisplayLimit,
   exportBatchSize: editExportBatchSize,
   csvQuoteMode: editCsvQuoteMode,
   exportRowLimitEnabled: editExportRowLimitEnabled,
@@ -1454,7 +1825,7 @@ function applyEditorSettingsKeysToRefs(draft: EditorSettingsDraft, keys: readonl
     redisKeyTemplates: (value) => normalizeRedisKeyTemplates(value as string[]).join("\n"),
     toolbarItems: (value) => ({ ...(value as EditorSettings["toolbarItems"]) }),
     snippets: (value) => (value as SqlSnippet[]).map(editableSnippet),
-    sqlShortcuts: (value) => (value as SqlShortcutAction[]).map(editableSqlShortcut),
+    sqlShortcuts: (value) => mergeDefaultSqlShortcuts((value as SqlShortcutAction[]).map(editableSqlShortcut)),
     sqlVariableSyntaxOverrides: (value) => normalizeSqlVariableSyntaxOverrides(value as EditorSettings["sqlVariableSyntaxOverrides"]),
     backgroundImage: (value) => cloneBackgroundImageDraft(value as BackgroundImageSettings),
   });
@@ -1506,12 +1877,24 @@ watch(
   { deep: true },
 );
 
-const shortcutConflicts = computed(() =>
-  SHORTCUT_DEFINITIONS.flatMap((definition) => {
+// 行 → 同作用域冲突对象（必顶阻断）。保留 map 形态是为了能算“重复对数”：
+// 行级列表会把同一对重复计两次（双向各一次），而摘要文案说的是“几组重复”。
+const shortcutConflictMap = computed(() => {
+  const conflicts: Partial<Record<ShortcutActionId, ShortcutActionId>> = {};
+  for (const definition of SHORTCUT_DEFINITIONS) {
     const conflict = findShortcutConflict(definition.id, editShortcuts.value[definition.id], editShortcuts.value);
-    return conflict ? [definition.id] : [];
-  }),
-);
+    if (conflict) conflicts[definition.id] = conflict;
+  }
+  return conflicts;
+});
+const shortcutConflicts = computed(() => Object.keys(shortcutConflictMap.value) as ShortcutActionId[]);
+// 行 → 跨作用域同键对象（**仅提示**，不进应用门禁）。不同作用域共用组合是
+// 有意的设计（find / focusSearch 默认都是 Mod+F，运行时按焦点路由），所以这里
+// 只用于展示；normalizeShortcutSettings 的占用判定依旧只看同作用域。
+const crossScopeShortcutConflicts = computed(() => findCrossScopeShortcutConflicts(editShortcuts.value));
+const crossScopeShortcutConflictIds = computed(() => Object.keys(crossScopeShortcutConflicts.value) as ShortcutActionId[]);
+const shortcutConflictPairCount = computed(() => countShortcutConflictPairs(shortcutConflictMap.value));
+const crossScopeShortcutPairCount = computed(() => countShortcutConflictPairs(crossScopeShortcutConflicts.value));
 const sqlShortcutConflicts = computed(() => findSqlShortcutConflicts(editSqlShortcuts.value, editShortcuts.value));
 const hasSqlShortcutConflicts = computed(() => sqlShortcutConflicts.value.length > 0);
 const shortcutSearchQuery = ref("");
@@ -1544,11 +1927,103 @@ const filteredShortcutDefinitions = computed(() => {
   const query = shortcutSearchQuery.value.trim().toLowerCase();
   if (!query) return SHORTCUT_DEFINITIONS;
   return SHORTCUT_DEFINITIONS.filter((definition) => {
-    const scope = t(`settings.shortcutScope${definition.scope[0].toUpperCase()}${definition.scope.slice(1)}`);
+    const scope = t(shortcutScopeLabelKey(definition.scope));
     const shortcut = formatShortcutPill(editShortcuts.value[definition.id]);
     return [definition.id, t(definition.labelKey), scope, shortcut].some((value) => value.toLowerCase().includes(query));
   });
 });
+
+// 二级归类：快捷键页签按作用域分组展示。顺序即运行时优先级——越外层先响应，
+// 用户读到的顺序与事件实际分发顺序一致。
+const SHORTCUT_SCOPE_ORDER: readonly ShortcutScope[] = ["global", "editor", "grid", "search", "sidebar"];
+
+function shortcutScopeLabelKey(scope: ShortcutScope): string {
+  return `settings.shortcutScope${scope[0].toUpperCase()}${scope.slice(1)}`;
+}
+
+function shortcutScopeHintKey(scope: ShortcutScope): string {
+  return `settings.shortcutScopeHint${scope[0].toUpperCase()}${scope.slice(1)}`;
+}
+
+function shortcutScopeIcon(scope: ShortcutScope) {
+  switch (scope) {
+    case "global":
+      return Globe;
+    case "editor":
+      return Code;
+    case "grid":
+      return Table;
+    case "search":
+      return Search;
+    default:
+      return PanelLeft;
+  }
+}
+
+interface ShortcutScopeGroup {
+  scope: ShortcutScope;
+  label: string;
+  hint: string;
+  definitions: ShortcutDefinition[];
+  unboundCount: number;
+  conflictCount: number;
+  crossScopeCount: number;
+}
+
+// 计数一律基于“当前可见行”（受搜索过滤影响）：组头是它下方那份列表的摘要，
+// 拿全局总数会导致搜索时组头数目与实际行数对不上。
+const shortcutScopeGroups = computed<ShortcutScopeGroup[]>(() =>
+  SHORTCUT_SCOPE_ORDER.map((scope) => {
+    const definitions = filteredShortcutDefinitions.value.filter((definition) => definition.scope === scope);
+    return {
+      scope,
+      label: t(shortcutScopeLabelKey(scope)),
+      hint: t(shortcutScopeHintKey(scope)),
+      definitions,
+      unboundCount: definitions.filter((definition) => !editShortcuts.value[definition.id]).length,
+      conflictCount: definitions.filter((definition) => shortcutConflictMap.value[definition.id]).length,
+      crossScopeCount: definitions.filter((definition) => (crossScopeShortcutConflicts.value[definition.id] ?? []).length > 0).length,
+    };
+  }).filter((group) => group.definitions.length > 0),
+);
+
+function isShortcutModified(definition: ShortcutDefinition): boolean {
+  return editShortcuts.value[definition.id] !== definition.defaultShortcut;
+}
+
+function shortcutDefinitionById(actionId: ShortcutActionId): ShortcutDefinition | undefined {
+  return SHORTCUT_DEFINITIONS.find((definition) => definition.id === actionId);
+}
+
+// 同作用域冲突的浮层文案：说清“与谁重复”与“为什么必须改”。
+function shortcutConflictTooltipText(definition: ShortcutDefinition): string {
+  const partnerId = shortcutConflictMap.value[definition.id];
+  const partner = partnerId ? shortcutDefinitionById(partnerId) : undefined;
+  if (!partner) return "";
+  return t("settings.shortcutConflictTooltip", { label: t(partner.labelKey), scope: t(shortcutScopeLabelKey(partner.scope)) });
+}
+
+// 跨作用域同键的浮层文案：列全对方动作及其作用域，并说明“无需处理”。
+function shortcutCrossScopeTooltipText(definition: ShortcutDefinition): string {
+  const others = crossScopeShortcutConflicts.value[definition.id] ?? [];
+  const targets = others
+    .map((actionId) => shortcutDefinitionById(actionId))
+    .filter((partner): partner is ShortcutDefinition => !!partner)
+    .map((partner) => `${t(shortcutScopeLabelKey(partner.scope))} · ${t(partner.labelKey)}`)
+    .join(t("settings.shortcutCrossScopeTooltipSeparator"));
+  if (!targets) return "";
+  return t("settings.shortcutCrossScopeTooltip", { targets });
+}
+
+function shortcutHasCrossScopeConflict(definition: ShortcutDefinition): boolean {
+  return (crossScopeShortcutConflicts.value[definition.id] ?? []).length > 0;
+}
+
+// 行级浮层的唯一入口：优先讲阻断性冲突（同作用域），其次才是跨作用域提示。
+// 返回空串时 LightTooltip 不展示（hasContent 为假），无需额外开关。
+function shortcutConflictHintText(definition: ShortcutDefinition): string {
+  return shortcutConflictTooltipText(definition) || shortcutCrossScopeTooltipText(definition);
+}
 const hasShortcutConflicts = computed(() => shortcutConflicts.value.length > 0);
 const shortcutsChanged = computed(() => JSON.stringify(editShortcuts.value) !== JSON.stringify(editEditorSettingsBase.value.shortcuts));
 const sqlShortcutsChanged = computed(() => JSON.stringify(editSqlShortcuts.value) !== JSON.stringify(editEditorSettingsBase.value.sqlShortcuts));
@@ -1586,6 +2061,10 @@ async function persistSettings() {
     settingsStore.updateEditorSettings(editorSettingsPatch);
     await settingsStore.persistEditorSettings();
     editEditorSettingsBase.value = editorSettingsDraftFromSettings(settingsStore.editorSettings);
+    // updateEditorSettings clamps out-of-range values; reflect the clamped
+    // result back into the input so an out-of-range draft doesn't keep
+    // reporting unsaved changes after a successful apply.
+    editRedisDatabaseDisplayLimit.value = settingsStore.editorSettings.redisDatabaseDisplayLimit;
   }
   if (pendingBackgroundImageCleanup) {
     const cleanupPath = pendingBackgroundImageCleanup;
@@ -1659,6 +2138,11 @@ async function restartDbxForDuckDbIsolation() {
 }
 
 function resetDefaultsForTab(tab: SettingsCategory) {
+  // Restoring defaults exits any in-progress shortcut capture so the affected
+  // rows return to their initial (non-editing) state instead of staying stuck
+  // in edit mode (#9066). Cleared unconditionally because the edit state can
+  // leak across tab switches (shortcuts/formatter tabs share the table).
+  editingShortcutId.value = null;
   if (tab === "editor") {
     editFontFamily.value = DEFAULT_EDITOR_SETTINGS.fontFamily;
     editFontSize.value = DEFAULT_EDITOR_SETTINGS.fontSize;
@@ -1672,10 +2156,12 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editShowInsertValueHints.value = DEFAULT_EDITOR_SETTINGS.showInsertValueHints;
     editAutoAliasTables.value = DEFAULT_EDITOR_SETTINGS.autoAliasTables;
     editInsertSpaceAfterCompletion.value = DEFAULT_EDITOR_SETTINGS.insertSpaceAfterCompletion;
+    editSqlServerSpaceConfirmsCompletion.value = DEFAULT_EDITOR_SETTINGS.sqlServerSpaceConfirmsCompletion;
     editSortCompletionColumnsAlphabetically.value = DEFAULT_EDITOR_SETTINGS.sortCompletionColumnsAlphabetically;
     editSelectFirstCompletionOnOpen.value = DEFAULT_EDITOR_SETTINGS.selectFirstCompletionOnOpen;
     editCompletionTriggerMode.value = DEFAULT_EDITOR_SETTINGS.completionTriggerMode;
     editWordWrap.value = DEFAULT_EDITOR_SETTINGS.wordWrap;
+    editShowWhitespace.value = DEFAULT_EDITOR_SETTINGS.showWhitespace;
     editVimModeEnabled.value = DEFAULT_EDITOR_SETTINGS.vimModeEnabled;
     editAutoCloseBrackets.value = DEFAULT_EDITOR_SETTINGS.autoCloseBrackets;
     editSqlSemanticDiagnosticsMode.value = DEFAULT_EDITOR_SETTINGS.sqlSemanticDiagnosticsMode;
@@ -1686,6 +2172,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editAppCloseUnsavedTabsMode.value = DEFAULT_EDITOR_SETTINGS.appCloseUnsavedTabsMode;
     editSavedSqlOpenTargetMode.value = DEFAULT_EDITOR_SETTINGS.savedSqlOpenTargetMode;
     editShowTableDdlHoverPreview.value = DEFAULT_EDITOR_SETTINGS.showTableDdlHoverPreview;
+    editTableHoverLookupMode.value = DEFAULT_EDITOR_SETTINGS.tableHoverLookupMode;
     editExternalSqlEditorMaxMb.value = DEFAULT_EDITOR_SETTINGS.externalSqlEditorMaxMb;
     editClickTableNavigationTarget.value = DEFAULT_EDITOR_SETTINGS.clickTableNavigationTarget;
     editSqlVariableSubstitutionEnabled.value = DEFAULT_EDITOR_SETTINGS.sqlVariableSubstitutionEnabled;
@@ -1721,6 +2208,8 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editSidebarBrowseObjectsOnDatabaseActivation.value = DEFAULT_EDITOR_SETTINGS.sidebarBrowseObjectsOnDatabaseActivation;
     editOpenTabsRestoreMode.value = DEFAULT_EDITOR_SETTINGS.openTabsRestoreMode;
     editDisconnectTabHandlingMode.value = DEFAULT_EDITOR_SETTINGS.disconnectTabHandlingMode;
+    editDeleteConnectionTabHandlingMode.value = DEFAULT_EDITOR_SETTINGS.deleteConnectionTabHandlingMode;
+    editRememberConnectionDatabaseOnDelete.value = DEFAULT_EDITOR_SETTINGS.rememberConnectionDatabaseOnDelete;
     editDataTabReuseMode.value = DEFAULT_EDITOR_SETTINGS.dataTabReuseMode;
     editOpenDataTabsNextToActive.value = DEFAULT_EDITOR_SETTINGS.openDataTabsNextToActive;
     editPrefillNewQueryWithSelect.value = DEFAULT_EDITOR_SETTINGS.prefillNewQueryWithSelect;
@@ -1728,7 +2217,6 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editGenerateSqlQuoteIdentifiers.value = DEFAULT_EDITOR_SETTINGS.generateSqlQuoteIdentifiers;
     editFormatSqlOnSqlFileSave.value = DEFAULT_EDITOR_SETTINGS.formatSqlOnSqlFileSave;
     editClickTableNavigationTarget.value = DEFAULT_EDITOR_SETTINGS.clickTableNavigationTarget;
-    editUpdateNotificationsEnabled.value = DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled;
     editSidebarObjectInfoMode.value = DEFAULT_EDITOR_SETTINGS.sidebarObjectInfoMode;
     editSidebarAllowHorizontalScroll.value = DEFAULT_EDITOR_SETTINGS.sidebarAllowHorizontalScroll;
     editSidebarShowTooltips.value = DEFAULT_EDITOR_SETTINGS.sidebarShowTooltips;
@@ -1760,6 +2248,9 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editDataGridShowWhitespace.value = DEFAULT_EDITOR_SETTINGS.dataGridShowWhitespace;
     editPageSize.value = DEFAULT_EDITOR_SETTINGS.pageSize;
     editTableOpenPageSize.value = DEFAULT_EDITOR_SETTINGS.tableOpenPageSize;
+    editTableOpenSortMode.value = DEFAULT_EDITOR_SETTINGS.tableOpenSortMode;
+    editTableDatabaseSortDirection.value = DEFAULT_EDITOR_SETTINGS.tableDatabaseSortDirection;
+    editTableLocalSortDirection.value = DEFAULT_EDITOR_SETTINGS.tableLocalSortDirection;
     editQueryResultMaxRowsEnabled.value = DEFAULT_EDITOR_SETTINGS.queryResultMaxRowsEnabled;
     editQueryResultMaxRows.value = DEFAULT_EDITOR_SETTINGS.queryResultMaxRows;
     editInfiniteScroll.value = DEFAULT_EDITOR_SETTINGS.infiniteScroll;
@@ -1769,6 +2260,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editDuckDbWorkerMaxProcesses.value = DEFAULT_DESKTOP_SETTINGS.duckdb_worker_max_processes;
     editTableColumnTemplateRows.value = tableColumnTemplateRowsFromSettings(DEFAULT_EDITOR_SETTINGS.tableColumnTemplateFields);
     editRedisKeyTemplates.value = normalizeRedisKeyTemplates(DEFAULT_EDITOR_SETTINGS.redisKeyTemplates).join("\n");
+    editRedisDatabaseDisplayLimit.value = DEFAULT_EDITOR_SETTINGS.redisDatabaseDisplayLimit;
     editExportBatchSize.value = DEFAULT_EDITOR_SETTINGS.exportBatchSize;
     editCsvQuoteMode.value = DEFAULT_EDITOR_SETTINGS.csvQuoteMode;
     editGlobalDateTimeDisplayFormat.value = DEFAULT_EDITOR_SETTINGS.globalDateTimeDisplayFormat;
@@ -1781,12 +2273,20 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editShortcuts.value = normalizeShortcutSettings(DEFAULT_EDITOR_SETTINGS.shortcuts);
   } else if (tab === "snippets") {
     editSnippets.value = DEFAULT_SQL_SNIPPETS.map((s) => ({ ...s }));
-  } else if (tab === "about") {
+  } else if (tab === "updates") {
+    editAutoUpdateApp.value = DEFAULT_EDITOR_SETTINGS.autoUpdateApp;
+    editAutoUpdateDrivers.value = DEFAULT_EDITOR_SETTINGS.autoUpdateDrivers;
+    editAutoUpdateJdbc.value = DEFAULT_EDITOR_SETTINGS.autoUpdateJdbc;
+    editAutoUpdateMcp.value = DEFAULT_EDITOR_SETTINGS.autoUpdateMcp;
+    editAutoUpdatePlugins.value = DEFAULT_EDITOR_SETTINGS.autoUpdatePlugins;
     editUpdateDownloadSource.value = DEFAULT_EDITOR_SETTINGS.updateDownloadSource;
   }
 }
 
 function resetAllDefaults() {
+  // Same contract as resetDefaultsForTab: a full reset also exits any
+  // in-progress shortcut capture (#9066).
+  editingShortcutId.value = null;
   editFontFamily.value = DEFAULT_EDITOR_SETTINGS.fontFamily;
   editFontSize.value = DEFAULT_EDITOR_SETTINGS.fontSize;
   editTableFontFamily.value = DEFAULT_EDITOR_SETTINGS.tableFontFamily;
@@ -1805,9 +2305,11 @@ function resetAllDefaults() {
   editShowInsertValueHints.value = DEFAULT_EDITOR_SETTINGS.showInsertValueHints;
   editAutoAliasTables.value = DEFAULT_EDITOR_SETTINGS.autoAliasTables;
   editInsertSpaceAfterCompletion.value = DEFAULT_EDITOR_SETTINGS.insertSpaceAfterCompletion;
+  editSqlServerSpaceConfirmsCompletion.value = DEFAULT_EDITOR_SETTINGS.sqlServerSpaceConfirmsCompletion;
   editSortCompletionColumnsAlphabetically.value = DEFAULT_EDITOR_SETTINGS.sortCompletionColumnsAlphabetically;
   editSelectFirstCompletionOnOpen.value = DEFAULT_EDITOR_SETTINGS.selectFirstCompletionOnOpen;
   editWordWrap.value = DEFAULT_EDITOR_SETTINGS.wordWrap;
+  editShowWhitespace.value = DEFAULT_EDITOR_SETTINGS.showWhitespace;
   editVimModeEnabled.value = DEFAULT_EDITOR_SETTINGS.vimModeEnabled;
   editAutoCloseBrackets.value = DEFAULT_EDITOR_SETTINGS.autoCloseBrackets;
   editSqlSemanticDiagnosticsMode.value = DEFAULT_EDITOR_SETTINGS.sqlSemanticDiagnosticsMode;
@@ -1849,6 +2351,9 @@ function resetAllDefaults() {
   editDataGridShowWhitespace.value = DEFAULT_EDITOR_SETTINGS.dataGridShowWhitespace;
   editPageSize.value = DEFAULT_EDITOR_SETTINGS.pageSize;
   editTableOpenPageSize.value = DEFAULT_EDITOR_SETTINGS.tableOpenPageSize;
+  editTableOpenSortMode.value = DEFAULT_EDITOR_SETTINGS.tableOpenSortMode;
+  editTableDatabaseSortDirection.value = DEFAULT_EDITOR_SETTINGS.tableDatabaseSortDirection;
+  editTableLocalSortDirection.value = DEFAULT_EDITOR_SETTINGS.tableLocalSortDirection;
   editQueryResultMaxRowsEnabled.value = DEFAULT_EDITOR_SETTINGS.queryResultMaxRowsEnabled;
   editQueryResultMaxRows.value = DEFAULT_EDITOR_SETTINGS.queryResultMaxRows;
   editExternalSqlEditorMaxMb.value = DEFAULT_EDITOR_SETTINGS.externalSqlEditorMaxMb;
@@ -1867,6 +2372,8 @@ function resetAllDefaults() {
   editSidebarBrowseObjectsOnDatabaseActivation.value = DEFAULT_EDITOR_SETTINGS.sidebarBrowseObjectsOnDatabaseActivation;
   editOpenTabsRestoreMode.value = DEFAULT_EDITOR_SETTINGS.openTabsRestoreMode;
   editDisconnectTabHandlingMode.value = DEFAULT_EDITOR_SETTINGS.disconnectTabHandlingMode;
+  editDeleteConnectionTabHandlingMode.value = DEFAULT_EDITOR_SETTINGS.deleteConnectionTabHandlingMode;
+  editRememberConnectionDatabaseOnDelete.value = DEFAULT_EDITOR_SETTINGS.rememberConnectionDatabaseOnDelete;
   editDataTabReuseMode.value = DEFAULT_EDITOR_SETTINGS.dataTabReuseMode;
   editOpenDataTabsNextToActive.value = DEFAULT_EDITOR_SETTINGS.openDataTabsNextToActive;
   editPrefillNewQueryWithSelect.value = DEFAULT_EDITOR_SETTINGS.prefillNewQueryWithSelect;
@@ -1874,7 +2381,12 @@ function resetAllDefaults() {
   editGenerateSqlQuoteIdentifiers.value = DEFAULT_EDITOR_SETTINGS.generateSqlQuoteIdentifiers;
   editFormatSqlOnSqlFileSave.value = DEFAULT_EDITOR_SETTINGS.formatSqlOnSqlFileSave;
   editShowTableDdlHoverPreview.value = DEFAULT_EDITOR_SETTINGS.showTableDdlHoverPreview;
-  editUpdateNotificationsEnabled.value = DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled;
+  editTableHoverLookupMode.value = DEFAULT_EDITOR_SETTINGS.tableHoverLookupMode;
+  editAutoUpdateApp.value = DEFAULT_EDITOR_SETTINGS.autoUpdateApp;
+  editAutoUpdateDrivers.value = DEFAULT_EDITOR_SETTINGS.autoUpdateDrivers;
+  editAutoUpdateJdbc.value = DEFAULT_EDITOR_SETTINGS.autoUpdateJdbc;
+  editAutoUpdateMcp.value = DEFAULT_EDITOR_SETTINGS.autoUpdateMcp;
+  editAutoUpdatePlugins.value = DEFAULT_EDITOR_SETTINGS.autoUpdatePlugins;
   editSidebarObjectInfoMode.value = DEFAULT_EDITOR_SETTINGS.sidebarObjectInfoMode;
   editSidebarAllowHorizontalScroll.value = DEFAULT_EDITOR_SETTINGS.sidebarAllowHorizontalScroll;
   editSidebarShowTooltips.value = DEFAULT_EDITOR_SETTINGS.sidebarShowTooltips;
@@ -1884,6 +2396,7 @@ function resetAllDefaults() {
   editSidebarCopyTableNameSeparator.value = DEFAULT_EDITOR_SETTINGS.sidebarCopyTableNameSeparator;
   editSidebarCopyTableNameIncludeSchema.value = DEFAULT_EDITOR_SETTINGS.sidebarCopyTableNameIncludeSchema;
   editRedisKeyTemplates.value = normalizeRedisKeyTemplates(DEFAULT_EDITOR_SETTINGS.redisKeyTemplates).join("\n");
+  editRedisDatabaseDisplayLimit.value = DEFAULT_EDITOR_SETTINGS.redisDatabaseDisplayLimit;
   editExportBatchSize.value = DEFAULT_EDITOR_SETTINGS.exportBatchSize;
   editCsvQuoteMode.value = DEFAULT_EDITOR_SETTINGS.csvQuoteMode;
   editGlobalDateTimeDisplayFormat.value = DEFAULT_EDITOR_SETTINGS.globalDateTimeDisplayFormat;
@@ -1895,7 +2408,7 @@ function resetAllDefaults() {
   editUpdateDownloadSource.value = DEFAULT_EDITOR_SETTINGS.updateDownloadSource;
   editToolbarItems.value = { ...DEFAULT_EDITOR_SETTINGS.toolbarItems };
   editSnippets.value = DEFAULT_SQL_SNIPPETS.map((s) => ({ ...s }));
-  editSqlShortcuts.value = [];
+  editSqlShortcuts.value = DEFAULT_SQL_SHORTCUTS.map(editableSqlShortcut);
 }
 
 function addTableColumnTemplateRow() {
@@ -2036,6 +2549,12 @@ function onCompletionTriggerModeChange(v: any) {
   }
 }
 
+function onTableHoverLookupModeChange(v: any) {
+  if (v === "current" || v === "fallback" || v === "always") {
+    editTableHoverLookupMode.value = v;
+  }
+}
+
 function onSqlSemanticDiagnosticsEnabledChange(value: boolean) {
   editSqlSemanticDiagnosticsEnabled.value = value;
   editSqlSemanticDiagnosticsMode.value = value ? "enabled" : "disabled";
@@ -2111,6 +2630,12 @@ function onDisconnectTabHandlingModeChange(v: any) {
   }
 }
 
+function onDeleteConnectionTabHandlingModeChange(v: any) {
+  if (v === "close-tabs" || v === "keep-sql-tabs" || v === "keep-pinned-sql-tabs" || v === "keep-all-tabs") {
+    editDeleteConnectionTabHandlingMode.value = v;
+  }
+}
+
 function onLocaleChange(v: any) {
   if (typeof v === "string") void setLocale(v as Locale);
 }
@@ -2155,6 +2680,14 @@ function onShortcutKeydown(actionId: ShortcutActionId, event: KeyboardEvent) {
   const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === actionId);
   const shortcut = definition?.inputKind === "modifier-only" ? eventToModifierOnlyShortcut(event) : eventToShortcut(event);
   if (!shortcut) return;
+  // macOS 上 ⌘H/⌥⌘H 由系统保留（Hide / Hide Others），配置层一旦绑定并在
+  // CodeMirror 中 preventDefault，AppKit 菜单的 key equivalent 就无法触发
+  // （#9068 的配置层复现），故此处输入时直接拒绝。
+  if (isReservedShortcut(shortcut)) {
+    toast(t("settings.shortcutReserved"), 3000);
+    editingShortcutId.value = null;
+    return;
+  }
   onShortcutChange(actionId, shortcut);
   editingShortcutId.value = null;
 }
@@ -2164,7 +2697,21 @@ function formatShortcutPill(shortcut: string): string {
 }
 
 const shortcutPressShortcutLabel = computed(() => t("settings.shortcutPressShortcut"));
-const shortcutPressShortcutInputWidth = computed(() => `${shortcutPressShortcutLabel.value.length + 2}em`);
+// #9144: `label.length + 2em` under-sizes CJK placeholders wherever the
+// environment's fallback font advances wider than 1em (user report: 15px/char
+// at a 13px font → the last glyph clipped mid-stroke). Measure a hidden mirror
+// span carrying the same box + typography classes as the capture inputs
+// instead; the char-count formula only survives as the pre-measurement
+// fallback. The +2px cushion absorbs sub-pixel rounding differences between
+// the mirror span and the real input.
+const shortcutPressShortcutInputWidth = ref(`${shortcutPressShortcutLabel.value.length + 2}em`);
+const shortcutPlaceholderMirrorRef = ref<HTMLElement | null>(null);
+const shortcutPlaceholderMirrorWidth = useMeasuredWidth(shortcutPlaceholderMirrorRef, 0, [shortcutPressShortcutLabel]);
+watch(shortcutPlaceholderMirrorWidth, (width) => {
+  if (width > 0) {
+    shortcutPressShortcutInputWidth.value = `${Math.ceil(width) + 2}px`;
+  }
+});
 
 function focusShortcutInput(actionId: ShortcutActionId) {
   editingShortcutId.value = actionId;
@@ -2267,10 +2814,11 @@ const settingsCategoryNav = computed<{ value: SettingsCategory; label: string }[
   { value: "sync", label: t("settings.syncTab") },
   { value: "ai", label: t("settings.aiTab") },
   { value: "mcp" as const, label: t("settings.mcpTab") },
+  { value: "updates" as const, label: t("settings.updatesTab") },
   ...(isWeb ? [{ value: "security" as const, label: t("settings.securityTab") }] : []),
   { value: "about", label: t("settings.aboutTab") },
 ]);
-const settingsTabsWithApplyFooter = new Set<SettingsCategory>(["editor", "formatter", "appearance", "navigation", "data", "shortcuts", "snippets"]);
+const settingsTabsWithApplyFooter = new Set<SettingsCategory>(["editor", "formatter", "appearance", "navigation", "data", "shortcuts", "snippets", "updates"]);
 
 function hasSettingsApplyFooter(value: SettingsCategory): boolean {
   return settingsTabsWithApplyFooter.has(value);
@@ -2300,6 +2848,8 @@ const settingsSearchEntries = computed(() =>
     [...SETTINGS_SEARCH_DEFINITIONS, ...createShortcutSettingsSearchDefinitions(SHORTCUT_DEFINITIONS)],
     {
       isWeb,
+      hasSqlServerConnection: hasSqlServerConnection.value,
+      sqlServerSpaceConfirmsCompletionEnabled: settingsStore.editorSettings.sqlServerSpaceConfirmsCompletion || editSqlServerSpaceConfirmsCompletion.value,
       visibleCategories: new Set(settingsCategoryNav.value.map((category) => category.value)),
     },
     translateWithExecuteShortcut,
@@ -2592,7 +3142,7 @@ async function exportDebugLogs() {
 }
 
 // ---------- MCP Server ----------
-type McpConfigTab = "claude" | "cursor" | "codebuddy" | "zcode" | "trae" | "vscode" | "windsurf" | "codex" | "deepseek-harness" | "opencode" | "pi" | "cherry-studio" | "qoder";
+type McpConfigTab = "claude" | "cursor" | "codebuddy" | "zcode" | "trae" | "vscode" | "windsurf" | "codex" | "deepseek-harness" | "opencode" | "pi" | "cherry-studio" | "qoder" | "workbuddy";
 type McpCopyKind = "install" | "uninstall" | "http-endpoint" | "http-token" | "http-config" | `${McpConfigTab}-config`;
 type McpTransportTab = "stdio" | "http";
 type McpManagementTab = "access" | "permissions";
@@ -3176,6 +3726,7 @@ const mcpDeepSeekHarnessRecommendedConfig = computed(() => buildMcpDeepSeekHarne
 
 const mcpOpenCodeRecommendedConfig = computed(() => buildMcpOpenCodeConfig(mcpLaunchConfig.value));
 const mcpPiRecommendedConfig = computed(() => buildMcpPiConfig(mcpLaunchConfig.value));
+const mcpWorkBuddyRecommendedConfig = computed(() => buildMcpWorkBuddyConfig(mcpLaunchConfig.value));
 
 const mcpStatusTone = computed<"ok" | "warning" | "muted">(() => {
   if (!mcpStatus.value) return "muted";
@@ -3243,6 +3794,7 @@ async function installMcp() {
     mcpInstallError.value = false;
     // 安装成功后刷新状态
     await refreshMcpStatus();
+    notifyComponentUpdatesChanged();
   } catch (e: any) {
     mcpInstallMessage.value = e?.message || String(e);
     mcpInstallError.value = true;
@@ -3265,6 +3817,7 @@ async function uninstallMcp() {
   try {
     mcpInstallMessage.value = await uninstallMcpServer();
     await refreshMcpStatus();
+    notifyComponentUpdatesChanged();
   } catch (e: any) {
     mcpInstallMessage.value = t("settings.mcpUninstallFailed", { error: e?.message || String(e) });
     mcpInstallError.value = true;
@@ -3295,9 +3848,13 @@ const webdavError = ref(false);
 const syncMethodTab = ref<"webdav" | "snippet">("webdav");
 
 const snippetProvider = ref<SnippetProvider>((localStorage.getItem("dbx-snippet-provider") as SnippetProvider) || "github");
+const snippetInstanceUrl = ref(localStorage.getItem("dbx-gitlab-instance-url") || "https://gitlab.com");
+const activeSnippetInstanceUrl = ref(snippetInstanceUrl.value);
+const snippetInstanceError = ref("");
+const snippetPreferenceKey = () => `dbx-snippet-remember-token-${snippetProvider.value}${snippetProvider.value === "gitlab" ? `-${activeSnippetInstanceUrl.value}` : ""}`;
 const snippetId = ref("");
 const snippetToken = ref("");
-const snippetRememberToken = ref(localStorage.getItem(`dbx-snippet-remember-token-${snippetProvider.value}`) === "true");
+const snippetRememberToken = ref(localStorage.getItem(snippetPreferenceKey()) === "true");
 const snippetHasSavedToken = ref(false);
 const snippetPassphrase = ref("");
 const snippetSecretsPassphrase = ref("");
@@ -3311,7 +3868,7 @@ const pendingLegacyCleanupId = ref("");
 const snippetSyncSettingsLoading = ref(true);
 
 const webdavReady = computed(() => !!webdavEndpoint.value.trim() && !webdavBusy.value && (!webdavSyncSecrets.value || !!webdavSecretsPassphrase.value.trim() || webdavHasSavedSecretsPassphrase.value));
-const snippetReady = computed(() => !snippetSyncSettingsLoading.value && !snippetBusy.value && (!!snippetToken.value.trim() || snippetHasSavedToken.value));
+const snippetReady = computed(() => !snippetSyncSettingsLoading.value && !snippetBusy.value && (snippetProvider.value !== "gitlab" || (!snippetInstanceError.value && snippetInstanceUrl.value === activeSnippetInstanceUrl.value)) && (!!snippetToken.value.trim() || snippetHasSavedToken.value));
 const snippetUploadReady = computed(() => snippetReady.value && !!snippetPassphrase.value.trim() && (!snippetIncludeSecrets.value || !!snippetSecretsPassphrase.value.trim()));
 // Legacy plaintext snippets have no outer encryption password. Let the
 // backend require one only after it detects an encrypted envelope so those
@@ -3321,6 +3878,7 @@ const snippetDownloadReady = computed(() => snippetReady.value && (!snippetResto
 function currentSnippetConfig(replaceLegacySnippet = false): SnippetSyncConfig {
   return {
     provider: snippetProvider.value,
+    instanceUrl: snippetProvider.value === "gitlab" ? activeSnippetInstanceUrl.value : undefined,
     token: snippetToken.value.trim() || undefined,
     snippetId: snippetId.value.trim() || undefined,
     replaceLegacySnippet: replaceLegacySnippet || undefined,
@@ -3332,43 +3890,70 @@ function currentSnippetAccountConfig(): SnippetSyncConfig {
 }
 
 async function refreshSnippetTokenStatus() {
+  const account = `${snippetProvider.value}:${activeSnippetInstanceUrl.value}`;
   try {
     const status = await snippetTokenStatus(currentSnippetAccountConfig());
+    if (account !== `${snippetProvider.value}:${activeSnippetInstanceUrl.value}`) return;
     snippetHasSavedToken.value = status.hasSavedToken;
     if (status.hasSavedToken) snippetRememberToken.value = true;
   } catch {
-    snippetHasSavedToken.value = false;
+    if (account === `${snippetProvider.value}:${activeSnippetInstanceUrl.value}`) snippetHasSavedToken.value = false;
   }
 }
 
-async function refreshSnippetSyncSettings(provider = snippetProvider.value) {
+async function refreshSnippetSyncSettings(provider = snippetProvider.value, instanceUrl = activeSnippetInstanceUrl.value) {
+  const isCurrent = () => provider === snippetProvider.value && instanceUrl === activeSnippetInstanceUrl.value;
   try {
-    const settings = await snippetSyncSettings(provider);
-    if (provider !== snippetProvider.value) return;
+    const settings = await snippetSyncSettings(provider, provider === "gitlab" ? instanceUrl : undefined);
+    if (!isCurrent()) return;
     pendingLegacyCleanupId.value = settings.legacyCleanupRequiredId || "";
     if (settings.snippetId) {
       snippetId.value = settings.snippetId;
       return;
     }
-    const legacyId = localStorage.getItem(`dbx-snippet-id-${provider}`)?.trim();
+    const legacyId = provider === "gitlab" ? undefined : localStorage.getItem(`dbx-snippet-id-${provider}`)?.trim();
     if (legacyId) {
       await saveSnippetSyncId(provider, legacyId);
       localStorage.removeItem(`dbx-snippet-id-${provider}`);
     }
-    if (provider !== snippetProvider.value) return;
+    if (!isCurrent()) return;
     snippetId.value = legacyId || "";
   } catch {
-    if (provider === snippetProvider.value) {
+    if (isCurrent()) {
       snippetId.value = "";
       pendingLegacyCleanupId.value = "";
     }
   } finally {
-    if (provider === snippetProvider.value) snippetSyncSettingsLoading.value = false;
+    if (isCurrent()) snippetSyncSettingsLoading.value = false;
   }
 }
 
 async function persistSnippetSyncId() {
-  await saveSnippetSyncId(snippetProvider.value, snippetId.value.trim() || undefined);
+  await saveSnippetSyncId(snippetProvider.value, snippetId.value.trim() || undefined, snippetProvider.value === "gitlab" ? activeSnippetInstanceUrl.value : undefined);
+}
+
+function commitSnippetInstance() {
+  try {
+    const url = new URL(snippetInstanceUrl.value.trim());
+    if (!["https:", "http:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error();
+    snippetInstanceUrl.value = url.href.replace(/\/$/, "");
+    snippetInstanceError.value = "";
+  } catch {
+    snippetInstanceError.value = t("settings.syncGitLabInstanceInvalid");
+    return;
+  }
+  if (snippetInstanceUrl.value === activeSnippetInstanceUrl.value) return;
+  activeSnippetInstanceUrl.value = snippetInstanceUrl.value;
+  localStorage.setItem("dbx-gitlab-instance-url", activeSnippetInstanceUrl.value);
+  snippetRememberToken.value = localStorage.getItem(snippetPreferenceKey()) === "true";
+  snippetToken.value = "";
+  snippetHasSavedToken.value = false;
+  snippetId.value = "";
+  legacySnippetId.value = "";
+  pendingLegacyCleanupId.value = "";
+  snippetSyncSettingsLoading.value = true;
+  void refreshSnippetTokenStatus();
+  void refreshSnippetSyncSettings();
 }
 
 async function applySnippetTokenPreference() {
@@ -3390,7 +3975,7 @@ async function runSnippetAction(kind: "test" | "upload" | "download" | "migrate"
   snippetError.value = false;
   try {
     localStorage.setItem("dbx-snippet-provider", snippetProvider.value);
-    localStorage.setItem(`dbx-snippet-remember-token-${snippetProvider.value}`, String(snippetRememberToken.value));
+    localStorage.setItem(snippetPreferenceKey(), String(snippetRememberToken.value));
     if (persistCurrentSnippetId) await persistSnippetSyncId();
     await applySnippetTokenPreference();
     snippetMessage.value = await action();
@@ -3775,8 +4360,9 @@ watch([webdavAutoUploadEnabled, webdavAutoUploadIntervalMinutes], () => {
 watch(snippetProvider, (provider) => {
   localStorage.setItem("dbx-snippet-provider", provider);
   snippetId.value = "";
-  snippetRememberToken.value = localStorage.getItem(`dbx-snippet-remember-token-${provider}`) === "true";
+  snippetRememberToken.value = localStorage.getItem(snippetPreferenceKey()) === "true";
   snippetToken.value = "";
+  snippetHasSavedToken.value = false;
   legacySnippetId.value = "";
   pendingLegacyCleanupId.value = "";
   snippetSyncSettingsLoading.value = true;
@@ -4019,7 +4605,7 @@ function globalInstructionsTooLong(): boolean {
 }
 
 // Agent turn limit for DBX's API-backed agent loop. CLI providers enforce their own limits.
-// Mirrors DEFAULT/MIN/MAX_MAX_AGENT_TURNS in crates/dbx-core/src/agent_loop.rs —
+// Mirrors DEFAULT/MIN/MAX_MAX_AGENT_TURNS in crates/dbx-core/src/ai/agent_loop.rs —
 // keep in sync; the backend clamp on save/load is the actual source of truth.
 const editMaxAgentTurns = ref<number | undefined>(undefined);
 const maxAgentTurnsSaving = ref(false);
@@ -4499,6 +5085,8 @@ function aiSelectProvider(presetId: string) {
   if (isWeb && CLI_AI_PROVIDERS.has(provider)) return;
   if (presetId === aiEditProviderPresetId.value) return;
 
+  syncAiEditState();
+
   // Apply new provider's preset defaults to edit state
   aiEditProviderPresetId.value = presetId;
   aiEditProvider.value = provider;
@@ -4528,6 +5116,7 @@ function aiEnterListMode() {
 }
 
 function aiEnterEditMode(configId?: string) {
+  syncAiEditState();
   aiConfigListMode.value = "edit";
   aiEditConfigId.value = configId || null;
 
@@ -5199,6 +5788,7 @@ onUnmounted(() => {
             <div ref="settingsSearchInputContainerRef" class="relative">
               <Search class="pointer-events-none absolute top-1/2 left-4 z-10 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
               <Input
+                data-settings-global-search
                 v-model="settingsSearchQuery"
                 type="text"
                 autocomplete="off"
@@ -5417,7 +6007,26 @@ onUnmounted(() => {
                   </Select>
                 </div>
 
-                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2" data-editor-default-transaction-mode>
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2 md:col-span-2" data-editor-table-hover-lookup-mode>
+                  <div class="min-w-0 space-y-1">
+                    <Label>{{ t("settings.tableHoverLookupMode") }}</Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ tableHoverLookupModeDescription }}
+                    </p>
+                  </div>
+                  <Select :model-value="editTableHoverLookupMode" @update:model-value="onTableHoverLookupModeChange">
+                    <SelectTrigger class="h-8 w-48 shrink-0">
+                      <SelectValue :placeholder="t('settings.tableHoverLookupMode')" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="current">{{ t("settings.tableHoverLookupModeCurrent") }}</SelectItem>
+                      <SelectItem value="fallback">{{ t("settings.tableHoverLookupModeFallback") }}</SelectItem>
+                      <SelectItem value="always">{{ t("settings.tableHoverLookupModeAlways") }}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2 md:col-span-2" data-editor-default-transaction-mode>
                   <div class="min-w-0 space-y-1">
                     <Label for="editor-default-transaction-mode">{{ t("settings.defaultTransactionMode") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -5528,6 +6137,16 @@ onUnmounted(() => {
                   <Switch id="editor-insert-space-after-completion" v-model="editInsertSpaceAfterCompletion" class="mt-0.5" />
                 </div>
 
+                <div v-if="showSqlServerSpaceConfirmsCompletion" class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="editor-sqlserver-space-confirms-completion">{{ t("settings.sqlServerSpaceConfirmsCompletion") }}</Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.sqlServerSpaceConfirmsCompletionDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="editor-sqlserver-space-confirms-completion" v-model="editSqlServerSpaceConfirmsCompletion" class="mt-0.5" />
+                </div>
+
                 <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="editor-sort-completion-columns-alphabetically">{{ t("settings.sortCompletionColumnsAlphabetically") }}</Label>
@@ -5560,6 +6179,16 @@ onUnmounted(() => {
                     </p>
                   </div>
                   <Switch id="editor-show-insert-value-hints" v-model="editShowInsertValueHints" class="mt-0.5" />
+                </div>
+
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="editor-show-whitespace">{{ t("settings.showWhitespace") }}</Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.showWhitespaceDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="editor-show-whitespace" v-model="editShowWhitespace" class="mt-0.5" />
                 </div>
 
                 <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
@@ -6202,16 +6831,6 @@ onUnmounted(() => {
                 <Switch id="quit-on-close" v-model="editQuitOnClose" />
               </div>
 
-              <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
-                <div class="space-y-1">
-                  <Label for="update-notifications-enabled">{{ t("settings.updateNotificationsEnabled") }}</Label>
-                  <p class="text-xs text-muted-foreground">
-                    {{ t("settings.updateNotificationsEnabledDescription") }}
-                  </p>
-                </div>
-                <Switch id="update-notifications-enabled" v-model="editUpdateNotificationsEnabled" />
-              </div>
-
               <div class="settings-appearance-group" data-icon-theme-settings>
                 <Label>{{ t("settings.iconTheme") }}</Label>
                 <div class="settings-appearance-choice-grid settings-icon-theme-grid">
@@ -6581,6 +7200,52 @@ onUnmounted(() => {
               </div>
               <div class="settings-item space-y-2 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
+                  <Label for="delete-connection-tab-handling-mode">{{ t("settings.deleteConnectionTabHandlingMode") }}</Label>
+                  <HelpTooltip :label="t('settings.deleteConnectionTabHandlingMode')">
+                    {{ t("settings.deleteConnectionTabHandlingModeDescription") }}
+                  </HelpTooltip>
+                </div>
+                <Select :model-value="editDeleteConnectionTabHandlingMode" @update:model-value="onDeleteConnectionTabHandlingModeChange">
+                  <SelectTrigger id="delete-connection-tab-handling-mode" class="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="close-tabs">{{ t("settings.deleteConnectionTabHandlingModeCloseTabs") }}</SelectItem>
+                    <SelectItem value="keep-sql-tabs">{{ t("settings.deleteConnectionTabHandlingModeKeepSqlTabs") }}</SelectItem>
+                    <SelectItem value="keep-pinned-sql-tabs">
+                      {{ t("settings.deleteConnectionTabHandlingModeKeepPinnedSqlTabs") }}
+                    </SelectItem>
+                    <SelectItem value="keep-all-tabs">{{ t("settings.deleteConnectionTabHandlingModeKeepAllTabs") }}</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p class="text-xs text-muted-foreground">
+                  {{ t(`settings.${deleteConnectionTabHandlingModeDescriptionKey}`) }}
+                </p>
+              </div>
+              <div class="settings-item flex items-center justify-between gap-3 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="min-w-0 space-y-1">
+                  <div class="flex items-center gap-2">
+                    <Label for="remember-connection-database-on-delete">{{ t("settings.rememberConnectionDatabaseOnDelete") }}</Label>
+                    <HelpTooltip :label="t('settings.rememberConnectionDatabaseOnDelete')">
+                      {{ t("settings.rememberConnectionDatabaseOnDeleteDescription") }}
+                    </HelpTooltip>
+                  </div>
+                  <p class="text-xs text-muted-foreground">
+                    {{ t("settings.rememberConnectionDatabaseOnDeleteHint") }}
+                  </p>
+                  <div class="flex flex-wrap items-center gap-2">
+                    <span class="text-xs text-muted-foreground">
+                      {{ t("settings.rememberedConnectionDatabaseCount", { count: rememberedConnectionDatabaseCount }) }}
+                    </span>
+                    <Button variant="outline" size="sm" :disabled="rememberedConnectionDatabaseCount === 0" @click="clearRememberedConnectionDatabases">
+                      {{ t("settings.clearRememberedConnectionDatabases") }}
+                    </Button>
+                  </div>
+                </div>
+                <Switch id="remember-connection-database-on-delete" v-model="editRememberConnectionDatabaseOnDelete" />
+              </div>
+              <div class="settings-item space-y-2 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="flex items-center gap-2">
                   <Label for="sidebar-object-info-mode">{{ t("settings.sidebarObjectInfoMode") }}</Label>
                   <HelpTooltip :label="t('settings.sidebarObjectInfoMode')">
                     {{ t("settings.sidebarObjectInfoModeDescription") }}
@@ -6928,6 +7593,35 @@ onUnmounted(() => {
                     @update:model-value="updatePageSizeDraft"
                   />
                 </div>
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="tableOpenSortMode">{{ t("settings.tableOpenSortMode") }}</Label>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.tableOpenSortDescription") }}</p>
+                  </div>
+                  <select id="tableOpenSortMode" v-model="editTableOpenSortMode" class="h-8 rounded-md border bg-background px-2 text-xs">
+                    <option value="none">{{ t("settings.tableSortUnchanged") }}</option>
+                    <option value="database">{{ t("settings.tableSortDatabase") }}</option>
+                    <option value="local">{{ t("settings.tableSortLocal") }}</option>
+                  </select>
+                </div>
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="tableDatabaseSortDirection">{{ t("settings.tableDatabaseSortDirection") }}</Label>
+                  </div>
+                  <select id="tableDatabaseSortDirection" v-model="editTableDatabaseSortDirection" class="h-8 rounded-md border bg-background px-2 text-xs">
+                    <option value="asc">{{ t("settings.tableSortAscending") }}</option>
+                    <option value="desc">{{ t("settings.tableSortDescending") }}</option>
+                  </select>
+                </div>
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="tableLocalSortDirection">{{ t("settings.tableLocalSortDirection") }}</Label>
+                  </div>
+                  <select id="tableLocalSortDirection" v-model="editTableLocalSortDirection" class="h-8 rounded-md border bg-background px-2 text-xs">
+                    <option value="asc">{{ t("settings.tableSortAscending") }}</option>
+                    <option value="desc">{{ t("settings.tableSortDescending") }}</option>
+                  </select>
+                </div>
                 <div data-settings-search-id="default-auto-keep-results" :class="['settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2', settingsSearchTargetClass('default-auto-keep-results')]">
                   <div class="min-w-0 space-y-1">
                     <Label for="default-auto-keep-results">{{ t("settings.defaultAutoKeepResults") }}</Label>
@@ -7262,6 +7956,25 @@ onUnmounted(() => {
                     {{ t("settings.redisKeyTemplatesDescription") }}
                   </p>
                 </div>
+                <div class="space-y-2">
+                  <Label for="redis-database-display-limit-input">{{ t("settings.redisDatabaseDisplayLimit") }}</Label>
+                  <div class="flex items-center gap-3">
+                    <Input
+                      id="redis-database-display-limit-input"
+                      type="number"
+                      list="redis-database-display-limits"
+                      :min="REDIS_DATABASE_DISPLAY_LIMIT_MIN"
+                      :max="REDIS_DATABASE_DISPLAY_LIMIT_MAX"
+                      step="10"
+                      v-model.number="editRedisDatabaseDisplayLimit"
+                      class="settings-export-number-input h-9 w-28 [&::-webkit-inner-spin-button]:appearance-none"
+                    />
+                    <datalist id="redis-database-display-limits">
+                      <option v-for="size in REDIS_DATABASE_DISPLAY_LIMIT_OPTIONS" :key="size" :value="size" />
+                    </datalist>
+                    <span class="text-xs text-muted-foreground">{{ t("settings.redisDatabaseDisplayLimitDescription") }}</span>
+                  </div>
+                </div>
               </div>
 
               <Separator />
@@ -7494,81 +8207,131 @@ onUnmounted(() => {
             </section>
 
             <section v-else-if="activeSettingsTab === 'shortcuts'" data-settings-search-id="shortcuts" :class="['flex flex-col gap-2 py-2', settingsSearchTargetClass('shortcuts')]">
-              <div class="relative">
-                <Search class="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                <Input v-model="shortcutSearchQuery" autocomplete="off" :placeholder="t('settings.shortcutSearchPlaceholder')" class="h-9 pl-9 text-sm" />
+              <div class="flex items-center gap-2">
+                <div class="relative min-w-0 flex-1">
+                  <Search class="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input v-model="shortcutSearchQuery" autocomplete="off" :placeholder="t('settings.shortcutSearchPlaceholder')" class="h-9 pl-9 text-sm" />
+                </div>
+                <!-- 冲突摘只需计数，明细进浮层：不再用整条横幅占掉列表高度。 -->
+                <LightTooltip v-if="shortcutConflicts.length > 0" :text="t('settings.shortcutConflictSummaryTooltip', { count: shortcutConflicts.length, pairs: shortcutConflictPairCount })">
+                  <span class="inline-flex h-9 shrink-0 cursor-help items-center gap-1.5 rounded-md border border-destructive/25 bg-destructive/10 px-2 text-[11.5px] font-medium tabular-nums text-destructive">
+                    <span class="size-1.5 rounded-full bg-current" aria-hidden="true" />
+                    {{ t("settings.shortcutConflictBadge", { count: shortcutConflicts.length }) }}
+                  </span>
+                </LightTooltip>
+                <LightTooltip v-if="crossScopeShortcutConflictIds.length > 0" :text="t('settings.shortcutCrossScopeSummaryTooltip', { count: crossScopeShortcutConflictIds.length, pairs: crossScopeShortcutPairCount })">
+                  <span class="inline-flex h-9 shrink-0 cursor-help items-center gap-1.5 rounded-md border border-warning/30 bg-warning/10 px-2 text-[11.5px] font-medium tabular-nums text-warning">
+                    <span class="size-1.5 rounded-full bg-current" aria-hidden="true" />
+                    {{ t("settings.shortcutCrossScopeBadge", { count: crossScopeShortcutConflictIds.length }) }}
+                  </span>
+                </LightTooltip>
               </div>
-              <div class="overflow-hidden rounded-md border border-border/70 bg-background">
-                <div v-if="filteredShortcutDefinitions.length === 0" class="px-3 py-8 text-center text-sm text-muted-foreground">
-                  {{ t("settings.shortcutSearchNoResults") }}
-                </div>
-                <div v-for="definition in filteredShortcutDefinitions" :key="definition.id" class="settings-shortcut-row group -mt-px grid gap-2 border-t border-border/70 px-3 py-2 transition-colors first:mt-0 first:border-t-0 hover:bg-muted/40 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
-                  <div class="settings-shortcut-label min-w-0">
-                    <div class="flex min-w-0 items-center gap-2">
-                      <Label class="min-w-0 truncate leading-none">{{ t(definition.labelKey) }}</Label>
-                      <Badge variant="outline" class="h-5 shrink-0 rounded-md border-border/60 px-1.5 text-[11px] font-normal text-muted-foreground">
-                        {{ t(`settings.shortcutScope${definition.scope[0].toUpperCase()}${definition.scope.slice(1)}`) }}
-                      </Badge>
+
+              <div v-if="filteredShortcutDefinitions.length === 0" class="rounded-md border border-border/70 px-3 py-8 text-center text-sm text-muted-foreground">
+                {{ t("settings.shortcutSearchNoResults") }}
+              </div>
+
+              <!-- 二级归类：按作用域分组，组头吸顶。顺序即运行时优先级（越外层越先响应）。
+                   分组容器刻意不用 overflow-hidden —— 它会成为嵌套滚动容器，使组头吸顶失效；
+                   圆角改由组头（上）与末行（下）分别承担。 -->
+              <div v-else class="flex flex-col gap-2">
+                <section v-for="group in shortcutScopeGroups" :key="group.scope" class="rounded-md border border-border/70 bg-background">
+                  <header class="sticky top-0 z-10 flex items-center gap-2 rounded-t-md border-b border-border/70 bg-popover px-3 py-2">
+                    <component :is="shortcutScopeIcon(group.scope)" class="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+                    <h3 class="shrink-0 text-[13px] leading-none font-semibold">{{ group.label }}</h3>
+                    <span class="shrink-0 rounded-sm border border-border/80 px-1 font-mono text-[10px] leading-4 text-muted-foreground/75">{{ group.scope }}</span>
+                    <span class="shrink-0 text-[11px] tabular-nums text-muted-foreground">{{ t("settings.shortcutGroupCount", { count: group.definitions.length }) }}</span>
+                    <LightTooltip v-if="group.unboundCount > 0" :text="t('settings.shortcutGroupUnboundTooltip')">
+                      <span class="shrink-0 cursor-help text-[11px] tabular-nums text-muted-foreground/70">
+                        {{ t("settings.shortcutGroupUnbound", { count: group.unboundCount }) }}
+                      </span>
+                    </LightTooltip>
+                    <LightTooltip v-if="group.conflictCount > 0" :text="t('settings.shortcutConflictSummaryTooltip', { count: group.conflictCount, pairs: shortcutConflictPairCount })">
+                      <span class="inline-flex shrink-0 cursor-help items-center gap-1 text-[11px] font-medium tabular-nums text-destructive"> <span class="size-[5px] rounded-full bg-current" aria-hidden="true" />{{ group.conflictCount }} </span>
+                    </LightTooltip>
+                    <LightTooltip v-if="group.crossScopeCount > 0" :text="t('settings.shortcutCrossScopeSummaryTooltip', { count: group.crossScopeCount, pairs: crossScopeShortcutPairCount })">
+                      <span class="inline-flex shrink-0 cursor-help items-center gap-1 text-[11px] font-medium tabular-nums text-warning"> <span class="size-[5px] rounded-full bg-current" aria-hidden="true" />{{ group.crossScopeCount }} </span>
+                    </LightTooltip>
+                    <span class="ml-auto hidden truncate text-[11px] text-muted-foreground xl:block">{{ group.hint }}</span>
+                  </header>
+                  <div
+                    v-for="(definition, index) in group.definitions"
+                    :key="definition.id"
+                    class="settings-shortcut-row group grid gap-2 border-t border-border/70 px-3 py-2 transition-colors hover:bg-muted/40 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
+                    :class="index === group.definitions.length - 1 ? 'rounded-b-md' : ''"
+                    :data-conflict="shortcutConflictMap[definition.id] ? 'true' : undefined"
+                    :data-cross-scope="shortcutHasCrossScopeConflict(definition) ? 'true' : undefined"
+                  >
+                    <div class="settings-shortcut-label min-w-0">
+                      <div class="flex min-w-0 items-center gap-2">
+                        <Label class="min-w-0 truncate leading-none">{{ t(definition.labelKey) }}</Label>
+                        <!-- scope 已由分组标题承载，行内不再重复散章 -->
+                        <LightTooltip v-if="isShortcutModified(definition)" :text="t('settings.shortcutModifiedTagTooltip')">
+                          <span class="shrink-0 cursor-help rounded-sm border border-border/90 px-1 text-[10px] leading-4 text-muted-foreground">
+                            {{ t("settings.shortcutModifiedTag") }}
+                          </span>
+                        </LightTooltip>
+                      </div>
+                    </div>
+                    <div class="settings-shortcut-actions min-w-0 text-right">
+                      <div class="settings-shortcut-controls flex items-center justify-end gap-1.5">
+                        <!-- 冲突解释改为悬停才出现：默认只留胶囊颜色这一条定位线索。 -->
+                        <LightTooltip side="left" :disabled="editingShortcutId === definition.id" :text="shortcutConflictHintText(definition)" content-class="max-w-[320px]">
+                          <input
+                            :data-shortcut-input="definition.id"
+                            :value="editingShortcutId === definition.id ? '' : formatShortcutPill(editShortcuts[definition.id])"
+                            :style="{
+                              width: editingShortcutId === definition.id ? shortcutPressShortcutInputWidth : `${Math.max(4, formatShortcutPill(editShortcuts[definition.id]).length + 3)}ch`,
+                            }"
+                            readonly
+                            :aria-invalid="shortcutConflicts.includes(definition.id)"
+                            :placeholder="t('settings.shortcutPressShortcut')"
+                            class="settings-shortcut-pill h-7 w-auto min-w-12 max-w-64 shrink-0 cursor-default rounded-[6px] border border-transparent bg-muted px-2.5 text-center font-mono text-[13px] font-semibold text-foreground/75 shadow-inner outline-none selection:bg-transparent placeholder:text-muted-foreground aria-invalid:border-destructive/55 aria-invalid:text-destructive"
+                            :class="editingShortcutId === definition.id ? 'max-w-64 cursor-text border-border/80 bg-background text-left text-foreground shadow-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/35' : ''"
+                            @keydown="(event: KeyboardEvent) => onShortcutKeydown(definition.id, event)"
+                          />
+                        </LightTooltip>
+                        <Button
+                          v-if="editingShortcutId !== definition.id"
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          class="settings-shortcut-action-button settings-shortcut-action-button--fix h-7 w-7 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+                          :aria-label="t('settings.shortcutPressShortcut')"
+                          @click="focusShortcutInput(definition.id)"
+                        >
+                          <Pencil class="h-4 w-4" />
+                        </Button>
+                        <Button v-else type="button" variant="ghost" size="sm" class="h-7 shrink-0 px-2 text-sm font-medium text-muted-foreground hover:text-foreground" @click="cancelShortcutEdit">
+                          {{ t("settings.cancel") }}
+                        </Button>
+                        <Button
+                          v-if="editingShortcutId !== definition.id"
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          class="settings-shortcut-action-button settings-shortcut-action-button--fix h-7 w-7 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+                          :aria-label="t('settings.reset')"
+                          @click="resetShortcut(definition.id)"
+                        >
+                          <RotateCcw class="h-4 w-4" />
+                        </Button>
+                        <Button
+                          v-if="editingShortcutId !== definition.id && editShortcuts[definition.id]"
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          class="settings-shortcut-action-button h-7 w-7 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-destructive focus-visible:opacity-100 group-hover:opacity-100"
+                          :aria-label="t('settings.shortcutClear')"
+                          @click="clearShortcut(definition.id)"
+                        >
+                          <X class="h-4 w-4" />
+                        </Button>
+                        <span v-else-if="editingShortcutId !== definition.id" class="h-7 w-7 shrink-0" aria-hidden="true" />
+                      </div>
                     </div>
                   </div>
-                  <div class="settings-shortcut-actions min-w-0 space-y-1 text-right">
-                    <div class="settings-shortcut-controls flex items-center justify-end gap-1.5">
-                      <input
-                        :data-shortcut-input="definition.id"
-                        :value="editingShortcutId === definition.id ? '' : formatShortcutPill(editShortcuts[definition.id])"
-                        :style="{
-                          width: editingShortcutId === definition.id ? shortcutPressShortcutInputWidth : `${Math.max(4, formatShortcutPill(editShortcuts[definition.id]).length + 3)}ch`,
-                        }"
-                        readonly
-                        :aria-invalid="shortcutConflicts.includes(definition.id)"
-                        :placeholder="t('settings.shortcutPressShortcut')"
-                        class="h-7 w-auto min-w-12 max-w-64 shrink-0 cursor-default rounded-[6px] border border-transparent bg-muted px-2.5 text-center font-mono text-[13px] font-semibold text-foreground/75 shadow-inner outline-none selection:bg-transparent placeholder:text-muted-foreground aria-invalid:border-destructive/70 aria-invalid:text-destructive aria-invalid:ring-destructive/20"
-                        :class="editingShortcutId === definition.id ? 'max-w-64 cursor-text border-border/80 bg-background text-left text-foreground shadow-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/35' : ''"
-                        @keydown="(event: KeyboardEvent) => onShortcutKeydown(definition.id, event)"
-                      />
-                      <Button
-                        v-if="editingShortcutId !== definition.id"
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        class="settings-shortcut-action-button h-7 w-7 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
-                        :aria-label="t('settings.shortcutPressShortcut')"
-                        @click="focusShortcutInput(definition.id)"
-                      >
-                        <Pencil class="h-4 w-4" />
-                      </Button>
-                      <Button v-else type="button" variant="ghost" size="sm" class="h-7 shrink-0 px-2 text-sm font-medium text-muted-foreground hover:text-foreground" @click="cancelShortcutEdit">
-                        {{ t("settings.cancel") }}
-                      </Button>
-                      <Button
-                        v-if="editingShortcutId !== definition.id"
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        class="settings-shortcut-action-button h-7 w-7 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
-                        :aria-label="t('settings.reset')"
-                        @click="resetShortcut(definition.id)"
-                      >
-                        <RotateCcw class="h-4 w-4" />
-                      </Button>
-                      <Button
-                        v-if="editingShortcutId !== definition.id && editShortcuts[definition.id]"
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        class="settings-shortcut-action-button h-7 w-7 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-destructive focus-visible:opacity-100 group-hover:opacity-100"
-                        :aria-label="t('settings.shortcutClear')"
-                        @click="clearShortcut(definition.id)"
-                      >
-                        <X class="h-4 w-4" />
-                      </Button>
-                      <span v-else-if="editingShortcutId !== definition.id" class="h-7 w-7 shrink-0" aria-hidden="true" />
-                    </div>
-                    <p v-if="shortcutConflicts.includes(definition.id)" class="text-xs text-destructive">
-                      {{ t("settings.shortcutConflict") }}
-                    </p>
-                  </div>
-                </div>
+                </section>
               </div>
 
               <div class="mt-6 border-t border-border/70 pt-6" data-settings-search-id="sql-shortcuts">
@@ -7589,11 +8352,13 @@ onUnmounted(() => {
                   {{ t("settings.sqlShortcutsEmpty") }}
                 </div>
                 <div v-else class="overflow-x-auto rounded-md border">
-                  <table class="w-full min-w-[720px] text-sm">
+                  <table class="w-full min-w-[900px] text-sm">
                     <thead>
                       <tr class="border-b bg-muted/50">
                         <th class="px-3 py-2 text-left font-medium whitespace-nowrap">{{ t("settings.sqlShortcutsLabel") }}</th>
+                        <th class="px-3 py-2 text-left font-medium whitespace-nowrap">{{ t("settings.sqlShortcutsSource") }}</th>
                         <th class="px-3 py-2 text-left font-medium whitespace-nowrap">{{ t("settings.shortcutPressShortcut") }}</th>
+                        <th class="px-3 py-2 text-left font-medium whitespace-nowrap">{{ t("settings.sqlShortcutsDatabaseTypes") }}</th>
                         <th class="px-3 py-2 text-left font-medium whitespace-nowrap">{{ t("settings.snippetsStatus") }}</th>
                         <th class="px-3 py-2 text-left font-medium whitespace-nowrap">{{ t("settings.sqlShortcutsSql") }}</th>
                         <th class="px-3 py-2 w-20"></th>
@@ -7601,11 +8366,19 @@ onUnmounted(() => {
                     </thead>
                     <tbody>
                       <tr v-for="action in editSqlShortcuts" :key="action.id" class="border-b last:border-b-0 hover:bg-muted/30" :class="action.enabled === false ? 'text-muted-foreground' : ''">
-                        <td class="px-3 py-2">{{ action.label }}</td>
+                        <td class="px-3 py-2">{{ sqlShortcutDisplayLabel(action) }}</td>
+                        <td class="px-3 py-2">
+                          <Badge variant="outline" class="h-5 rounded-md px-1.5 text-[11px]" :class="isBuiltinSqlShortcut(action.id) ? 'border-primary/40 text-primary' : 'text-muted-foreground'">
+                            {{ isBuiltinSqlShortcut(action.id) ? t("settings.sqlShortcutsSourceBuiltin") : t("settings.sqlShortcutsSourceCustom") }}
+                          </Badge>
+                        </td>
                         <td class="px-3 py-2">
                           <Badge variant="outline" class="h-5 rounded-md px-1.5 font-mono text-[11px] text-muted-foreground">
                             {{ action.shortcut ? formatShortcutPill(action.shortcut) : t("settings.sqlShortcutsUnbound") }}
                           </Badge>
+                        </td>
+                        <td class="max-w-[180px] truncate px-3 py-2 text-xs text-muted-foreground" :title="sqlShortcutDatabaseTypesLabel(action)">
+                          {{ sqlShortcutDatabaseTypesLabel(action) }}
                         </td>
                         <td class="px-3 py-2">
                           <div class="flex items-center gap-2">
@@ -7615,13 +8388,13 @@ onUnmounted(() => {
                             </Label>
                           </div>
                         </td>
-                        <td class="max-w-[300px] truncate px-3 py-2 font-mono text-xs text-muted-foreground">{{ action.sql }}</td>
+                        <td class="max-w-[300px] truncate px-3 py-2 font-mono text-xs text-muted-foreground" :title="sqlShortcutListSql(action)">{{ sqlShortcutListSql(action) }}</td>
                         <td class="px-3 py-2">
                           <div class="flex items-center gap-1">
                             <Button variant="ghost" size="icon-xs" @click="openEditSqlShortcutDialog(action)">
                               <Pencil class="size-3.5" />
                             </Button>
-                            <Button variant="ghost" size="icon-xs" @click="confirmDeleteSqlShortcut(action)">
+                            <Button v-if="!isBuiltinSqlShortcut(action.id)" variant="ghost" size="icon-xs" @click="confirmDeleteSqlShortcut(action)">
                               <Trash2 class="size-3.5" />
                             </Button>
                           </div>
@@ -7719,7 +8492,7 @@ LIMIT 100;</pre
               <Tabs v-model="syncMethodTab" class="w-full">
                 <TabsList v-if="!isWeb" class="grid w-full grid-cols-2">
                   <TabsTrigger value="webdav">WebDAV</TabsTrigger>
-                  <TabsTrigger value="snippet">GitHub / Gitee</TabsTrigger>
+                  <TabsTrigger value="snippet">{{ t("settings.syncSnippetTitle") }}</TabsTrigger>
                 </TabsList>
 
                 <TabsContent value="webdav" data-settings-search-id="sync-webdav" :class="['mt-5 space-y-5', settingsSearchTargetClass('sync-webdav')]">
@@ -7846,8 +8619,15 @@ LIMIT 100;</pre
                         <SelectContent>
                           <SelectItem value="github">GitHub Gist</SelectItem>
                           <SelectItem value="gitee">{{ t("settings.syncSnippetProviderGitee") }}</SelectItem>
+                          <SelectItem value="gitlab">GitLab Snippets</SelectItem>
                         </SelectContent>
                       </Select>
+                    </div>
+                    <div v-if="snippetProvider === 'gitlab'" class="space-y-2 md:col-span-2">
+                      <Label for="gitlab-instance-url">{{ t("settings.syncGitLabInstance") }}</Label>
+                      <Input id="gitlab-instance-url" v-model="snippetInstanceUrl" type="url" autocomplete="url" :disabled="!!snippetBusy" placeholder="https://gitlab.example.com" @blur="commitSnippetInstance" @keydown.enter="commitSnippetInstance" />
+                      <p v-if="snippetInstanceError" class="text-xs text-destructive">{{ snippetInstanceError }}</p>
+                      <p v-if="activeSnippetInstanceUrl.startsWith('http://')" class="text-xs text-destructive">{{ t("settings.syncGitLabHttpWarning") }}</p>
                     </div>
                     <div class="space-y-2">
                       <Label for="snippet-sync-id">{{ t("settings.syncSnippetId") }}</Label>
@@ -8084,6 +8864,22 @@ LIMIT 100;</pre
                     </button>
                   </div>
                   <div class="flex-1"></div>
+                </div>
+              </div>
+
+              <!-- Default auto intent routing (list mode, global) -->
+              <div v-if="aiConfigListMode === 'list'" class="space-y-3">
+                <Separator />
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="ai-default-auto-routing">
+                      {{ t("ai.defaultAutoRouting") }}
+                    </Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("ai.defaultAutoRoutingDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="ai-default-auto-routing" :model-value="settingsStore.defaultAutoRouting" @update:model-value="(value) => settingsStore.setDefaultAutoRouting(Boolean(value))" />
                 </div>
               </div>
 
@@ -9078,6 +9874,7 @@ LIMIT 100;</pre
                         <TabsTrigger value="pi" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Pi</TabsTrigger>
                         <TabsTrigger value="cherry-studio" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Cherry Studio</TabsTrigger>
                         <TabsTrigger value="qoder" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Qoder</TabsTrigger>
+                        <TabsTrigger value="workbuddy" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">WorkBuddy</TabsTrigger>
                       </TabsList>
 
                       <TabsContent value="claude" class="m-0">
@@ -9269,6 +10066,21 @@ LIMIT 100;</pre
                           </div>
                         </div>
                       </TabsContent>
+
+                      <TabsContent value="workbuddy" class="m-0">
+                        <div class="space-y-2">
+                          <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                            {{ t("settings.mcpWorkBuddyConfigPath") }}
+                          </div>
+                          <div class="relative rounded-md border bg-background p-3">
+                            <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpWorkBuddyRecommendedConfig }}</code></pre>
+                            <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('workbuddy-config', mcpWorkBuddyRecommendedConfig)">
+                              <CheckCircle2 v-if="mcpCopied === 'workbuddy-config'" class="h-3.5 w-3.5 text-green-500" />
+                              <Copy v-else class="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
+                        </div>
+                      </TabsContent>
                     </Tabs>
                   </div>
 
@@ -9282,6 +10094,111 @@ LIMIT 100;</pre
                   </div>
                 </div>
               </Tabs>
+            </section>
+
+            <section v-else-if="activeSettingsTab === 'updates'" data-settings-search-id="updates" :class="['flex flex-col gap-5 py-2', settingsSearchTargetClass('updates')]">
+              <div class="space-y-3 rounded-lg border bg-muted/20 p-4">
+                <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div class="min-w-0 space-y-1">
+                    <Label>{{ t("settings.updateStatusTitle") }}</Label>
+                    <p class="text-sm text-muted-foreground">{{ t("settings.updateStatusDescription") }}</p>
+                  </div>
+                  <div class="flex shrink-0 items-center gap-2">
+                    <Button type="button" variant="outline" size="sm" class="h-8 min-w-20" :disabled="props.checkingUpdates || props.updatingAllUpdates" :aria-label="t('settings.checkUpdates')" @click="emit('check-updates')">
+                      <Loader2 v-if="props.checkingUpdates" class="h-3.5 w-3.5 animate-spin" />
+                      <span v-else>{{ t("settings.checkUpdates") }}</span>
+                    </Button>
+                    <Button v-if="hasAnyUpdate" type="button" size="sm" class="h-8" :disabled="props.checkingUpdates || props.updatingAllUpdates" @click="emit('update-all')">
+                      <Loader2 v-if="props.updatingAllUpdates" class="h-3.5 w-3.5 animate-spin" />
+                      <RefreshCw v-else class="h-3.5 w-3.5" />
+                      {{ t("settings.updateAll") }}
+                    </Button>
+                  </div>
+                </div>
+                <div class="grid gap-2 sm:grid-cols-2">
+                  <div class="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2.5 text-sm">
+                    <button type="button" class="min-w-0 space-y-0.5 rounded-sm text-left transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50" @click="emit('open-update-center')">
+                      <div class="font-medium">{{ t("settings.updateClient") }}</div>
+                      <div class="flex items-center gap-1.5" :class="updateCheckLoading.app ? 'text-muted-foreground' : props.appUpdateAvailable ? 'text-primary' : 'text-muted-foreground'">
+                        <Loader2 v-if="updateCheckLoading.app" class="h-3 w-3 animate-spin" />
+                        <span>{{ updateCheckLoading.app ? t("updates.checking") : props.appUpdateAvailable ? props.appUpdateVersion || t("settings.updateAvailable") : t("settings.upToDate") }}</span>
+                      </div>
+                    </button>
+                    <div class="flex shrink-0 items-center gap-2">
+                      <Label for="auto-update-app" class="text-xs font-normal text-muted-foreground">{{ t("settings.autoUpdate") }}</Label>
+                      <Switch id="auto-update-app" v-model="editAutoUpdateApp" :aria-label="t('settings.autoUpdateApp')" />
+                    </div>
+                  </div>
+                  <div class="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2.5 text-sm">
+                    <button type="button" class="min-w-0 space-y-0.5 rounded-sm text-left transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50" @click="emit('open-driver-store', 'agent')">
+                      <div class="font-medium">{{ t("settings.updateDrivers") }}</div>
+                      <div class="flex items-center gap-1.5" :class="updateCheckLoading.drivers ? 'text-muted-foreground' : (props.driverUpdateCount || 0) > 0 ? 'text-primary' : 'text-muted-foreground'">
+                        <Loader2 v-if="updateCheckLoading.drivers" class="h-3 w-3 animate-spin" />
+                        <span>{{ updateCheckLoading.drivers ? t("updates.checking") : (props.driverUpdateCount || 0) > 0 ? t("settings.updateCount", { count: props.driverUpdateCount }) : t("settings.upToDate") }}</span>
+                      </div>
+                    </button>
+                    <div class="flex shrink-0 items-center gap-2">
+                      <Label for="auto-update-drivers" class="text-xs font-normal text-muted-foreground">{{ t("settings.autoUpdate") }}</Label>
+                      <Switch id="auto-update-drivers" v-model="editAutoUpdateDrivers" :aria-label="t('settings.autoUpdateDrivers')" />
+                    </div>
+                  </div>
+                  <div class="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2.5 text-sm">
+                    <button type="button" class="min-w-0 space-y-0.5 rounded-sm text-left transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50" @click="emit('open-driver-store', 'jdbc')">
+                      <div class="font-medium">{{ t("settings.updateJdbc") }}</div>
+                      <div class="flex items-center gap-1.5" :class="updateCheckLoading.jdbc ? 'text-muted-foreground' : props.jdbcUpdateAvailable ? 'text-primary' : 'text-muted-foreground'">
+                        <Loader2 v-if="updateCheckLoading.jdbc" class="h-3 w-3 animate-spin" />
+                        <span>{{ updateCheckLoading.jdbc ? t("updates.checking") : props.jdbcUpdateAvailable ? t("settings.updateAvailable") : t("settings.upToDate") }}</span>
+                      </div>
+                    </button>
+                    <div class="flex shrink-0 items-center gap-2">
+                      <Label for="auto-update-jdbc" class="text-xs font-normal text-muted-foreground">{{ t("settings.autoUpdate") }}</Label>
+                      <Switch id="auto-update-jdbc" v-model="editAutoUpdateJdbc" :aria-label="t('settings.autoUpdateJdbc')" />
+                    </div>
+                  </div>
+                  <div class="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2.5 text-sm">
+                    <button type="button" class="min-w-0 space-y-0.5 rounded-sm text-left transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50" @click="emit('open-mcp-settings')">
+                      <div class="font-medium">{{ t("settings.updateMcp") }}</div>
+                      <div class="flex items-center gap-1.5" :class="updateCheckLoading.mcp ? 'text-muted-foreground' : props.mcpUpdateAvailable ? 'text-primary' : 'text-muted-foreground'">
+                        <Loader2 v-if="updateCheckLoading.mcp" class="h-3 w-3 animate-spin" />
+                        <span>{{ updateCheckLoading.mcp ? t("updates.checking") : props.mcpUpdateAvailable ? t("settings.updateAvailable") : t("settings.upToDate") }}</span>
+                      </div>
+                    </button>
+                    <div class="flex shrink-0 items-center gap-2">
+                      <Label for="auto-update-mcp" class="text-xs font-normal text-muted-foreground">{{ t("settings.autoUpdate") }}</Label>
+                      <Switch id="auto-update-mcp" v-model="editAutoUpdateMcp" :aria-label="t('settings.autoUpdateMcp')" />
+                    </div>
+                  </div>
+                  <div class="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2.5 text-sm">
+                    <button type="button" class="min-w-0 space-y-0.5 rounded-sm text-left transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50" @click="emit('open-plugin-center')">
+                      <div class="font-medium">{{ t("settings.updatePlugins") }}</div>
+                      <div class="flex items-center gap-1.5" :class="updateCheckLoading.plugins ? 'text-muted-foreground' : (props.pluginUpdateCount || 0) > 0 ? 'text-primary' : 'text-muted-foreground'">
+                        <Loader2 v-if="updateCheckLoading.plugins" class="h-3 w-3 animate-spin" />
+                        <span>{{ updateCheckLoading.plugins ? t("updates.checking") : (props.pluginUpdateCount || 0) > 0 ? t("settings.updateCount", { count: props.pluginUpdateCount }) : t("settings.upToDate") }}</span>
+                      </div>
+                    </button>
+                    <div class="flex shrink-0 items-center gap-2">
+                      <Label for="auto-update-plugins" class="text-xs font-normal text-muted-foreground">{{ t("settings.autoUpdate") }}</Label>
+                      <Switch id="auto-update-plugins" v-model="editAutoUpdatePlugins" :aria-label="t('settings.autoUpdatePlugins')" />
+                    </div>
+                  </div>
+                </div>
+                <p class="border-t pt-3 text-xs text-muted-foreground">{{ t("settings.updateRestartHint") }}</p>
+              </div>
+
+              <div class="flex flex-col gap-3 rounded-lg border p-4 sm:flex-row sm:items-center sm:justify-between">
+                <div class="min-w-0 space-y-1">
+                  <Label>{{ t("settings.updateDownloadSource") }}</Label>
+                  <p class="text-sm text-muted-foreground">{{ t("settings.updateDownloadSourceDescription") }}</p>
+                </div>
+                <Select :model-value="editUpdateDownloadSource" @update:model-value="onUpdateDownloadSourceChange">
+                  <SelectTrigger class="h-9 w-full sm:w-[180px]"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="official">{{ t("settings.updateDownloadSourceOfficial") }}</SelectItem>
+                    <SelectItem value="cnb">{{ t("settings.updateDownloadSourceCnb") }}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <ChangelogPanel :checking-updates="props.checkingUpdates" @check-updates="emit('check-updates')" />
             </section>
 
             <section v-else-if="activeSettingsTab === 'security' && isWeb" data-settings-search-id="security" :class="['flex flex-col gap-5 py-2', settingsSearchTargetClass('security')]">
@@ -9383,34 +10300,9 @@ LIMIT 100;</pre
                 </div>
               </div>
 
-              <div class="settings-item rounded-lg border p-4">
-                <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                  <div class="min-w-0 space-y-1">
-                    <Label>{{ t("settings.updateDownloadSource") }}</Label>
-                    <p class="text-sm text-muted-foreground">
-                      {{ t("settings.updateDownloadSourceDescription") }}
-                    </p>
-                  </div>
-                  <Select :model-value="editUpdateDownloadSource" @update:model-value="onUpdateDownloadSourceChange">
-                    <SelectTrigger class="h-9 w-full sm:w-[180px]">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="official">{{ t("settings.updateDownloadSourceOfficial") }}</SelectItem>
-                      <SelectItem value="cnb">{{ t("settings.updateDownloadSourceCnb") }}</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-              </div>
-
-              <ChangelogPanel :checking-updates="props.checkingUpdates" @check-updates="emit('check-updates')" />
-
-              <div class="grid gap-3 sm:grid-cols-2">
+              <div class="grid gap-3 sm:grid-cols-3">
                 <button type="button" class="rounded-lg border p-4 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" @click="openExternalUrl('https://qm.qq.com/cgi-bin/qm/qr?k=&group_code=1087880322')">
-                  <div class="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                    {{ t("settings.community") }}
-                  </div>
-                  <div class="mt-3 flex items-center gap-2 text-sm font-medium">
+                  <div class="flex items-center gap-2 text-sm font-medium">
                     <img
                       src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGhlaWdodD0iODYiIHdpZHRoPSI4NiIgdmlld0JveD0iMCAwIDEyMCAxNDUiPjxwYXRoIGZpbGw9IiNmYWFiMDciIGQ9Ik02MC41MDMgMTQyLjIzN2MtMTIuNTMzIDAtMjQuMDM4LTQuMTk1LTMxLjQ0NS0xMC40Ni0zLjc2MiAxLjEyNC04LjU3NCAyLjkzMi0xMS42MSA1LjE3NS0yLjYgMS45MTgtMi4yNzUgMy44NzQtMS44MDcgNC42NjMgMi4wNTYgMy40NyAzNS4yNzMgMi4yMTYgNDQuODYyIDEuMTM2em0wIDBjMTIuNTM1IDAgMjQuMDM5LTQuMTk1IDMxLjQ0Ny0xMC40NiAzLjc2IDEuMTI0IDguNTczIDIuOTMyIDExLjYxIDUuMTc1IDIuNTk4IDEuOTE4IDIuMjc0IDMuODc0IDEuODA1IDQuNjYzLTIuMDU2IDMuNDctMzUuMjcyIDIuMjE2LTQ0Ljg2MiAxLjEzNnptMCAwIi8+PHBhdGggZD0iTTYwLjU3NiA2Ny4xMTljMjAuNjk4LS4xNCAzNy4yODYtNC4xNDcgNDIuOTA3LTUuNjgzIDEuMzQtLjM2NyAyLjA1Ni0xLjAyNCAyLjA1Ni0xLjAyNC4wMDUtLjE4OS4wODUtMy4zNy4wODUtNS4wMUMxMDUuNjI0IDI3Ljc2OCA5Mi41OC4wMDEgNjAuNSAwIDI4LjQyLjAwMSAxNS4zNzUgMjcuNzY5IDE1LjM3NSA1NS40MDFjMCAxLjY0Mi4wOCA0LjgyMi4wODYgNS4wMSAwIDAgLjU4My42MTUgMS42NS45MTMgNS4xOSAxLjQ0NCAyMi4wOSA1LjY1IDQzLjMxMiA1Ljc5NXptNTYuMjQ1IDIzLjAyYy0xLjI4My00LjEyOS0zLjAzNC04Ljk0NC00LjgwOC0xMy41NjggMCAwLTEuMDItLjEyNi0xLjUzNy4wMjMtMTUuOTEzIDQuNjIzLTM1LjIwMiA3LjU3LTQ5LjkgNy4zOTJoLS4xNTNjLTE0LjYxNi4xNzUtMzMuNzc0LTIuNzM3LTQ5LjYzNC03LjMxNS0uNjA2LS4xNzUtMS44MDItLjEtMS44MDItLjEtMS43NzQgNC42MjQtMy41MjUgOS40NC00LjgwOCAxMy41NjgtNi4xMTkgMTkuNjktNC4xMzYgMjcuODM4LTIuNjI3IDI4LjAyIDMuMjM5LjM5MiAxMi42MDYtMTQuODIxIDEyLjYwNi0xNC44MjEgMCAxNS40NTkgMTMuOTU3IDM5LjE5NSA0NS45MTggMzkuNDEzaC44NDhjMzEuOTYtLjIxOCA0NS45MTctMjMuOTU0IDQ1LjkxNy0zOS40MTMgMCAwIDkuMzY4IDE1LjIxMyAxMi42MDcgMTQuODIyIDEuNTA4LS4xODMgMy40OTEtOC4zMzItMi42MjctMjguMDIxIi8+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTQ5LjA4NSA0MC44MjRjLTQuMzUyLjE5Ny04LjA3LTQuNzYtOC4zMDQtMTEuMDYzLS4yMzYtNi4zMDUgMy4wOTgtMTEuNTc2IDcuNDUtMTEuNzczIDQuMzQ3LS4xOTUgOC4wNjQgNC43NiA4LjMgMTEuMDY1LjIzOCA2LjMwNi0zLjA5NyAxMS41NzctNy40NDYgMTEuNzcxbTMxLjEzMy0xMS4wNjNjLS4yMzMgNi4zMDItMy45NTEgMTEuMjYtOC4zMDMgMTEuMDYzLTQuMzUtLjE5NS03LjY4NC01LjQ2NS03LjQ0Ni0xMS43Ny4yMzYtNi4zMDUgMy45NTItMTEuMjYgOC4zLTExLjA2NiA0LjM1Mi4xOTcgNy42ODYgNS40NjggNy40NDkgMTEuNzczIi8+PHBhdGggZmlsbD0iI2ZhYWIwNyIgZD0iTTg3Ljk1MiA0OS43MjVDODYuNzkgNDcuMTUgNzUuMDc3IDQ0LjI4IDYwLjU3OCA0NC4yOGgtLjE1NmMtMTQuNSAwLTI2LjIxMiAyLjg3LTI3LjM3NSA1LjQ0NmEuODYzLjg2MyAwIDAwLS4wODUuMzY3Ljg4Ljg4IDAgMDAuMTYuNDk2Yy45OCAxLjQyNyAxMy45ODUgOC40ODcgMjcuMyA4LjQ4N2guMTU2YzEzLjMxNCAwIDI2LjMxOS03LjA1OCAyNy4yOTktOC40ODdhLjg3My44NzMgMCAwMC4xNi0uNDk4Ljg1Ni44NTYgMCAwMC0uMDg1LS4zNjUiLz48cGF0aCBkPSJNNTQuNDM0IDI5Ljg1NGMuMTk5IDIuNDktMS4xNjcgNC43MDItMy4wNDYgNC45NDMtMS44ODMuMjQyLTMuNTY4LTEuNTgtMy43NjgtNC4wNy0uMTk3LTIuNDkyIDEuMTY3LTQuNzA0IDMuMDQzLTQuOTQ0IDEuODg2LS4yNDQgMy41NzQgMS41OCAzLjc3MSA0LjA3bTExLjk1Ni44MzNjLjM4NS0uNjg5IDMuMDA0LTQuMzEyIDguNDI3LTIuOTkzIDEuNDI1LjM0NyAyLjA4NC44NTcgMi4yMjMgMS4wNTcuMjA1LjI5Ni4yNjIuNzE4LjA1MyAxLjI4Ni0uNDEyIDEuMTI2LTEuMjYzIDEuMDk1LTEuNzM0Ljg3NS0uMzA1LS4xNDItNC4wODItMi42Ni03LjU2MiAxLjA5Ny0uMjQuMjU3LS42NjguMzQ2LTEuMDczLjA0LS40MDctLjMwOC0uNTc0LS45My0uMzM0LTEuMzYyIi8+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTYwLjU3NiA4My4wOGgtLjE1M2MtOS45OTYuMTItMjIuMTE2LTEuMjA0LTMzLjg1NC0zLjUxOC0xLjAwNCA1LjgxOC0xLjYxIDEzLjEzMi0xLjA5IDIxLjg1MyAxLjMxNiAyMi4wNDMgMTQuNDA3IDM1LjkgMzQuNjE0IDM2LjFoLjgyYzIwLjIwOC0uMiAzMy4yOTgtMTQuMDU3IDM0LjYxNi0zNi4xLjUyLTguNzIzLS4wODctMTYuMDM1LTEuMDkyLTIxLjg1NC0xMS43MzkgMi4zMTUtMjMuODYyIDMuNjQtMzMuODYgMy41MTgiLz48cGF0aCBmaWxsPSIjZWIxOTIzIiBkPSJNMzIuMTAyIDgxLjIzNXYyMS42OTNzOS45MzcgMi4wMDQgMTkuODkzLjYxNlY4My41MzVjLTYuMzA3LS4zNTctMTMuMTA5LTEuMTUyLTE5Ljg5My0yLjMiLz48cGF0aCBmaWxsPSIjZWIxOTIzIiBkPSJNMTA1LjUzOSA2MC40MTJzLTE5LjMzIDYuMTAyLTQ0Ljk2MyA2LjI3NWgtLjE1M2MtMjUuNTkxLS4xNzItNDQuODk2LTYuMjU1LTQ0Ljk2Mi02LjI3NUw4Ljk4NyA3Ni41N2MxNi4xOTMgNC44ODIgMzYuMjYxIDguMDI4IDUxLjQzNiA3Ljg0NWguMTUzYzE1LjE3NS4xODMgMzUuMjQyLTIuOTYzIDUxLjQzNy03Ljg0NXptMCAwIi8+PC9zdmc+"
                       alt="QQ"
@@ -9422,10 +10314,7 @@ LIMIT 100;</pre
                   <div class="mt-1 font-mono text-base">1087880322</div>
                 </button>
                 <button type="button" class="rounded-lg border p-4 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" @click="openExternalUrl('https://discord.gg/W7NyVDRt6a')">
-                  <div class="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                    {{ t("settings.community") }}
-                  </div>
-                  <div class="mt-3 flex items-center gap-2 text-sm font-medium">
+                  <div class="flex items-center gap-2 text-sm font-medium">
                     <img src="https://cdn.simpleicons.org/discord/5865F2" alt="Discord" class="h-7 w-7 rounded-md bg-white p-1" />
                     Discord
                     <ExternalLink class="ml-auto h-3.5 w-3.5 text-muted-foreground" />
@@ -9433,10 +10322,7 @@ LIMIT 100;</pre
                   <div class="mt-1 text-sm text-primary">discord.gg/W7NyVDRt6a</div>
                 </button>
                 <button type="button" class="rounded-lg border p-4 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" @click="openExternalUrl('https://docs.qq.com/doc/DVVhMY0h1ekJqc0tz')">
-                  <div class="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                    {{ t("settings.community") }}
-                  </div>
-                  <div class="mt-3 flex items-center gap-2 text-sm font-medium">
+                  <div class="flex items-center gap-2 text-sm font-medium">
                     <span class="flex h-7 w-7 items-center justify-center rounded-md bg-[#07C160] text-white">
                       <svg class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
                         <path
@@ -9451,11 +10337,26 @@ LIMIT 100;</pre
                     {{ t("settings.wechatGroupInvite") }}
                   </div>
                 </button>
-                <button type="button" class="rounded-lg border p-4 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" @click="openExternalUrl('https://github.com/t8y2/dbx')">
-                  <div class="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                    {{ t("settings.project") }}
+                <button
+                  type="button"
+                  class="rounded-lg border p-4 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  @click="openExternalUrl('https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=30cvb14f-a9b1-4b12-adb6-2ff6d476a227')"
+                >
+                  <div class="flex items-center gap-2 text-sm font-medium">
+                    <span class="flex h-7 w-7 items-center justify-center rounded-md bg-[#3370FF] text-white">
+                      <svg class="h-4 w-4" viewBox="164 204 762 617" fill="currentColor" aria-hidden="true">
+                        <path
+                          d="M559.915 530.453c-46.507-111.786-194.56-248.469-262.806-302.826h333.782c47.146 16.298 87.616 134.677 101.973 191.808-35.499 31.21-119.787 97.109-172.95 111.018zM632.021 452.992c-45.184 60.48-133.546 121.963-172.053 145.13l-2.88 24.278 235.947 63.637c32.213-25.962 103.061-87.296 128.96-124.928 4.394-6.378 68.992-135.914 79.402-151.552-18.24-11.306-42.56-18.261-104.277-21.738-82.56-4.331-116.437 20.864-165.099 65.173zM187.883 712.917V393.515C397.568 599.808 558.315 642.688 641.045 653.76c124.459 5.419 154.667-73.045 181.142-93.099-97.024 153.174-224.64 235.734-384.747 235.734-128.107 0-219.755-55.659-249.557-83.478z"
+                        />
+                      </svg>
+                    </span>
+                    {{ t("settings.feishuGroup") }}
+                    <ExternalLink class="ml-auto h-3.5 w-3.5 text-muted-foreground" />
                   </div>
-                  <div class="mt-3 flex items-center gap-2 text-sm font-medium">
+                  <div class="mt-1 text-sm text-primary">applink.feishu.cn</div>
+                </button>
+                <button type="button" class="rounded-lg border p-4 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" @click="openExternalUrl('https://github.com/t8y2/dbx')">
+                  <div class="flex items-center gap-2 text-sm font-medium">
                     <img src="https://cdn.simpleicons.org/github/181717" alt="GitHub" class="h-7 w-7 rounded-md bg-white p-1" />
                     {{ t("settings.openSource") }}
                     <ExternalLink class="ml-auto h-3.5 w-3.5 text-muted-foreground" />
@@ -9463,10 +10364,7 @@ LIMIT 100;</pre
                   <div class="mt-1 text-sm text-primary">github.com/t8y2/dbx</div>
                 </button>
                 <button type="button" class="rounded-lg border p-4 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" @click="openExternalUrl('https://dbxio.com')">
-                  <div class="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                    {{ t("settings.project") }}
-                  </div>
-                  <div class="mt-3 flex items-center gap-2 text-sm font-medium">
+                  <div class="flex items-center gap-2 text-sm font-medium">
                     <AppLogo class="h-7 w-7" />
                     {{ t("settings.officialDocs") }}
                     <ExternalLink class="ml-auto h-3.5 w-3.5 text-muted-foreground" />
@@ -9481,6 +10379,11 @@ LIMIT 100;</pre
             <Button variant="outline" @click="resetDefaultsForTab(activeSettingsTab as SettingsCategory)">
               {{ t("settings.resetDefaults") }}
             </Button>
+            <!-- 行内冲突说明收进浮层后，“应用为何被禁用”需要一处常驻解释。 -->
+            <span v-if="hasBlockingShortcutConflicts" class="inline-flex items-center gap-1.5 text-xs text-destructive">
+              <AlertTriangle class="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+              {{ t("settings.shortcutConflictBlocksApply", { count: shortcutConflicts.length, pairs: shortcutConflictPairCount }) }}
+            </span>
             <div class="flex-1" />
             <Button variant="outline" @click="closeSettings">
               {{ t("common.close") }}
@@ -9644,7 +10547,7 @@ LIMIT 100;</pre
 
     <!-- SQL Shortcut Add/Edit Dialog -->
     <Dialog :open="sqlShortcutDialogOpen" @update:open="sqlShortcutDialogOpen = $event">
-      <DialogContent class="sm:max-w-[560px]">
+      <DialogContent class="sm:max-w-[600px]">
         <DialogHeader>
           <DialogTitle>
             {{ sqlShortcutEditingId ? t("settings.sqlShortcutsEditTitle") : t("settings.sqlShortcutsAddTitle") }}
@@ -9653,7 +10556,8 @@ LIMIT 100;</pre
         <div class="flex flex-col gap-4 py-2">
           <div class="flex flex-col gap-1.5">
             <Label for="sql-shortcut-label">{{ t("settings.sqlShortcutsLabel") }}</Label>
-            <Input id="sql-shortcut-label" v-model="sqlShortcutForm.label" :placeholder="t('settings.sqlShortcutsLabelPlaceholder')" />
+            <Input v-if="!sqlShortcutFormIsBuiltin" id="sql-shortcut-label" v-model="sqlShortcutForm.label" :placeholder="t('settings.sqlShortcutsLabelPlaceholder')" />
+            <Input v-else id="sql-shortcut-label" :model-value="sqlShortcutFormBuiltinLabel" readonly class="bg-muted" />
             <p v-if="sqlShortcutFormLabelError" class="text-xs text-destructive">
               {{ sqlShortcutFormLabelError }}
             </p>
@@ -9683,19 +10587,104 @@ LIMIT 100;</pre
               </Button>
             </div>
           </div>
-          <div class="flex flex-col gap-1.5">
-            <Label for="sql-shortcut-sql">{{ t("settings.sqlShortcutsSql") }}</Label>
-            <textarea
-              id="sql-shortcut-sql"
-              v-model="sqlShortcutForm.sql"
-              :placeholder="t('settings.sqlShortcutsSqlPlaceholder')"
-              rows="6"
-              class="flex min-h-[120px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm font-mono shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-            />
+
+          <!-- Built-in select-limit: row count + dialect preview -->
+          <template v-if="sqlShortcutFormIsBuiltin && sqlShortcutForm.kind === 'select-limit'">
+            <div class="flex flex-col gap-1.5">
+              <Label for="sql-shortcut-limit">{{ t("settings.sqlShortcutsLimit") }}</Label>
+              <Input id="sql-shortcut-limit" type="number" min="1" max="100000" v-model.number="sqlShortcutForm.limit" class="w-32" />
+            </div>
+            <div class="flex flex-col gap-1.5">
+              <div class="flex items-center justify-between gap-2">
+                <Label>{{ t("settings.sqlShortcutsPreview") }}</Label>
+                <Select v-model="sqlShortcutPreviewDatabaseType">
+                  <SelectTrigger class="h-8 w-[160px]">
+                    <SelectValue :placeholder="t('settings.sqlShortcutsPreviewDatabase')" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem v-for="dbType in dbTypeOptions" :key="dbType" :value="dbType">
+                      {{ dbTypeLabel(dbType) }}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <pre class="overflow-x-auto whitespace-pre-wrap rounded-md border bg-muted/30 px-3 py-2 font-mono text-xs leading-relaxed">{{ sqlShortcutFormPreviewSql }}</pre>
+              <p class="text-xs text-muted-foreground">{{ t("settings.sqlShortcutsSelectLimitHint") }}</p>
+            </div>
+          </template>
+
+          <!-- Built-in count: read-only SQL -->
+          <div v-else-if="sqlShortcutFormIsBuiltin" class="flex flex-col gap-1.5">
+            <Label>{{ t("settings.sqlShortcutsSql") }}</Label>
+            <pre class="overflow-x-auto whitespace-pre-wrap rounded-md border bg-muted/30 px-3 py-2 font-mono text-xs leading-relaxed">{{ sqlShortcutForm.sql }}</pre>
             <p class="text-xs text-muted-foreground">
               {{ t("settings.sqlShortcutsVariableHint", { token: SQL_SHORTCUT_TABLE_TOKEN }) }}
             </p>
           </div>
+
+          <!-- Custom add/edit: databases + SQL (optional per-DB body) -->
+          <template v-else>
+            <div class="flex flex-col gap-1.5">
+              <Label>{{ t("settings.sqlShortcutsDatabaseTypes") }}</Label>
+              <div class="flex flex-wrap items-center gap-2">
+                <Popover :open="sqlShortcutDatabaseTypesOpen" @update:open="(open) => (sqlShortcutDatabaseTypesOpen = open)">
+                  <PopoverTrigger as-child>
+                    <Button type="button" variant="outline" size="sm" class="h-8">
+                      {{ sqlShortcutForm.databaseTypes.length === 0 ? t("settings.sqlShortcutsDatabaseTypesAll") : t("settings.sqlShortcutsDatabaseTypesSelected", { count: sqlShortcutForm.databaseTypes.length }) }}
+                      <ChevronDown class="ml-1 h-3.5 w-3.5 opacity-60" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent align="start" class="w-64 p-2">
+                    <button type="button" class="mb-1 flex w-full items-center gap-2 rounded-sm px-1 py-1 text-xs hover:bg-muted" @click="clearSqlShortcutDatabaseTypes">
+                      <div class="flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border" :class="sqlShortcutForm.databaseTypes.length === 0 ? 'border-primary bg-primary text-primary-foreground' : ''">
+                        <Check v-if="sqlShortcutForm.databaseTypes.length === 0" class="h-3 w-3" />
+                      </div>
+                      {{ t("settings.sqlShortcutsDatabaseTypesAll") }}
+                    </button>
+                    <div class="max-h-48 overflow-auto border-t border-border/60 pt-1">
+                      <button v-for="dbType in dbTypeOptions" :key="dbType" type="button" class="flex w-full items-center gap-2 rounded-sm px-1 py-1 text-xs hover:bg-muted" @click="toggleSqlShortcutDatabaseType(dbType)">
+                        <div class="flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border" :class="sqlShortcutForm.databaseTypes.includes(dbType) ? 'border-primary bg-primary text-primary-foreground' : ''">
+                          <Check v-if="sqlShortcutForm.databaseTypes.includes(dbType)" class="h-3 w-3" />
+                        </div>
+                        {{ dbTypeLabel(dbType) }}
+                      </button>
+                    </div>
+                  </PopoverContent>
+                </Popover>
+              </div>
+              <p class="text-xs text-muted-foreground">{{ t("settings.sqlShortcutsDatabaseTypesHint") }}</p>
+            </div>
+            <div class="flex flex-col gap-1.5">
+              <div class="flex items-center justify-between gap-2">
+                <Label for="sql-shortcut-sql">{{ t("settings.sqlShortcutsSql") }}</Label>
+                <div v-if="sqlShortcutForm.databaseTypes.length > 0" class="flex items-center gap-2">
+                  <Select :model-value="sqlShortcutForm.editingDatabaseType || sqlShortcutForm.databaseTypes[0]" @update:model-value="(value) => onSqlShortcutEditingDatabaseTypeChange((value as DatabaseType) || '')">
+                    <SelectTrigger class="h-8 w-[160px]">
+                      <SelectValue :placeholder="t('settings.sqlShortcutsSqlDatabase')" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem v-for="dbType in sqlShortcutForm.databaseTypes" :key="dbType" :value="dbType">
+                        {{ dbTypeLabel(dbType) }}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <Button type="button" variant="outline" size="sm" class="h-8 shrink-0" @click="applySqlShortcutSqlToAllSelected">
+                    {{ t("settings.sqlShortcutsApplySqlToAllSelected") }}
+                  </Button>
+                </div>
+              </div>
+              <textarea
+                id="sql-shortcut-sql"
+                v-model="sqlShortcutForm.body"
+                :placeholder="t('settings.sqlShortcutsSqlPlaceholder')"
+                rows="6"
+                class="flex min-h-[120px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm font-mono shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              />
+              <p class="text-xs text-muted-foreground">
+                {{ t("settings.sqlShortcutsVariableHint", { token: SQL_SHORTCUT_TABLE_TOKEN }) }}
+              </p>
+            </div>
+          </template>
         </div>
         <DialogFooter>
           <Button variant="outline" @click="sqlShortcutDialogOpen = false">{{ t("settings.cancel") }}</Button>
@@ -9717,6 +10706,13 @@ LIMIT 100;</pre
       :confirm-label="t('common.delete')"
       @confirm="templateDeleteConfirm && confirmDeleteTemplate(templateDeleteConfirm)"
     />
+
+    <!-- Hidden mirror of the shortcut-capture placeholder: measured to size
+         the capture inputs (#9144). Carries the same box + typography classes
+         as those inputs (font-mono text-[13px] font-semibold px-2.5 border) so
+         its border-box width is exactly what they need, including font-fallback
+         advances and letter-spacing that char-count arithmetic cannot predict. -->
+    <span ref="shortcutPlaceholderMirrorRef" aria-hidden="true" class="invisible pointer-events-none absolute top-0 left-0 h-0 max-w-64 overflow-hidden whitespace-pre rounded-[6px] border px-2.5 font-mono text-[13px] font-semibold">{{ shortcutPressShortcutLabel }}</span>
   </component>
 </template>
 
@@ -9848,6 +10844,28 @@ LIMIT 100;</pre
 
 .settings-mcp-config-tabs:hover::-webkit-scrollbar-thumb {
   background: color-mix(in oklab, var(--muted-foreground) 38%, transparent);
+}
+
+/*
+ * 快捷键页签的分组与冲突呈现。
+ *
+ * 跨作用域同键只给一条细琥珀边作为定位线索（不做光晕）：不同作用域共用组合是
+ * 有意的设计（find / focusSearch 默认都是 Mod+F），把它渲染成错误会让用户去改
+ * 本来无需处理的键；光晕留给悬停，避免十几行同时发光。
+ *
+ * 写在这里而不是用 Tailwind 的 border-warning/45，是因为基类里的
+ * border-transparent 与它同为单类选择器，谁生效取决于样式表顺序而不是 class
+ * 书写顺序；aria-invalid 那条能工作是因为变体在生成顺序上排在基类之后。
+ * `:not([aria-invalid="true"])` 保证阻断性冲突（红）优先于提示（琥珀）。
+ */
+.settings-shortcut-row[data-cross-scope="true"] .settings-shortcut-pill:not([aria-invalid="true"]) {
+  border-color: color-mix(in srgb, var(--warning) 45%, transparent);
+}
+
+/* 阻断性冲突行常显“改键 / 恢复默认”两个修复入口；清除按钮与普通行一致随悬停出现，
+   不在有问题的行上堆叠常驻控件。 */
+.settings-shortcut-row[data-conflict="true"] .settings-shortcut-action-button--fix {
+  opacity: 1;
 }
 
 html.dbx-legacy-webview .settings-shortcut-row:hover .settings-shortcut-action-button,

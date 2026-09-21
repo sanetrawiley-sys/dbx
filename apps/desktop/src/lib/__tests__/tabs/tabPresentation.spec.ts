@@ -21,7 +21,7 @@ import {
   dirtyTabTitleStyle,
 } from "@/lib/tabs/tabPresentation";
 import { sqlTextFingerprint } from "@/lib/sql/sqlTextFingerprint";
-import type { ConnectionConfig, QueryTab } from "@/types/database";
+import type { ConnectionConfig, QueryResult, QueryTab } from "@/types/database";
 
 const translations: Record<string, string> = {
   "tabs.tooltipConnection": "Connection:",
@@ -94,9 +94,31 @@ describe("query result SQL selection", () => {
     expect(queryResultBaseSql(tab)).toBe("SELECT * FROM dbo.second");
     expect(queryResultExecutionSql(tab)).toBe("SELECT * FROM dbo.second ORDER BY id DESC");
   });
+
+  it("uses lastExecutedSql when a data tab has no editor SQL", () => {
+    const tab = queryTab({ mode: "data", sql: "", lastExecutedSql: "SELECT * FROM users", result: { columns: ["id"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 } });
+
+    expect(queryResultBaseSql(tab)).toBe("SELECT * FROM users");
+    expect(queryResultExecutionSql(tab)).toBe("SELECT * FROM users");
+  });
 });
 
 describe("query result labels", () => {
+  it("excludes tagged server messages without renumbering storage indexes", () => {
+    const message: QueryResult = { columns: ["Message"], rows: [["notice"]], affected_rows: 0, execution_time_ms: 1, server_message: true };
+    const data: QueryResult = { columns: ["Message"], rows: [["real data"]], affected_rows: 0, execution_time_ms: 1 };
+    const empty: QueryResult = { ...data, rows: [] };
+    const results = [message, data, message, empty, data];
+
+    expect(tabularResultItems(results).map(({ index, n }) => ({ index, n }))).toEqual([
+      { index: 1, n: 1 },
+      { index: 3, n: 2 },
+      { index: 4, n: 3 },
+    ]);
+    expect(tabularResultItems([message])).toEqual([]);
+    expect(results).toHaveLength(5);
+  });
+
   it("preserves both ends when shortening long source labels", () => {
     expect(middleEllipsis("easy_manager_tool.tool_monitor_data_index_item")).toBe("easy_manage...index_item");
     expect(middleEllipsis("aaa.apis")).toBe("aaa.apis");

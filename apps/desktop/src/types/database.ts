@@ -13,6 +13,10 @@ export function isMeilisearchDatabaseType(dbType?: DatabaseType): boolean {
   return dbType === "meilisearch";
 }
 
+export function isSolrDatabaseType(dbType?: DatabaseType): boolean {
+  return dbType === "solr";
+}
+
 export interface SqlSnippet {
   id: string;
   label: string;
@@ -21,12 +25,22 @@ export interface SqlSnippet {
   enabled?: boolean;
 }
 
+export type SqlShortcutKind = "template" | "select-limit";
+
 export interface SqlShortcutAction {
   id: string;
   label: string;
   shortcut: string;
   sql: string;
   enabled?: boolean;
+  /** Empty / omitted = all databases. Non-empty = only these DatabaseType values. */
+  databaseTypes?: DatabaseType[];
+  /** Per-database SQL overrides for custom templates; missing keys fall back to `sql`. */
+  sqlByDatabaseType?: Partial<Record<DatabaseType, string>>;
+  /** `select-limit` builds dialect-aware SELECT * … LIMIT/TOP/ROWNUM at run time (built-in only). */
+  kind?: SqlShortcutKind;
+  /** Row count for `select-limit` (default 10). Ignored for plain templates. */
+  limit?: number;
 }
 
 export type CompletionAssistantObjectKind = "database" | "schema" | "table" | "view" | "routine" | "procedure" | "function" | "column" | "sequence";
@@ -269,10 +283,68 @@ export type PluginFormFieldBinding = "config" | "secret" | "name" | "host" | "po
 
 export type PluginFormFieldValue = string | number | boolean | undefined;
 
+export interface LocalSshKey {
+  /** Absolute path to the private key file. */
+  path: string;
+  /** SSH algorithm name (e.g. `ssh-ed25519`); empty when undetectable. */
+  algorithm: string;
+  /** SHA-256 fingerprint (`SHA256:...`); empty when the key could not be decoded. */
+  fingerprint: string;
+  /** Heuristic: the key looks passphrase-protected. */
+  hasPassphrase: boolean;
+}
+
 export interface PluginFormFieldOption {
   label: string;
   value: string;
 }
+
+/** A literal a `one_of` clause may list; compared by canonical string form. */
+export type PluginFieldConditionLiteral = string | number | boolean;
+
+/** Legacy single-field clause: `{ field, one_of }`. */
+export interface PluginFieldConditionClause {
+  /** Key of another plugin form field whose current value drives the clause. */
+  field: string;
+  /** The clause matches when the referenced field's value is in this list. */
+  one_of: PluginFieldConditionLiteral[];
+}
+
+/** Every nested condition must match. */
+export interface PluginFieldConditionAllOf {
+  all_of: PluginFieldCondition[];
+}
+
+/** At least one nested condition must match. */
+export interface PluginFieldConditionAnyOf {
+  any_of: PluginFieldCondition[];
+}
+
+/** Inverts the nested condition. */
+export interface PluginFieldConditionNot {
+  not: PluginFieldCondition;
+}
+
+/** Host API 1.1: local-file action on a plugin connection field. */
+export interface PluginFormFieldPicker {
+  /** `directory` is desktop-only. */
+  kind: "file" | "directory";
+  /** Extensions (`.pem`) or MIME types (`text/plain`) offered by the picker. */
+  accept?: string[];
+  /**
+   * Declared sibling field that receives the file content on hosts without a
+   * client filesystem (the browser build). Desktop hosts store the chosen path
+   * in the declaring field and clear this one instead.
+   */
+  content_field?: string;
+}
+
+/**
+ * `visible_when` / `required_when` expression. The legacy `{ field, one_of }`
+ * clause keeps its exact meaning; `all_of` / `any_of` / `not` compose clauses
+ * (e.g. `sudo_source = custom AND read_only = false`).
+ */
+export type PluginFieldCondition = PluginFieldConditionClause | PluginFieldConditionAllOf | PluginFieldConditionAnyOf | PluginFieldConditionNot;
 
 export interface PluginFormField {
   key: string;
@@ -281,9 +353,18 @@ export interface PluginFormField {
   description?: string;
   placeholder?: string;
   required?: boolean;
-  default?: PluginFormFieldValue;
+  /** Declared default. Hosts older than the manifest serialization fix send
+   * `null` for "no default", which the form treats as unset. */
+  default?: PluginFormFieldValue | null;
   options?: PluginFormFieldOption[];
+  /** Plugin method returning `{ options: [{ value, label }] }` for dynamic
+   * select rendering; falls back to the declared type when unavailable. */
+  options_action?: string;
+  /** Host API 1.1: offer a local-file action on this field. */
+  picker?: PluginFormFieldPicker;
   binding?: PluginFormFieldBinding;
+  visible_when?: PluginFieldCondition;
+  required_when?: PluginFieldCondition;
 }
 
 export type PluginConnectionCapability = "test" | "connect" | "disconnect";
@@ -326,6 +407,8 @@ export interface PluginConnectionProviderContribution {
   filesystem_provider?: string;
   capabilities?: PluginConnectionCapability[];
   actions?: PluginConnectionActionContribution[];
+  /** Multi-endpoint providers (Kafka advertised.listeners) receive a SOCKS5 runtime.proxy route over transport layers. */
+  proxy_route?: boolean;
 }
 
 export interface PluginWorkbenchContribution {
@@ -392,6 +475,16 @@ export interface PluginResultViewContribution {
   description?: string;
   icon?: string;
 }
+
+/**
+ * Contribution types the host renders through the plugin's own UI entrypoint in
+ * a plugin tab. A `workbench` is launched from the sidebar, the plugin center,
+ * or `host.openWorkbench`; a `result-view` is launched from the query-result
+ * toolbar with the current result snapshot as context. Both declare display
+ * metadata only — the opened contribution id is what tells the plugin UI which
+ * of its declared surfaces to render.
+ */
+export type PluginUiContribution = PluginWorkbenchContribution | PluginResultViewContribution;
 
 export type PluginContribution = PluginConnectionProviderContribution | PluginWorkbenchContribution | PluginFilesystemProviderContribution | PluginContextMenuContribution | PluginResultViewContribution;
 
@@ -463,10 +556,18 @@ export interface PluginManifest {
   localizations?: Record<string, PluginManifestLocalization>;
 }
 
+export interface PluginInstallProvenance {
+  repositoryId?: string;
+  publisher?: string;
+  signingKeyId?: string;
+  source?: "marketplace" | "url" | "file" | "unknown";
+}
+
 export interface InstalledPlugin {
   manifest: PluginManifest;
   compatibility: PluginCompatibility;
   path?: string;
+  provenance?: PluginInstallProvenance;
 }
 
 export interface PluginTrustedKey {
@@ -546,6 +647,7 @@ export interface PluginMarketplaceInstallRequest {
   repositoryId: string;
   pluginId: string;
   version?: string;
+  allowSourceChange?: boolean;
 }
 
 export interface ActivePluginSession {
@@ -712,6 +814,8 @@ export interface CatalogInfo {
 export interface TableInfo {
   name: string;
   table_type: string;
+  /** Optional validity populated by status-aware object loaders. */
+  valid?: boolean | null;
   comment?: string | null;
   parent_schema?: string | null;
   parent_name?: string | null;
@@ -1006,12 +1110,13 @@ export interface QueryResult {
   execution_error?: true;
   /** Set only for SQL Server informational messages emitted by the backend. */
   server_message?: true;
-  /** Oracle-only manual-transaction UX marker: set on a manual-transaction result
-   *  whose statement DBX proved to be an ordinary top-level read. Absent for
-   *  every non-Oracle execution and every unproven Oracle statement. */
+  /** Manual-transaction UX marker for sticky proven-read-only dialects (Oracle,
+   *  OceanBase-Oracle, MySQL, PostgreSQL): set on a manual-transaction result
+   *  whose statement DBX proved to be an ordinary read by that dialect's strict
+   *  heuristic. Absent for unproven statements and non-participating dialects. */
   manual_transaction_proven_read_only?: true;
-  /** Oracle-only manual-transaction UX marker: set on the synthetic successful
-   *  result of an empty/whitespace/comments-only manual script. */
+  /** Manual-transaction UX marker for the same dialects: set on the synthetic
+   *  successful result of an empty/whitespace/comments-only manual script. */
   manual_transaction_no_statement?: true;
   /** Structured backend error; authoritative when execution_error is true. */
   error?: BackendError;
@@ -1044,6 +1149,10 @@ export interface QueryResult {
   mongo_copy_documents?: unknown[];
   affected_rows: number;
   execution_time_ms: number;
+  /** OceanBase SQL Audit EXECUTE_TIME for a completed statement, in microseconds. */
+  server_execute_time_us?: number;
+  /** Desktop wait from query request dispatch to the complete result payload; summed across appended pages. OceanBase Oracle query tabs only. */
+  client_request_wait_ms?: number;
   /** Whether a backend-reported result total is exact. */
   total_is_exact?: boolean;
   truncated?: boolean;
@@ -1060,6 +1169,13 @@ export interface QueryResult {
   /** Absolute offsets in the editor document at execution time. */
   sourceFrom?: number;
   sourceTo?: number;
+  /**
+   * Frontend-internal: the statement text actually sent for this result when it
+   * differs from `sourceStatement` (pagination wrapping, hidden-key rewrites…).
+   * Backend SQL error positions are relative to this text, so it is needed to
+   * map an error row/column back onto the user's original statement.
+   */
+  executedStatement?: string;
   /** Database server messages (notices, warnings) emitted while producing this result. Omitted when empty. */
   messages?: QueryMessage[];
 }
@@ -1252,6 +1368,7 @@ export type TreeNodeType =
   | "group-table-partitions"
   | "group-table-subpartitions"
   | "group-tables"
+  | "table-vgroup"
   | "group-dolt-system-tables"
   | "group-views"
   | "group-materialized-views"
@@ -1326,6 +1443,16 @@ export interface SidebarLayout {
   order: SidebarOrderEntry[];
 }
 
+export type TableVGroupOrderEntry = { type: "group"; id: string; children?: TableVGroupOrderEntry[] } | { type: "table"; name: string };
+
+export interface TableVGroupLayout {
+  version?: number;
+  groups: ConnectionGroup[];
+  order: TableVGroupOrderEntry[];
+  /** Toggled by the container context menu to hide groups without deleting them. */
+  enabled?: boolean;
+}
+
 export interface TreeNode {
   id: string;
   label: string;
@@ -1381,6 +1508,8 @@ export interface TreeNode {
   tableSearchParentId?: string;
   savedSqlId?: string;
   savedSqlFolderId?: string;
+  /** Set on synthetic table virtual-group container nodes. */
+  vgroupId?: string;
   meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | ConstraintInfo | PartitionInfo | SubpartitionInfo | ExtensionInfo | VectorCollectionMeta | MongoCollectionMeta | CustomTypeTreeMemberMeta;
   loadMore?: {
     parentId: string;
@@ -1400,7 +1529,43 @@ export interface TableNameFilter {
   excludePatterns: string[];
 }
 
-export type TableInfoTab = "columns" | "indexes" | "foreignKeys" | "constraints" | "triggers" | "ddl";
+export type TableInfoTab = "info" | "columns" | "indexes" | "foreignKeys" | "constraints" | "triggers" | "partitions" | "ddl";
+
+/** PostgreSQL declarative partitioning strategy (`pg_partitioned_table.partstrat`). */
+export type PgPartitionKind = "range" | "list" | "hash";
+
+/** Structured form of a partition's `pg_get_expr(relpartbound)` definition. Values are the SQL literal text PostgreSQL reported (`'2024-01-01'`, `MINVALUE`, `0`). */
+export type PgPartitionBound = { kind: "range"; from: string[]; to: string[] } | { kind: "list"; values: string[] } | { kind: "hash"; modulus: number; remainder: number } | { kind: "default" };
+
+export interface PgPartitionNode {
+  schema: string;
+  name: string;
+  strategy?: PgPartitionKind;
+  keyDefinition?: string;
+  bound?: PgPartitionBound;
+  boundDefinition?: string;
+  isLeaf: boolean;
+  rowEstimate?: number;
+  totalBytes?: number;
+  children: PgPartitionNode[];
+}
+
+export interface PgTablePartitioning {
+  isPartitioned: boolean;
+  isPartition: boolean;
+  parent?: string;
+  parentSchema?: string;
+  parentTable?: string;
+  ownBound?: PgPartitionBound;
+  strategy?: PgPartitionKind;
+  keyDefinition?: string;
+  keyColumns: string[];
+  keyExpression?: string;
+  defaultPartition?: string;
+  partitions: PgPartitionNode[];
+  /** `server_version_num`, used to gate `DETACH PARTITION CONCURRENTLY` (14+). */
+  serverVersionNum?: number;
+}
 
 export interface TableStructureEditorTarget {
   kind: "column" | "index";
@@ -1412,6 +1577,9 @@ export interface TableStructureEditorDraft {
   activeTab: TableInfoTab;
   /** DDL as loaded from the database — the baseline `ddlDraft` is compared against. */
   ddlContent?: string;
+  /** Original DDL and display preference retained so restoring a draft cannot change its baseline. */
+  rawDdlContent?: string;
+  excludeDdlStorage?: boolean;
   /** Edited DDL script, or null/undefined when the DDL tab was left untouched. */
   ddlDraft?: string | null;
   newTableName: string;
@@ -1430,6 +1598,13 @@ export interface TableStructureEditorDraft {
   constraintsLoaded?: boolean;
   triggers: import("@/lib/table/tableStructureEditorSql").EditableStructureTrigger[];
   triggersLoaded?: boolean;
+  /** Pending PostgreSQL partition operations (create/attach/detach/drop). */
+  partitionOperations?: import("@/lib/table/tableStructureEditorSql").TablePartitionOperation[];
+  /** Create-mode `PARTITION BY` declaration. */
+  createPartitioningEnabled?: boolean;
+  createPartitioningKind?: import("@/types/database").PgPartitionKind;
+  createPartitioningColumns?: string[];
+  createPartitioningExpression?: string;
   loadedMetadataFacets?: import("@/lib/metadata/objectMetadataCache").ObjectMetadataFacet[];
   scrollPositions?: Partial<Record<TableInfoTab, TableStructureEditorViewport>>;
   /** Request id of the structureInitialTab the editor already applied; remounts must not replay a consumed initial tab over the restored draft. */
@@ -1494,6 +1669,11 @@ export interface QueryTab {
   forceWordWrap?: boolean;
   connectionId: string;
   database: string;
+  /**
+   * 所属连接被删除后，被保留下来的 SQL 页签会记录原连接名。新建同名连接时按此
+   * 字段把页签重新绑定到新连接上；绑定完成后清空。
+   */
+  detachedConnectionName?: string;
   /** Optional branch context for a driver-profile database workspace. */
   workspaceBranch?: string;
   schema?: string;
@@ -1570,6 +1750,12 @@ export interface QueryTab {
     anchor: number;
     head: number;
   };
+  /** Ephemeral request to move the cursor/scrolling to a specific line/column (e.g. global content search jump). */
+  editorRevealRequest?: {
+    id: number;
+    line: number;
+    column?: number;
+  };
   executionId?: string;
   /** Ephemeral result run targeted by the current execution; null means a new run is being produced. */
   executingResultRunId?: string | null;
@@ -1614,6 +1800,7 @@ export interface QueryTab {
     | "mysql-dashboard"
     | "postgres-dashboard"
     | "xugu-dashboard"
+    | "solr-admin"
     | "dolt-version-control"
     | "plugin-workbench"
     | "plugin-filesystem";
@@ -1641,6 +1828,8 @@ export interface QueryTab {
   nacosTargetRequestId?: number;
   nacosConfigEditorViewport?: NacosConfigEditorViewport;
   structureTableName?: string;
+  /** Navigation type of the opened structure object; views matter for "view data" routing. */
+  structureTableType?: "table" | "view";
   structureInitialTab?: TableInfoTab;
   structureInitialTabRequestId?: number;
   structureInitialTarget?: TableStructureEditorTarget;
@@ -1667,6 +1856,31 @@ export interface QueryTab {
     objectType: ObjectSourceKind;
     signature?: string;
   };
+  /**
+   * 「先出 UI 再加载」的中间态：源码 tab 已经可见，但源码还在路上
+   * （ensureConnected + getObjectSource）。让 tab 栏与编辑区在等待期间就有反馈，
+   * 失败时就地显示错误 + Retry，而不是等到加载完才建 tab、失败只弹 toast。
+   *
+   * 纯运行期字段，刻意不进 openTabsPersistence 的落盘白名单：重启后恢复出的
+   * tab 只是普通空 tab，不会永久停在「加载中」。
+   */
+  sourceLoad?: {
+    startedAt: number;
+    /** Whether this request should open an editable object definition instead of the original source. */
+    initialEditing?: boolean;
+    /** 加载失败时写入；保留 request 以便就地重试 */
+    error?: string;
+    /**
+     * 重试所需的请求身份。与 `objectSource` 分开保存：objectType 在这里是
+     * **请求时**的类型，而 `objectSource.objectType` 是 routine fallback
+     * 解析后的类型（PROCEDURE↔FUNCTION、PACKAGE↔PACKAGE_BODY 会被改写）。
+     */
+    request: {
+      name: string;
+      objectType: ObjectSourceKind;
+      signature?: string;
+    };
+  };
   tableComment?: string | null;
   tableMeta?: {
     schema?: string;
@@ -1676,6 +1890,8 @@ export interface QueryTab {
     database?: string;
     columns: ColumnInfo[];
     primaryKeys: string[];
+    /** Physical primary keys used for table-open default sorting; excludes unique and synthetic row identifiers. */
+    physicalPrimaryKeys?: string[];
   };
   tableMetaUpdatedAt?: number;
   /** 该 tab 的 tableMeta 是哪个连接元数据代次下写入的：disconnect / 关闭数据库 /
@@ -1773,10 +1989,11 @@ export interface QueryTab {
   txnSessionId?: string;
   /** Set to true when a manual transaction was auto-rolled back due to inactivity */
   txnAutoRolledBack?: boolean;
-  /** Oracle-only, non-persisted: whether the current manual Oracle session has
-   *  executed at least one statement DBX cannot prove read-only. Commit/Rollback
-   *  actions are hidden while a session is clean. Never cleared by a later read. */
-  oracleTxnPossiblyDirty?: boolean;
+  /** Sticky proven-read-only dialects (Oracle/OceanBase-Oracle/MySQL/PostgreSQL),
+   *  not persisted: whether the current manual session has executed at least one
+   *  statement DBX cannot prove read-only. Commit/Rollback actions are hidden
+   *  while a session is clean. Never cleared by a later read. */
+  txnPossiblyDirty?: boolean;
 }
 
 export interface SavedSqlFolder {

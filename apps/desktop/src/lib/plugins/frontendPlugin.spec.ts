@@ -1,6 +1,16 @@
 import { describe, expect, it } from "vitest";
-import type { InstalledPlugin, PluginConnectionProviderContribution } from "@/types/database";
-import { buildPluginConnectionConfig, createFrontendPluginRegistry, initialPluginFormValues, parsePluginConnectionProviderOptionValue, pluginConnectionActionsForDialog, pluginConnectionFormValues, pluginConnectionProviderIcon, pluginConnectionProviderOptionValue } from "./frontendPlugin";
+import type { InstalledPlugin, PluginConnectionProviderContribution, PluginFormFieldValue } from "@/types/database";
+import {
+  buildPluginConnectionConfig,
+  createFrontendPluginRegistry,
+  initialPluginFormValues,
+  parsePluginConnectionProviderOptionValue,
+  pluginConnectionActionsForDialog,
+  pluginConnectionConnectTimeoutDefault,
+  pluginConnectionFormValues,
+  pluginConnectionProviderIcon,
+  pluginConnectionProviderOptionValue,
+} from "./frontendPlugin";
 
 function installedPlugin(id: string, contributions: InstalledPlugin["manifest"]["contributions"] = []): InstalledPlugin {
   return {
@@ -31,6 +41,67 @@ function connectionProvider(overrides: Partial<PluginConnectionProviderContribut
 }
 
 describe("FrontendPluginRegistry", () => {
+  it("migrates a config-bound secret on edit, preserves multiline values and removes the plaintext copy", () => {
+    const provider = connectionProvider({ fields: [{ key: "key", label: "Private key", type: "textarea", binding: "secret" }] });
+    const pem = "-----BEGIN PRIVATE KEY-----\nexample\n-----END PRIVATE KEY-----\n";
+    const existing = buildPluginConnectionConfig("example.plugin", connectionProvider({ fields: [] }), {});
+    existing.external_config = { key: pem, root: "/files" };
+    const values = pluginConnectionFormValues(provider, existing);
+    expect(values.key).toBe(pem);
+
+    const saved = buildPluginConnectionConfig("example.plugin", provider, values, existing);
+    expect(saved.connection_secrets?.key).toBe(pem);
+    expect(saved.external_config).toEqual({ root: "/files" });
+    expect(existing.external_config).toEqual({ key: pem, root: "/files" });
+    expect(pluginConnectionFormValues(provider, saved).key).toBe(pem);
+
+    existing.connection_secrets = { key: "newer secret" };
+    expect(pluginConnectionFormValues(provider, existing).key).toBe("newer secret");
+    const cleared = buildPluginConnectionConfig("example.plugin", provider, { key: "" }, existing);
+    expect(cleared.connection_secrets?.key).toBeUndefined();
+    expect(cleared.external_config).toEqual({ root: "/files" });
+  });
+
+  it("round-trips automatic ports as an empty input and preserves explicit custom ports", () => {
+    const provider = connectionProvider({ fields: [{ key: "port", label: "Port", type: "number", binding: "port" }] });
+    const automatic = buildPluginConnectionConfig("example.plugin", provider, {});
+    expect(automatic.port).toBe(0);
+    expect(pluginConnectionFormValues(provider, automatic).port).toBeUndefined();
+    const explicit = buildPluginConnectionConfig("example.plugin", provider, { port: 1636 });
+    expect(pluginConnectionFormValues(provider, explicit).port).toBe(1636);
+  });
+
+  it("preserves the save-password preference for plugin connections", () => {
+    const provider = connectionProvider({ fields: [] });
+    const defaultConfig = buildPluginConnectionConfig("example.plugin", provider, {});
+    expect(defaultConfig.save_password).toBe(true);
+
+    const transient = buildPluginConnectionConfig("example.plugin", provider, {}, { ...defaultConfig, save_password: false });
+    expect(transient.save_password).toBe(false);
+  });
+
+  it("materializes the provider's connect_timeout_secs default into the typed timeout", () => {
+    const provider = connectionProvider({
+      fields: [{ key: "connect_timeout_secs", label: "Connect timeout", type: "number", default: 30 }],
+    });
+    expect(pluginConnectionConnectTimeoutDefault(provider)).toBe(30);
+    expect(buildPluginConnectionConfig("example.plugin", provider, {}).connect_timeout_secs).toBe(30);
+    // An advanced-form value the user tuned is mirrored into the typed field too.
+    expect(buildPluginConnectionConfig("example.plugin", provider, { connect_timeout_secs: 60 }).connect_timeout_secs).toBe(60);
+
+    // Once the provider declares the field, its resolved value is the single
+    // source of truth: a stale typed value from before the declaration is
+    // healed to the declared default.
+    const existing = buildPluginConnectionConfig("example.plugin", connectionProvider({ fields: [] }), {});
+    existing.connect_timeout_secs = 7;
+    expect(buildPluginConnectionConfig("example.plugin", provider, {}, existing).connect_timeout_secs).toBe(30);
+
+    // Providers without the well-known field keep the generic 10s default.
+    const generic = connectionProvider({ fields: [] });
+    expect(pluginConnectionConnectTimeoutDefault(generic)).toBeUndefined();
+    expect(buildPluginConnectionConfig("example.plugin", generic, {}).connect_timeout_secs).toBe(10);
+  });
+
   it("round-trips plugin connection provider picker values", () => {
     const value = pluginConnectionProviderOptionValue("example/plugin", "ssh:main");
     expect(parsePluginConnectionProviderOptionValue(value)).toEqual({ pluginId: "example/plugin", providerId: "ssh:main" });
@@ -75,6 +146,68 @@ describe("FrontendPluginRegistry", () => {
     expect(views).toHaveLength(1);
     expect(views[0]?.contribution.id).toBe("example.graph");
     expect(views[0]?.contribution.label).toBe("Graph");
+  });
+
+  it("resolves the plugin UI contribution behind a workbench or result-view tab", () => {
+    const registry = createFrontendPluginRegistry([
+      installedPlugin("com.example.plugin", [
+        { type: "workbench", id: "example.main", label: "Example Workbench", icon: "assets/main.svg" },
+        { type: "result-view", id: "example.graph", label: "Graph", icon: "assets/graph.svg" },
+      ]),
+    ]);
+
+    const workbench = registry.findUiContribution("com.example.plugin", "example.main");
+    expect(workbench?.contribution).toMatchObject({ type: "workbench", id: "example.main", label: "Example Workbench", icon: "assets/main.svg" });
+
+    // The result-view keeps its own id and display metadata: the plugin UI is
+    // told which declared contribution the user opened, and it is not a workbench.
+    const resultView = registry.findUiContribution("com.example.plugin", "example.graph");
+    expect(resultView?.contribution).toMatchObject({ type: "result-view", id: "example.graph", label: "Graph", icon: "assets/graph.svg" });
+  });
+
+  it("keeps workbench lookups scoped to workbench contributions", () => {
+    const registry = createFrontendPluginRegistry([
+      installedPlugin("com.example.plugin", [
+        { type: "workbench", id: "example.main", label: "Example Workbench" },
+        { type: "result-view", id: "example.graph", label: "Graph" },
+      ]),
+    ]);
+
+    // `findWorkbench` answers `host.openWorkbench` and `connection-provider.workbench`:
+    // a result-view id must never satisfy it.
+    expect(registry.findWorkbench("com.example.plugin", "example.graph")).toBeUndefined();
+    expect(registry.findWorkbench("com.example.plugin", "example.main")?.contribution.id).toBe("example.main");
+  });
+
+  it("does not resolve unknown, foreign, or non-UI contributions as plugin UI", () => {
+    const registry = createFrontendPluginRegistry([
+      installedPlugin("com.example.plugin", [
+        { type: "result-view", id: "example.graph", label: "Graph" },
+        { type: "context-menu", id: "example.inspect", label: "Inspect", menu: "connection" },
+        { type: "filesystem-provider", id: "example.files", label: "Files", schemes: ["example"] },
+      ]),
+      installedPlugin("com.example.other", []),
+    ]);
+
+    expect(registry.findUiContribution("com.example.plugin", "example.graph")?.contribution.type).toBe("result-view");
+    expect(registry.findUiContribution("com.example.plugin", "example.missing")).toBeUndefined();
+    expect(registry.findUiContribution("com.example.other", "example.graph")).toBeUndefined();
+    // Context menus render natively and filesystem providers own their tab mode.
+    expect(registry.findUiContribution("com.example.plugin", "example.inspect")).toBeUndefined();
+    expect(registry.findUiContribution("com.example.plugin", "example.files")).toBeUndefined();
+  });
+
+  it("does not resolve plugin UI contributions of incompatible plugins", () => {
+    const plugin = installedPlugin("com.example.plugin", [
+      { type: "workbench", id: "example.main", label: "Example Workbench" },
+      { type: "result-view", id: "example.graph", label: "Graph" },
+    ]);
+    plugin.compatibility = { compatible: false, errors: ["Unsupported host API"] };
+
+    const registry = createFrontendPluginRegistry([plugin]);
+
+    expect(registry.findUiContribution("com.example.plugin", "example.main")).toBeUndefined();
+    expect(registry.findUiContribution("com.example.plugin", "example.graph")).toBeUndefined();
   });
 
   it("indexes context-menu contributions per menu surface", () => {
@@ -155,6 +288,10 @@ describe("FrontendPluginRegistry", () => {
         database_type: "unsafe",
         fields: [],
       },
+      // Every contribution the host renders through the plugin UI entrypoint
+      // resolves its icon asset path the same way.
+      { type: "workbench", id: "unsafe.main", label: "Unsafe workbench", icon: "../outside.svg" },
+      { type: "result-view", id: "unsafe.graph", label: "Unsafe graph", icon: "/outside.svg" },
     ]);
     plugin.manifest.icon = "\\outside.svg";
 
@@ -163,6 +300,8 @@ describe("FrontendPluginRegistry", () => {
 
     expect(definition.plugin.manifest.icon).toBeUndefined();
     expect(pluginConnectionProviderIcon(entry)).toBeUndefined();
+    expect(createFrontendPluginRegistry([plugin]).listWorkbenches()[0]?.contribution.icon).toBeUndefined();
+    expect(createFrontendPluginRegistry([plugin]).listResultViews()[0]?.contribution.icon).toBeUndefined();
   });
 
   it("localizes plugin metadata, contributions, and form fields", () => {
@@ -285,6 +424,91 @@ describe("FrontendPluginRegistry", () => {
     expect(values).not.toHaveProperty("host");
   });
 
+  it("treats a host-serialized null default as unset instead of a value", () => {
+    // Hosts before the manifest serialization fix sent `"default": null` for
+    // every field that declares no default, so an untouched password field
+    // turned into the four-character string "null" once it was saved.
+    const provider = connectionProvider({
+      fields: [
+        { key: "sudo_password", label: "Sudo password", type: "password", binding: "secret", default: null },
+        { key: "mode", label: "Mode", type: "text", binding: "config", default: null },
+        { key: "read_only", label: "Read only", type: "boolean", binding: "config", default: false },
+      ],
+    });
+
+    expect(initialPluginFormValues(provider)).toEqual({ read_only: false });
+
+    const config = buildPluginConnectionConfig("io.dbx.ssh", provider, {
+      sudo_password: null,
+      mode: null,
+      read_only: false,
+    } as unknown as Record<string, string>);
+
+    expect(config.connection_secrets?.sudo_password).toBeUndefined();
+    expect(config.external_config).toEqual({ read_only: false });
+  });
+
+  it("preserves opaque 'null' credentials when reopening and saving connections", () => {
+    const provider = connectionProvider({
+      fields: [
+        { key: "sudo_password", label: "Sudo password", type: "password", binding: "secret" },
+        { key: "totp_secret", label: "TOTP secret", type: "textarea", binding: "secret" },
+        { key: "sudo_source", label: "Sudo source", type: "text", binding: "config" },
+      ],
+    });
+    const existing = buildPluginConnectionConfig("io.dbx.ssh", provider, {});
+    existing.connection_secrets = { sudo_password: "null", totp_secret: "JBSWY3DPEHPK3PXP" };
+    existing.external_config = { sudo_source: "custom", stale: null };
+
+    const values = pluginConnectionFormValues(provider, existing);
+
+    expect(values.sudo_password).toBe("null");
+    expect(values.totp_secret).toBe("JBSWY3DPEHPK3PXP");
+    expect(values.stale).toBeUndefined();
+    expect(values.sudo_source).toBe("custom");
+
+    const saved = buildPluginConnectionConfig("io.dbx.ssh", provider, values, existing);
+    expect(saved.connection_secrets?.sudo_password).toBe("null");
+    expect(saved.connection_secrets?.totp_secret).toBe("JBSWY3DPEHPK3PXP");
+  });
+
+  it.each([undefined, "secret", "password"] as const)("round-trips explicit 'null' credentials with binding %s", (binding) => {
+    const provider = connectionProvider({ fields: [{ key: "credential", label: "Credential", type: "password", binding }] });
+    const saved = buildPluginConnectionConfig("example.plugin", provider, { credential: "null" });
+    expect(binding === "password" ? saved.password : saved.connection_secrets?.credential).toBe("null");
+    expect(pluginConnectionFormValues(provider, saved)).toEqual({ credential: "null" });
+    const reopened = buildPluginConnectionConfig("example.plugin", provider, pluginConnectionFormValues(provider, saved), saved);
+    expect(pluginConnectionFormValues(provider, reopened)).toEqual({ credential: "null" });
+  });
+
+  it("migrates an opaque 'null' credential from config to secret storage without losing it", () => {
+    const provider = connectionProvider({ fields: [{ key: "credential", label: "Credential", type: "password" }] });
+    const existing = buildPluginConnectionConfig("example.plugin", provider, {});
+    existing.external_config = { credential: "null" };
+    const values = pluginConnectionFormValues(provider, existing);
+    expect(values).toEqual({ credential: "null" });
+    const saved = buildPluginConnectionConfig("example.plugin", provider, values, existing);
+    expect(saved.connection_secrets).toEqual({ credential: "null" });
+    expect(saved.external_config).toEqual({});
+  });
+
+  it.each([null, undefined, ""])("keeps an unset credential %s absent without a default", (credential) => {
+    const provider = connectionProvider({ fields: [{ key: "credential", label: "Credential", type: "password" }] });
+    const existing = buildPluginConnectionConfig("example.plugin", provider, {});
+    existing.connection_secrets = { credential: "old-secret" };
+    const saved = buildPluginConnectionConfig("example.plugin", provider, { credential } as unknown as Record<string, PluginFormFieldValue>, existing);
+    expect(saved.connection_secrets).toEqual({});
+    expect(pluginConnectionFormValues(provider, saved)).toEqual({});
+  });
+
+  it("uses an explicit string default only for missing input, not a cleared input", () => {
+    const provider = connectionProvider({ fields: [{ key: "credential", label: "Credential", type: "password", default: "null" }] });
+    expect(initialPluginFormValues(provider)).toEqual({ credential: "null" });
+    expect(buildPluginConnectionConfig("example.plugin", provider, {}).connection_secrets).toEqual({ credential: "null" });
+    expect(buildPluginConnectionConfig("example.plugin", provider, { credential: null } as unknown as Record<string, PluginFormFieldValue>).connection_secrets).toEqual({});
+    expect(buildPluginConnectionConfig("example.plugin", provider, { credential: "" }).connection_secrets).toEqual({});
+  });
+
   it("maps provider fields into common, config, and secret storage", () => {
     const provider: PluginConnectionProviderContribution = {
       type: "connection-provider",
@@ -326,5 +550,24 @@ describe("FrontendPluginRegistry", () => {
       private_key: "secret-key",
       keepalive: false,
     });
+  });
+
+  it("builds from a reactive (non-structured-cloneable) existing config", () => {
+    // Connection configs reach the builder through props as Vue reactive
+    // proxies; structuredClone refuses them ("The object can not be cloned.").
+    const provider = connectionProvider({
+      id: "example.ssh",
+      database_type: "ssh",
+      fields: [{ key: "authentication", label: "Authentication", type: "select", binding: "config", default: "password", options: [] }],
+    });
+    const existing = {
+      id: "ssh-1",
+      external_config: new Proxy({ authentication: "private-key" }, {}),
+    } as unknown as Parameters<typeof buildPluginConnectionConfig>[3];
+
+    const config = buildPluginConnectionConfig("example.plugin", provider, { authentication: "private-key" }, existing);
+
+    expect(config.external_config).toEqual({ authentication: "private-key" });
+    expect(config.id).toBe("ssh-1");
   });
 });

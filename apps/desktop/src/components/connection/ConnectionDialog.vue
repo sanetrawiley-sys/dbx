@@ -42,25 +42,38 @@ import type { NacosAdminConfig, NacosApiPlane, NacosAuthConfig, NacosImplementat
 import { CONNECTION_ATTEMPT_CANCELLED_MESSAGE, useConnectionStore } from "@/stores/connectionStore";
 import { useTunnelProfileStore } from "@/stores/tunnelProfileStore";
 import { detachTunnelProfileLayer, tunnelProfileReferenceLayer, tunnelProfileSummary } from "@/lib/connection/tunnelProfiles";
+import { sanitizeConnectionCredentials } from "@/lib/connection/credentialSanitizer";
 import { applySshAuthMethod, inferSshAuthMethod } from "@/lib/connection/sshAuthMethod";
 import { applySshConfigHostAliasPrefill as prefillSshConfigHostAlias } from "@/lib/connection/sshConfigHosts";
 import { canPersistConnectionTestResult, connectionEditDraftSyncAction } from "./connectionEditDraftSync";
 import { createConnectionNoteVisibilityDraft, persistConnectionNoteVisibilityDraft as persistConnectionNoteVisibilityDraftState, resetConnectionNoteVisibilityDraft, setConnectionNoteVisibilityDraft, syncConnectionNoteVisibilityDraft } from "./connectionNoteVisibilityDraft";
 import { REDIS_SCAN_PAGE_SIZE_DEFAULT, REDIS_SCAN_PAGE_SIZE_MIN, REDIS_SCAN_PAGE_SIZE_MAX, REDIS_SCAN_PAGE_SIZE_OPTIONS } from "@/lib/redis/redisKeyPattern";
 import { normalizeRedisKeyTemplates, redisKeyTemplatesToTextarea } from "@/lib/redis/redisKeyTemplates";
+import { normalizeRedisDatabaseValue } from "@/lib/redis/redisDatabaseIndex";
 import { normalizeGlobalConnectTimeoutSecs, normalizeGlobalQueryTimeoutSecs, useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import PluginConnectionFields from "@/components/plugins/PluginConnectionFields.vue";
 import PluginIcon from "@/components/plugins/PluginIcon.vue";
 import * as api from "@/lib/backend/api";
-import { buildPluginConnectionConfig, createFrontendPluginRegistry, parsePluginConnectionProviderOptionValue, pluginConnectionActionsForDialog, pluginConnectionFormValues, pluginConnectionProviderIcon, pluginConnectionProviderOptionValue } from "@/lib/plugins/frontendPlugin";
+import {
+  buildPluginConnectionConfig,
+  createFrontendPluginRegistry,
+  parsePluginConnectionProviderOptionValue,
+  pluginConnectionActionsForDialog,
+  pluginConnectionConnectTimeoutDefault,
+  pluginConnectionFormValues,
+  pluginConnectionProviderIcon,
+  pluginConnectionProviderOptionValue,
+} from "@/lib/plugins/frontendPlugin";
 import type { PluginCenterFocus } from "@/lib/plugins/pluginCenterNavigation";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { applyMeilisearchBasePathToExternalConfig, applyParsedConnectionUrl, normalizeMongoConnectionString, parseConnectionUrl } from "@/lib/connection/connectionUrl";
+import { hasXuguConnectionDatabase } from "@/lib/connection/xuguDatabase";
 import { DEFAULT_QUERY_TIMEOUT_SECS, MAX_CONNECT_TIMEOUT_SECS, MAX_QUERY_TIMEOUT_SECS } from "@/lib/connection/timeoutLimits";
 import { buildOracleTnsConnectionString, normalizeOracleTnsAdminPath, parseOracleTnsConnectionString } from "@/lib/connection/oracleTnsConnection";
-import { connectionDeepLinkServiceHydrationValue, parseConnectionDeepLink, parseServiceConnectionUrl, type ConnectionDeepLinkDraft } from "@/lib/connection/connectionDeepLink";
+import { applyConnectionDeepLinkUpdate, resolveConnectionDeepLinkUpdate } from "@/lib/connection/connectionDeepLinkUpdate";
+import { connectionDeepLinkServiceHydrationValue, parseConnectionDeepLink, parseConnectionDeepLinkUpdate, parseServiceConnectionUrl, type ConnectionDeepLinkDraft, type ConnectionDeepLinkUpdate } from "@/lib/connection/connectionDeepLink";
 import { connectionUrlPlaceholder as getUrlPlaceholder } from "@/lib/connection/connectionPresentation";
 import { parseGaussdbHosts, serializeGaussdbHosts, type GaussdbHostEntry } from "@/lib/connection/gaussdbHosts";
 import { h2ConnectionModeForConfig, h2FileJdbcUrlWithPath, h2FilePathFromJdbcUrl, isH2SplitJdbcUrl, type H2ConnectionMode } from "@/lib/database/h2Connection";
@@ -80,6 +93,7 @@ import { configuredDatabaseProductName, connectionConfigFingerprint, databaseInf
 import { agentDriverInstallKey, appendAgentDriverUpdateHint, connectionUsesSsh, hasAgentDriverUpdate, showAgentDriverInstallHint, type AgentDriverInstallState, type DriverStoreFocus } from "@/lib/connection/agentDriverInstallHint";
 import { prestoSqlBuiltinDriverPaths } from "@/lib/database/prestoSqlBuiltinDriver";
 import { JDBCX_DEFAULT_URL, JDBCX_DRIVER_PROFILE, JDBCX_JDBC_DRIVER_CLASS, ensureJdbcxRuntimeDrivers, isJdbcxRuntimeBundle, isJdbcxRuntimePath, jdbcxHighPrivilegeExtensionsEnabled, setJdbcxHighPrivilegeExtensionsEnabled } from "@/lib/database/jdbcxBuiltinDriver";
+import { notifyComponentUpdatesChanged } from "@/lib/updates/componentUpdateEvents";
 import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/database/databaseFileDetection";
 import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connection/connectionAttemptTimeout";
 import { consulAgentAddressesMatch } from "@/lib/consul/agentTarget";
@@ -92,6 +106,7 @@ import { assertCompleteDatabaseCategories, databaseSelectionForCategory } from "
 import { loadConnectionPickerView, saveConnectionPickerView, type DbPickerView } from "@/lib/connection/connectionPickerViewPreference";
 import { normalizeRocketmqNamesrvAddr } from "@/lib/connection/rocketmqNamesrv";
 import { normalizeRabbitmqAddresses, parseRabbitmqAddress } from "@/lib/connection/rabbitmqAddresses";
+import { pluginFieldIsRequired, pluginFieldIsVisible } from "@/lib/plugins/pluginFieldConditions";
 import { detectMqUiAuthKind, isMqAuthKindAllowedForSystem, type MqUiAuthKind } from "@/lib/connection/mqAuth";
 import { driverInstallProgressChannel, driverInstallProgressPercent, isDriverInstallProgressForOperation, requestAgentInstallCancellation, resolveAgentInstallOutcome, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
 import { requiresSqlServerLegacyCompatibilityComponent, setSqlServerLegacyCompatibilityConfig, sqlServerUsesLegacyCompatibility, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
@@ -255,6 +270,8 @@ type LegacyTransportFields = {
 type LegacyConnectionConfig = ConnectionConfig & LegacyTransportFields;
 type ConnectionForm = Omit<ConnectionConfig, "id">;
 type ConnectionTestState = ConnectionTestResult & { ok: boolean; scope?: "connection" | "ssh" };
+type PluginActionStatus = { ok: boolean; message: string };
+type SaveConnectionOptions = { connectAfterSave?: boolean; closeOnSuccess?: boolean };
 
 const { t, locale: appLocale } = useI18n();
 const { toast } = useToast();
@@ -272,6 +289,7 @@ const isDesktop = isTauriRuntime();
 const props = defineProps<{
   editConfig?: ConnectionConfig;
   prefillConfig?: ConnectionDeepLinkDraft | null;
+  updatePrefill?: ConnectionDeepLinkUpdate | null;
   pluginProvider?: PluginCenterFocus | null;
   initialTab?: ConfigTab;
 }>();
@@ -328,11 +346,9 @@ const connectionErrorDetail = ref("");
 const testResultCopied = ref(false);
 const connectionErrorCopied = ref(false);
 const editingId = ref<string | null>(null);
-const installedPlugins = ref<InstalledPlugin[]>([]);
 const pluginFormValues = ref<Record<string, PluginFormFieldValue>>({});
 const pluginLoadError = ref("");
 const runningPluginActionId = ref<string | null>(null);
-type PluginActionStatus = { ok: boolean; message: string };
 const pluginActionStatus = ref<PluginActionStatus | null>(null);
 const draftTestConnectionId = ref(uuid());
 const showVisibleDatabasesDialog = ref(false);
@@ -365,6 +381,7 @@ const isLoadingVisibleSchemas = ref(false);
 const visibleSchemaNames = ref<string[]>([]);
 const visibleSchemaInitialSelection = ref<string[]>([]);
 const visibleSchemaError = ref("");
+const installedPlugins = ref<InstalledPlugin[]>([]);
 let testRunId = 0;
 let unlistenAgentInstallProgress: (() => void) | null = null;
 
@@ -759,6 +776,13 @@ const keepaliveEnabled = computed({
 const selectedTransportLayerId = ref<string | null>(null);
 const draggedTransportLayerId = ref<string | null>(null);
 const selectedType = ref("mysql");
+const pluginRegistry = computed(() => createFrontendPluginRegistry(installedPlugins.value, appLocale.value));
+const pluginConnectionProviders = computed(() => pluginRegistry.value.listConnectionProviders());
+const selectedPluginProvider = computed(() => pluginProviderEntryForOption(selectedType.value));
+const selectedPluginIcon = computed(() => (selectedPluginProvider.value ? pluginConnectionProviderIcon(selectedPluginProvider.value) : undefined));
+const isPluginConnection = computed(() => form.value.db_type === "plugin");
+const pluginFooterActions = computed<PluginConnectionAction[]>(() => (selectedPluginProvider.value ? pluginConnectionActionsForDialog(selectedPluginProvider.value.contribution, !!editingId.value) : []));
+const pluginFooterBusy = computed(() => isTesting.value || isSaving.value || !!runningPluginActionId.value);
 const customDriverName = ref("");
 const mongoUseUrl = ref(false);
 const jdbcDriverPathsInput = ref("");
@@ -1190,13 +1214,6 @@ function selectedProfile() {
   return driverProfiles[profile] ?? driverProfiles.mysql;
 }
 
-const isPluginConnection = computed(() => form.value.db_type === "plugin");
-const pluginConnectionProviders = computed(() => createFrontendPluginRegistry(installedPlugins.value, appLocale.value).listConnectionProviders());
-const selectedPluginProvider = computed(() => pluginProviderEntryForOption(selectedType.value));
-const selectedPluginIcon = computed(() => (selectedPluginProvider.value ? pluginConnectionProviderIcon(selectedPluginProvider.value) : undefined));
-const pluginFooterActions = computed<PluginConnectionAction[]>(() => (selectedPluginProvider.value ? pluginConnectionActionsForDialog(selectedPluginProvider.value.contribution, !!editingId.value) : []));
-const pluginFooterBusy = computed(() => isTesting.value || isSaving.value || !!runningPluginActionId.value);
-
 function pluginProviderEntry(pluginId: string, providerId: string) {
   return pluginConnectionProviders.value.find((entry) => entry.plugin.manifest.id === pluginId && entry.contribution.id === providerId) || null;
 }
@@ -1204,62 +1221,6 @@ function pluginProviderEntry(pluginId: string, providerId: string) {
 function pluginProviderEntryForOption(value: string) {
   const target = parsePluginConnectionProviderOptionValue(value);
   return target ? pluginProviderEntry(target.pluginId, target.providerId) : null;
-}
-
-function applyPluginProvider(value: string, preserveConnectionFields = false, existing?: ConnectionConfig): boolean {
-  const target = parsePluginConnectionProviderOptionValue(value);
-  if (!target) return false;
-  const entry = pluginProviderEntry(target.pluginId, target.providerId);
-  if (!entry) return false;
-
-  selectedType.value = value;
-  if (!preserveConnectionFields) {
-    form.value = {
-      ...defaultForm(),
-      name: entry.contribution.label,
-      db_type: "plugin",
-      driver_profile: "plugin",
-      driver_label: entry.contribution.label,
-      host: "",
-      port: 0,
-      username: "",
-      password: "",
-      query_timeout_secs: 60,
-    };
-  } else {
-    form.value.db_type = "plugin";
-    form.value.driver_profile = "plugin";
-    form.value.driver_label = entry.contribution.label;
-  }
-  pluginFormValues.value = pluginConnectionFormValues(entry.contribution, existing);
-  if (!preserveConnectionFields) {
-    const nameField = entry.contribution.fields.find((field) => field.binding === "name");
-    const defaultName = nameField ? pluginFormValues.value[nameField.key] : undefined;
-    if (typeof defaultName === "string" && defaultName.trim()) form.value.name = defaultName.trim();
-  }
-  connectionUrlInput.value = "";
-  appliedConnectionUrlInput.value = "";
-  return true;
-}
-
-async function loadInstalledPlugins() {
-  pluginLoadError.value = "";
-  try {
-    installedPlugins.value = await api.listPlugins();
-  } catch (cause) {
-    installedPlugins.value = [];
-    pluginLoadError.value = cause instanceof Error ? cause.message : String(cause);
-  }
-}
-
-function applyRequestedPluginProvider(target: PluginCenterFocus | null | undefined) {
-  if (!target?.pluginId || !target.providerId) return false;
-  const value = pluginConnectionProviderOptionValue(target.pluginId, target.providerId);
-  if (!applyPluginProvider(value)) return false;
-  selectedDbCategory.value = "plugins";
-  dialogStep.value = "config";
-  configTab.value = "connection";
-  return true;
 }
 
 function mqExtraRecord(config?: Partial<MqAdminConfig>): Record<string, unknown> {
@@ -2006,6 +1967,7 @@ async function ensureRequiredAgentDriverInstalled(config: ConnectionConfig): Pro
   const operationId = beginAgentDriverInstall(driverKey, label);
   try {
     await api.installAgent(driverKey, operationId);
+    notifyComponentUpdatesChanged();
     await refreshLocalAgentDrivers();
     // A stale promise (cancelled then retried) must not close the retry's dialog.
     if (agentInstallOperationId.value === operationId) finishAgentDriverInstall(operationId);
@@ -2041,6 +2003,7 @@ async function ensureRequiredJdbcxDriverInstalled(config: ConnectionConfig): Pro
     testResult.value = { ok: true, message: "Installing JDBC plugin..." };
   });
   if (!result) return;
+  notifyComponentUpdatesChanged();
 
   jdbcMavenBundles.value = result.bundles;
   addJdbcDriverPaths(result.paths);
@@ -2054,6 +2017,7 @@ async function ensureRequiredJdbcxDriverInstalled(config: ConnectionConfig): Pro
 async function ensureRequiredJdbcProductRuntimeInstalled(config: ConnectionConfig): Promise<void> {
   const result = await ensureRegisteredJdbcProductRuntimeDrivers(config, api);
   if (!result) return;
+  notifyComponentUpdatesChanged();
 
   jdbcMavenBundles.value = result.bundles;
   jdbcDriverPathsInput.value = result.paths.join("\n");
@@ -2073,6 +2037,7 @@ async function ensureRequiredGaussdbMJdbcRuntime(config: ConnectionConfig): Prom
   if (status.installed && status.compatible) return;
   testResult.value = { ok: true, message: t("connection.gaussdbMJdbcPluginInstalling") };
   await api.installJdbcPlugin();
+  notifyComponentUpdatesChanged();
 }
 
 async function installSqlServerLegacyCompatibilityComponentIfNeeded(): Promise<boolean> {
@@ -2082,6 +2047,7 @@ async function installSqlServerLegacyCompatibilityComponentIfNeeded(): Promise<b
   const operationId = beginAgentDriverInstall(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY, label);
   try {
     await api.installAgent(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY, operationId);
+    notifyComponentUpdatesChanged();
     await refreshLocalAgentDrivers();
     // A stale promise (cancelled then retried) must not close the retry's dialog.
     if (agentInstallOperationId.value === operationId) finishAgentDriverInstall(operationId);
@@ -2589,6 +2555,62 @@ function applyProfile(val: string, preserveConnectionFields = false) {
   }
 }
 
+function applyPluginProvider(value: string, preserveConnectionFields = false, existing?: ConnectionConfig): boolean {
+  const target = parsePluginConnectionProviderOptionValue(value);
+  if (!target) return false;
+  const entry = pluginProviderEntry(target.pluginId, target.providerId);
+  if (!entry) return false;
+
+  selectedType.value = value;
+  if (!preserveConnectionFields) {
+    form.value = {
+      ...defaultForm(),
+      name: entry.contribution.label,
+      db_type: "plugin",
+      driver_profile: "plugin",
+      driver_label: entry.contribution.label,
+      host: "",
+      port: 0,
+      username: "",
+      password: "",
+      query_timeout_secs: 60,
+    };
+  } else {
+    form.value.db_type = "plugin";
+    form.value.driver_profile = "plugin";
+    form.value.driver_label = entry.contribution.label;
+  }
+  pluginFormValues.value = pluginConnectionFormValues(entry.contribution, existing);
+  if (!preserveConnectionFields) {
+    const nameField = entry.contribution.fields.find((field) => field.binding === "name");
+    const defaultName = nameField ? pluginFormValues.value[nameField.key] : undefined;
+    if (typeof defaultName === "string" && defaultName.trim()) form.value.name = defaultName.trim();
+  }
+  connectionUrlInput.value = "";
+  appliedConnectionUrlInput.value = "";
+  return true;
+}
+
+async function loadInstalledPlugins() {
+  pluginLoadError.value = "";
+  try {
+    installedPlugins.value = await api.listPlugins();
+  } catch (cause) {
+    installedPlugins.value = [];
+    pluginLoadError.value = cause instanceof Error ? cause.message : String(cause);
+  }
+}
+
+function applyRequestedPluginProvider(target: PluginCenterFocus | null | undefined) {
+  if (!target?.pluginId || !target.providerId) return false;
+  const value = pluginConnectionProviderOptionValue(target.pluginId, target.providerId);
+  if (!applyPluginProvider(value)) return false;
+  selectedDbCategory.value = "plugins";
+  dialogStep.value = "config";
+  configTab.value = "connection";
+  return true;
+}
+
 function switchOceanbaseMode(mode: "mysql" | "oracle") {
   oceanbaseSubMode.value = mode;
   if (mode === "mysql") {
@@ -2606,15 +2628,42 @@ function switchGbaseProfile(profile: "gbase8a" | "gbase8s") {
   resetTestState();
 }
 
+let applyingConnectionUpdate = false;
+let appliedConnectionUpdate: ConnectionDeepLinkUpdate | null = null;
+
+function finishApplyingConnectionUpdate() {
+  void nextTick(() => {
+    applyingConnectionUpdate = false;
+  });
+}
+
+// The external_config shaped by an update link must survive submit verbatim
+// only while the submitted values are still the ones the link patched: once
+// the user edits the port away from the patched value, or the patch targeted
+// another connection, the flag is re-derived from the form like any edit.
+function connectionUpdateExternalConfigPreserved(config: Pick<ConnectionConfig, "id" | "port">): boolean {
+  if (!appliedConnectionUpdate || appliedConnectionUpdate.connectionId !== config.id) return false;
+  const patchedPort = appliedConnectionUpdate.patch.port;
+  return patchedPort === undefined || patchedPort === config.port;
+}
+
 watch(
   [() => props.editConfig, open],
-  ([config, isOpen]) => {
-    const syncAction = connectionEditDraftSyncAction(config?.id ?? null, isOpen, editingId.value);
+  ([savedConfig, isOpen]) => {
+    const syncAction = connectionEditDraftSyncAction(savedConfig?.id ?? null, isOpen, editingId.value);
     if (syncAction === "preserve") return;
+    // Hydrate a detached edit draft before form watchers observe it. Do not
+    // mutate the saved record or apply create defaults to an ID update. Only
+    // flag the update as applied when the prefill really targeted this
+    // connection, so an ID mismatch cannot freeze port-flag recomputation.
+    const connectionUpdate = savedConfig && props.updatePrefill?.connectionId === savedConfig.id ? props.updatePrefill : null;
+    const config = connectionUpdate && savedConfig ? applyConnectionDeepLinkUpdate(savedConfig, connectionUpdate) : savedConfig;
     resetConnectionNoteVisibilityDraft(connectionNoteVisibilityDraft, settingsStore.editorSettings.sidebarShowConnectionNotes);
     editGlobalConnectTimeoutSecs.value = settingsStore.editorSettings.globalConnectTimeoutSecs;
     editGlobalQueryTimeoutSecs.value = settingsStore.editorSettings.globalQueryTimeoutSecs;
     if (syncAction === "hydrate" && config) {
+      appliedConnectionUpdate = connectionUpdate;
+      if (connectionUpdate) applyingConnectionUpdate = true;
       clearSavedDatabaseInfo();
       const legacyConfig = config as LegacyConnectionConfig;
       const profile = profileForConfig(config);
@@ -2626,7 +2675,7 @@ watch(
         name: config.name,
         note: config.note || "",
         db_type: oceanbasePatch?.db_type || profileConfig?.type || config.db_type,
-        driver_profile: oceanbasePatch?.driver_profile || config.driver_profile || profile,
+        driver_profile: config.db_type === "plugin" ? "plugin" : oceanbasePatch?.driver_profile || config.driver_profile || profile,
         driver_label: config.driver_label || oceanbasePatch?.driver_label || driverProfiles[profile]?.label || config.db_type,
         url_params: config.url_params || "",
         agent_java_options: config.agent_java_options || [],
@@ -2634,7 +2683,9 @@ watch(
         port: profile === "tdengine" && (config.port === 0 || config.port === 6030) ? 6041 : config.port,
         username: config.username,
         password: config.password,
-        database: config.database,
+        // Show the index the backend actually connects with; legacy dirty values
+        // (e.g. redis-cli flags in the field) are healed when the form is saved.
+        database: config.db_type === "redis" ? normalizeRedisDatabaseValue(config.database) || "" : config.database,
         color: config.color || "",
         transport_layers: transportLayersForConfig(legacyConfig),
         connect_timeout_secs: config.connect_timeout_inherit === true ? settingsStore.editorSettings.globalConnectTimeoutSecs : config.connect_timeout_secs || 10,
@@ -2755,13 +2806,15 @@ watch(
       customDriverName.value = isCustomCompatibleProfile() ? config.driver_label || "" : "";
       dialogStep.value = "config";
       configTab.value = initialConfigTab();
+      if (props.updatePrefill) finishApplyingConnectionUpdate();
       // Form/profile watchers normalize derived fields in this flush. Capture
       // the saved baseline afterwards so those initial changes are not treated
       // as user edits that invalidate persisted database metadata.
       void nextTick(() => {
-        if (open.value && props.editConfig?.id === config.id) applySavedDatabaseInfo(config);
+        if (open.value && props.editConfig?.id === config.id && !props.updatePrefill) applySavedDatabaseInfo(config);
       });
     } else {
+      appliedConnectionUpdate = null;
       clearSavedDatabaseInfo();
       editingId.value = null;
       selectedConnectionGroupId.value = initialConnectionGroupId();
@@ -2770,6 +2823,7 @@ watch(
       productionProtectionEnabled.value = false;
       selectedTransportLayerId.value = null;
       selectedType.value = "mysql";
+      pluginFormValues.value = {};
       customDriverName.value = "";
       resetMqFields();
       resetCassandraTlsFields(undefined);
@@ -2804,6 +2858,30 @@ watch(
   },
 );
 
+// 删除连接时若开启了「记住连接名与数据库」，新建同名**同类型**连接会自动选中记住的数据库。
+// 只在数据库字段为空、或仍是上一次自动回填的值时才覆盖，避免抢走用户手输的内容。
+const lastRememberedDatabaseAutofill = ref("");
+watch(
+  () => [open.value, editingId.value, form.value.name, form.value.db_type] as const,
+  ([isOpen, editing, rawName, dbType]) => {
+    if (!isOpen || editing) {
+      lastRememberedDatabaseAutofill.value = "";
+      return;
+    }
+    const name = (rawName ?? "").trim();
+    const remembered = name ? settingsStore.rememberedDatabaseForConnection(name, dbType) : "";
+    const current = (form.value.database ?? "").trim();
+    if (current === remembered) {
+      lastRememberedDatabaseAutofill.value = remembered;
+      return;
+    }
+    if (current && current !== lastRememberedDatabaseAutofill.value) return;
+    form.value.database = remembered || undefined;
+    lastRememberedDatabaseAutofill.value = remembered;
+  },
+  { immediate: true },
+);
+
 const databaseLabel = computed(() => {
   if (form.value.db_type === "oracle" && form.value.oracle_connection_type === "tns") return t("connection.oracleTnsAlias");
   if (form.value.db_type === "oracle") return t("connection.serviceName");
@@ -2813,6 +2891,7 @@ const databaseLabel = computed(() => {
 
 const databasePlaceholder = computed(() => {
   if (form.value.db_type === "oracle" && form.value.oracle_connection_type === "tns") return t("connection.oracleTnsAliasPlaceholder");
+  if (form.value.db_type === "xugu") return t("connection.databasePlaceholderRequired");
   if (form.value.db_type === "kingbase") return t("connection.databasePlaceholderRequired");
   const fallback = defaultDatabaseForProfile();
   if (!fallback) return t("connection.databasePlaceholder");
@@ -2882,6 +2961,7 @@ const transportPathSegments = computed(() => {
 
 function defaultDatabaseForProfile() {
   if (form.value.db_type === "redshift") return "dev";
+  if (form.value.db_type === "redis") return "0";
   if (form.value.db_type === "gaussdb") return "postgres";
   if (form.value.db_type === "kwdb") return "defaultdb";
   if (form.value.db_type === "databend") return "default";
@@ -3013,10 +3093,10 @@ const dbCategoryMetadata: Array<{ key: DbCategoryKey; titleKey: string }> = [
   { key: "registry_config", titleKey: "connection.databaseCategoryRegistryConfig" },
 ];
 
-function jdbcProductCategory(profileId: string): DbCategoryKey {
-  const category = dbCategoryMetadata.find(({ key }) => jdbcProductProfileIdsForCategory(key).includes(profileId))?.key;
-  if (!category) throw new Error(`JDBC product profile ${profileId} has no connection picker category`);
-  return category;
+function jdbcProductCategory(profileId: string): ConnectionProfileCategory {
+  const category: DbCategoryKey | undefined = dbCategoryMetadata.find(({ key }) => jdbcProductProfileIdsForCategory(key).includes(profileId))?.key;
+  if (category !== "plugins" && category) return category;
+  throw new Error(`JDBC product profile ${profileId} has no connection picker category`);
 }
 
 // `influxdb3` is presented as a version option inside the InfluxDB card
@@ -3092,7 +3172,7 @@ const selectedDbOptionIsVisible = computed(() => visibleDbCategories.value.some(
 function selectDbCategory(category: DbCategoryKey) {
   selectedDbCategory.value = category;
   dbSearchQuery.value = "";
-  const categoryOptions = dbCategoryDefinitions.find((definition) => definition.key === category)?.optionValues ?? [];
+  const categoryOptions = dbCategories.value.find((definition) => definition.key === category)?.options.map((option) => option.value) ?? [];
   const nextSelection = databaseSelectionForCategory(selectedType.value, categoryOptions);
   if (nextSelection && nextSelection !== selectedType.value) onDbTypeChange(nextSelection);
 }
@@ -3161,6 +3241,7 @@ const tlsCapableDatabaseTypes = new Set<DatabaseType>([
   "elasticsearch",
   "easysearch",
   "meilisearch",
+  "solr",
   "hbase",
   "qdrant",
   "milvus",
@@ -3573,15 +3654,54 @@ const pluginActionStatusMessage = computed(() => {
   if (!pluginActionStatus.value) return "";
   return pluginActionStatus.value.ok ? pluginActionStatus.value.message : translateBackendError(t, pluginActionStatus.value.message);
 });
+const agentInstallPercent = computed(() => driverInstallProgressPercent(agentInstallProgress.value));
+const agentInstallProgressLabel = computed(() => {
+  const progress = agentInstallProgress.value;
+  if (agentInstallError.value) return t("connection.driverInstall.statusFailed");
+  if (!agentInstallRunning.value) return t("connection.driverInstall.statusWaiting");
+  if (!progress) return t("connection.driverInstall.statusPreparing");
+  if (progress.step === "jre-extract") return t("connection.driverInstall.statusExtractingJre");
+  const label = progress.step === "jre" ? t("connection.driverInstall.stepJre") : progress.step === "driver" ? t("connection.driverInstall.stepDriver") : progress.step || t("connection.driverInstall.stepDefault");
+  if (!progress.total) return `${label}...`;
+  return `${label} ${formatInstallSize(progress.downloaded ?? 0)} / ${formatInstallSize(progress.total)} (${agentInstallPercent.value ?? 0}%)`;
+});
+const canCloseAgentInstallDialog = computed(() => !agentInstallRunning.value || !!agentInstallError.value);
+const sqlServerDriverMode = computed<"auto" | "legacy">(() => (sqlServerUsesLegacyCompatibility(form.value) ? "legacy" : "auto"));
+const shouldUseWideConnectionDialog = computed(
+  () => dialogStep.value === "config" && (canChooseVisibleDatabases.value || canChooseVisibleNacosNamespaces.value || (canChooseVisibleSchemas.value && !visibleFilterUsesSchemas.value) || (selectedPluginProvider.value?.contribution.fields.length ?? 0) >= 6),
+);
+const connectionDialogContentClass = computed(() => {
+  if (dialogStep.value === "select") return "connection-dialog-content--picker sm:h-[720px] sm:max-w-[880px]";
+  const widthClass = shouldUseWideConnectionDialog.value ? "connection-dialog-content--wide sm:max-w-[660px]" : "connection-dialog-content--standard sm:max-w-[560px]";
+  const scrollableAdvancedNacos = form.value.db_type === "nacos" && configTab.value === "advanced";
+  return `${widthClass} connection-dialog-content--config${scrollableAdvancedNacos ? " connection-dialog-content--scrollable" : ""}`;
+});
+const connectionLabelClass = "justify-self-start text-left";
+const connectionLabelSmallClass = `${connectionLabelClass} text-xs`;
+const connectionLabelTopClass = `${connectionLabelClass} mt-2`;
+const connectionLabelSmallPaddedClass = `${connectionLabelClass} pt-2 text-xs`;
 
 function pluginFieldValue(field: PluginFormField): PluginFormFieldValue {
   if (field.binding === "name") return form.value.name;
-  return pluginFormValues.value[field.key] ?? field.default;
+  return pluginFormValues.value[field.key] ?? field.default ?? undefined;
 }
 
 function pluginFieldHasValue(field: PluginFormField): boolean {
   const value = pluginFieldValue(field);
   return typeof value === "string" ? value.trim().length > 0 : value !== undefined;
+}
+
+function pluginFieldValueByKey(key: string): PluginFormFieldValue {
+  const field = selectedPluginProvider.value?.contribution.fields.find((candidate) => candidate.key === key);
+  return field ? pluginFieldValue(field) : undefined;
+}
+
+function pluginFieldVisible(field: PluginFormField): boolean {
+  return pluginFieldIsVisible(field, pluginFieldValueByKey, (key) => selectedPluginProvider.value?.contribution.fields.find((candidate) => candidate.key === key));
+}
+
+function pluginFieldRequired(field: PluginFormField): boolean {
+  return pluginFieldIsRequired(field, pluginFieldValueByKey);
 }
 
 function pluginActionLabel(action: PluginConnectionAction): string {
@@ -3633,34 +3753,11 @@ function applyPluginActionFieldValues(values: Record<string, PluginFormFieldValu
   }
   pluginFormValues.value = nextValues;
 }
-const agentInstallPercent = computed(() => driverInstallProgressPercent(agentInstallProgress.value));
-const agentInstallProgressLabel = computed(() => {
-  const progress = agentInstallProgress.value;
-  if (agentInstallError.value) return t("connection.driverInstall.statusFailed");
-  if (!agentInstallRunning.value) return t("connection.driverInstall.statusWaiting");
-  if (!progress) return t("connection.driverInstall.statusPreparing");
-  if (progress.step === "jre-extract") return t("connection.driverInstall.statusExtractingJre");
-  const label = progress.step === "jre" ? t("connection.driverInstall.stepJre") : progress.step === "driver" ? t("connection.driverInstall.stepDriver") : progress.step || t("connection.driverInstall.stepDefault");
-  if (!progress.total) return `${label}...`;
-  return `${label} ${formatInstallSize(progress.downloaded ?? 0)} / ${formatInstallSize(progress.total)} (${agentInstallPercent.value ?? 0}%)`;
-});
-const canCloseAgentInstallDialog = computed(() => !agentInstallRunning.value || !!agentInstallError.value);
-const sqlServerDriverMode = computed<"auto" | "legacy">(() => (sqlServerUsesLegacyCompatibility(form.value) ? "legacy" : "auto"));
-const shouldUseWideConnectionDialog = computed(() => dialogStep.value === "config" && (canChooseVisibleDatabases.value || canChooseVisibleNacosNamespaces.value || (canChooseVisibleSchemas.value && !visibleFilterUsesSchemas.value)));
-const connectionDialogContentClass = computed(() => {
-  if (dialogStep.value === "select") return "connection-dialog-content--picker sm:h-[720px] sm:max-w-[880px]";
-  const widthClass = shouldUseWideConnectionDialog.value ? "connection-dialog-content--wide sm:max-w-[660px]" : "connection-dialog-content--standard sm:max-w-[560px]";
-  const scrollableAdvancedNacos = form.value.db_type === "nacos" && configTab.value === "advanced";
-  return `${widthClass} connection-dialog-content--config${scrollableAdvancedNacos ? " connection-dialog-content--scrollable" : ""}`;
-});
-const connectionLabelClass = "justify-self-start text-left";
-const connectionLabelSmallClass = `${connectionLabelClass} text-xs`;
-const connectionLabelTopClass = `${connectionLabelClass} mt-2`;
-const connectionLabelSmallPaddedClass = `${connectionLabelClass} pt-2 text-xs`;
+
 const hasRequiredConnectionTarget = computed(() => {
   if (isPluginConnection.value) {
-    const provider = selectedPluginProvider.value?.contribution;
-    return !!provider && provider.fields.every((field) => !field.required || pluginFieldHasValue(field));
+    const entry = selectedPluginProvider.value;
+    return !!entry && entry.contribution.fields.every((field) => !pluginFieldVisible(field) || !pluginFieldRequired(field) || pluginFieldHasValue(field));
   }
   if (form.value.db_type === "mq") {
     if (mqSystemKind.value === "kafka") return mqKafkaConnectionSource.value === "zookeeper" ? !!mqKafkaZooKeeperServers.value.trim() : !!mqKafkaBootstrapServers.value.trim();
@@ -3865,6 +3962,18 @@ function clearEditedConnectionErrorAfterSuccessfulTest() {
 
 function applyConnectionUrlToForm(input: string): boolean {
   try {
+    const update = parseConnectionDeepLinkUpdate(input);
+    if (update) {
+      if (update.connectionId !== editingId.value || props.editConfig?.one_time) throw new Error("Open the saved connection specified by this update link before applying it.");
+      const draft = applyConnectionDeepLinkUpdate(form.value, update);
+      applyingConnectionUpdate = true;
+      appliedConnectionUpdate = update;
+      form.value = draft;
+      finishApplyingConnectionUpdate();
+      resetTestState();
+      appliedConnectionUrlInput.value = input.trim();
+      return true;
+    }
     const draft = parseConnectionDeepLink(input) ?? parseServiceConnectionUrl(input);
     if (draft) {
       applyConnectionDraftToForm({ ...draft, oneTime: undefined });
@@ -3944,6 +4053,11 @@ function ensureConnectionHostResolvedFromUrl(): boolean {
 function formValueForSubmit(): Omit<ConnectionConfig, "id"> {
   const url = connectionUrlInput.value.trim();
   if (url && url !== appliedConnectionUrlInput.value) {
+    const update = parseConnectionDeepLinkUpdate(url);
+    if (update) {
+      if (update.connectionId !== editingId.value || props.editConfig?.one_time) throw new Error("Open the saved connection specified by this update link before applying it.");
+      return applyConnectionDeepLinkUpdate(form.value, update);
+    }
     const draft = parseConnectionDeepLink(url);
     if (draft) {
       return applyConnectionDraftToConfig(form.value, { ...draft, oneTime: undefined });
@@ -4061,11 +4175,12 @@ function connectionConfigForSshTunnelTest(id: string): ConnectionConfig {
 }
 
 function connectionConfigForSubmit(id: string, generatedName = "", validatePluginRequired = true): ConnectionConfig {
+  let config: LegacyConnectionConfig;
   if (isPluginConnection.value) {
     const entry = selectedPluginProvider.value;
     if (!entry) throw new Error(pluginLoadError.value || t("connection.pluginProviderUnavailable"));
     if (validatePluginRequired) {
-      const missingField = entry.contribution.fields.find((field) => field.required && !pluginFieldHasValue(field));
+      const missingField = entry.contribution.fields.find((field) => pluginFieldVisible(field) && pluginFieldRequired(field) && !pluginFieldHasValue(field));
       if (missingField) throw new Error(t("connection.pluginRequiredField", { field: missingField.label }));
     }
     const values = { ...pluginFormValues.value };
@@ -4073,10 +4188,46 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
       if (field.binding === "name") values[field.key] = form.value.name;
     }
     const existing = props.editConfig?.db_type === "plugin" && props.editConfig.plugin_id === entry.plugin.manifest.id && props.editConfig.plugin_connection_provider === entry.contribution.id ? props.editConfig : undefined;
-    const config = buildPluginConnectionConfig(entry.plugin.manifest.id, entry.contribution, values, existing);
-    return { ...formValueForSubmit(), ...config, id, name: form.value.name.trim() || generatedName.trim() || config.name, note: form.value.note?.trim() || undefined };
+    config = buildPluginConnectionConfig(entry.plugin.manifest.id, entry.contribution, values, existing) as LegacyConnectionConfig;
+    // buildPluginConnectionConfig already mirrored the provider's resolved
+    // connect_timeout_secs (declared default or advanced-form value) into the
+    // typed field; capture it before the generic form overwrite below.
+    const resolvedPluginConnectTimeout = pluginConnectionConnectTimeoutDefault(entry.contribution) === undefined ? undefined : config.connect_timeout_secs;
+    config.id = id;
+    config.name = form.value.name.trim() || config.name;
+    config.note = form.value.note;
+    config.color = form.value.color;
+    config.transport_layers = form.value.transport_layers || [];
+    config.connect_timeout_secs = form.value.connect_timeout_secs;
+    // buildPluginConnectionConfig rebuilds the config from scratch and drops
+    // the timeout inherit flags, so mirror the Advanced-tab radio state the
+    // same way the built-in branch keeps them via the form spread. Kept ahead
+    // of the resolvedPluginConnectTimeout override below, which intentionally
+    // forces connect inheritance off for providers declaring their own
+    // handshake timeout field.
+    config.connect_timeout_inherit = form.value.connect_timeout_inherit;
+    if (resolvedPluginConnectTimeout !== undefined) {
+      // A provider declaring its own connect_timeout_secs field makes it the
+      // single source of truth (declared default or advanced-form value): the
+      // typed timeout mirrors it, and the generic global/per-connection DBX
+      // timeout radios do not apply. Otherwise the host RPC deadline and the
+      // plugin's own handshake timeout could disagree and the host would kill
+      // slow connects first.
+      config.connect_timeout_secs = resolvedPluginConnectTimeout;
+      config.connect_timeout_inherit = false;
+    }
+    config.query_timeout_secs = form.value.query_timeout_secs;
+    config.query_timeout_inherit = form.value.query_timeout_inherit;
+    config.idle_timeout_secs = form.value.idle_timeout_secs;
+    config.keepalive_interval_secs = form.value.keepalive_interval_secs;
+    config.read_only = form.value.read_only;
+    config.save_password = form.value.save_password;
+    // 生产保护只拦截 SQL/数据编辑路径，插件连接走不到；表单已隐藏该区块，提交时清掉历史残留标志。
+    config.is_production = false;
+    config.production_databases = [];
+  } else {
+    config = { ...formValueForSubmit(), id } as LegacyConnectionConfig;
   }
-  const config = { ...formValueForSubmit(), id } as LegacyConnectionConfig;
   config.database_info = undefined;
   config.database = normalizeStoredConnectionDatabase(config.db_type, config.database);
   config.note = config.note?.trim() || undefined;
@@ -4085,6 +4236,12 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
   }
   if (!config.name?.trim()) {
     config.name = generatedName.trim() || generateConnectionName();
+  }
+  if (config.db_type === "xugu") {
+    config.database = config.database?.trim() || undefined;
+    if (!hasXuguConnectionDatabase(config.database, config.connection_string)) {
+      throw new Error(t("connection.xuguDatabaseRequired"));
+    }
   }
   if (config.db_type === "kingbase") {
     config.database = config.database?.trim() || undefined;
@@ -4276,7 +4433,7 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     config.password = config.password.trim();
     config.database = undefined;
   } else if (config.db_type === "sqlserver") {
-    config.external_config = sqlServerPortExplicitFromConfig(config) ? { portExplicit: true } : undefined;
+    if (!connectionUpdateExternalConfigPreserved(config)) config.external_config = sqlServerPortExplicitFromConfig(config) ? { portExplicit: true } : undefined;
   } else if (supportsGaussdbIdentifierQuoteStyle(config)) {
     const style = gaussdbIdentifierQuoteStyle(config);
     const targetServerType = gaussdbTargetServerType(config);
@@ -4286,7 +4443,10 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     setGaussdbTargetServerType(config, targetServerType);
     setGaussdbCountQueryDop(config, countQueryDop);
   } else if (config.db_type !== "plugin" && !isDoltDriverProfile(config.driver_profile)) {
-    config.external_config = undefined;
+    // Plugin connections keep `external_config`: the manifest-driven form
+    // fields land there via buildPluginConnectionConfig. Only the built-in
+    // drivers without an external-config payload get wiped here.
+    if (!connectionUpdateExternalConfigPreserved(config)) config.external_config = undefined;
   }
   if (config.db_type === "mongodb" && !mongoUseUrl.value) {
     config.connection_string = undefined;
@@ -4368,6 +4528,13 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     const scanSize = Number(config.redis_scan_page_size);
     config.redis_scan_page_size = Number.isFinite(scanSize) && scanSize >= REDIS_SCAN_PAGE_SIZE_MIN && scanSize <= REDIS_SCAN_PAGE_SIZE_MAX ? Math.round(scanSize) : REDIS_SCAN_PAGE_SIZE_DEFAULT;
     {
+      // A Redis database is a numeric index; dirty values (e.g. redis-cli flags
+      // pasted into the field) are stored as the index the backend connects with.
+      const database = normalizeRedisDatabaseValue(config.database);
+      config.database = database;
+      form.value.database = database || "";
+    }
+    {
       const templates = normalizeRedisKeyTemplates(redisKeyTemplatesText.value);
       config.redis_key_templates = templates.length > 0 ? templates : undefined;
       form.value.redis_key_templates = templates;
@@ -4382,12 +4549,6 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
       config.port = firstEndpoint.port;
     }
     config.database = undefined;
-    config.ca_cert_path = config.ca_cert_path?.trim() || "";
-    config.client_cert_path = config.client_cert_path?.trim() || "";
-    config.client_key_path = config.client_key_path?.trim() || "";
-    if ((config.client_cert_path && !config.client_key_path) || (!config.client_cert_path && config.client_key_path)) {
-      throw new Error(t("connection.etcdClientCertPairRequired"));
-    }
   }
   if (config.db_type === "etcd") {
     config.etcd_endpoints = normalizeEndpointLines(config.etcd_endpoints || "");
@@ -4402,12 +4563,38 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     if ((config.client_cert_path && !config.client_key_path) || (!config.client_cert_path && config.client_key_path)) {
       throw new Error(t("connection.etcdClientCertPairRequired"));
     }
-  } else if (form.value.db_type !== "consul" && config.db_type !== "zookeeper") {
+  } else if (config.db_type === "zookeeper") {
+    config.etcd_endpoints = undefined;
+    config.client_cert_path = config.client_cert_path?.trim() || "";
+    config.client_key_path = config.client_key_path?.trim() || "";
+    if ((config.client_cert_path && !config.client_key_path) || (!config.client_cert_path && config.client_key_path)) {
+      throw new Error(t("connection.etcdClientCertPairRequired"));
+    }
+  } else if (form.value.db_type !== "consul" && config.db_type !== "elasticsearch" && config.db_type !== "easysearch" && config.db_type !== "solr") {
     config.etcd_endpoints = undefined;
     config.client_cert_path = undefined;
     config.client_key_path = undefined;
   }
-  if (config.db_type !== "mysql" && config.db_type !== "clickhouse" && config.db_type !== "etcd" && config.db_type !== "consul" && config.db_type !== "starrocks" && config.db_type !== "mongodb" && config.db_type !== "victoriametrics" && config.db_type !== "zookeeper") {
+  if (config.db_type === "elasticsearch" || config.db_type === "easysearch" || config.db_type === "solr") {
+    config.client_cert_path = config.client_cert_path?.trim() || "";
+    config.client_key_path = config.client_key_path?.trim() || "";
+    if ((config.client_cert_path && !config.client_key_path) || (!config.client_cert_path && config.client_key_path)) {
+      throw new Error(t("connection.etcdClientCertPairRequired"));
+    }
+  }
+  if (
+    config.db_type !== "mysql" &&
+    config.db_type !== "clickhouse" &&
+    config.db_type !== "etcd" &&
+    config.db_type !== "consul" &&
+    config.db_type !== "starrocks" &&
+    config.db_type !== "mongodb" &&
+    config.db_type !== "victoriametrics" &&
+    config.db_type !== "zookeeper" &&
+    config.db_type !== "elasticsearch" &&
+    config.db_type !== "easysearch" &&
+    config.db_type !== "solr"
+  ) {
     config.ca_cert_path = undefined;
   } else {
     config.ca_cert_path = config.ca_cert_path?.trim() || "";
@@ -4518,6 +4705,8 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
   if (!config.show_system_schemas) config.show_system_schemas = undefined;
   if (config.visible_schemas && Object.keys(config.visible_schemas).length === 0) config.visible_schemas = undefined;
   if (config.agent_java_options && config.agent_java_options.length === 0) config.agent_java_options = undefined;
+  // Pasted credentials may carry invisible characters that trim() keeps (#9043).
+  sanitizeConnectionCredentials(config);
   return config as ConnectionConfig;
 }
 
@@ -4733,6 +4922,7 @@ function resetTestState() {
   isTesting.value = false;
   isTestingSshTunnel.value = false;
   testResult.value = null;
+  pluginActionStatus.value = null;
   clearTestedConnectionInfo();
   showConnectionErrorDialog.value = false;
   connectionErrorRawDetail.value = "";
@@ -5272,6 +5462,7 @@ function resetForm(options: { preservePickerState?: boolean } = {}) {
   selectedTransportLayerId.value = null;
   draggedTransportLayerId.value = null;
   selectedType.value = "mysql";
+  pluginFormValues.value = {};
   customDriverName.value = "";
   mongoUseUrl.value = false;
   resetMqFields();
@@ -5407,6 +5598,19 @@ watch(
       resetForm();
       if (props.prefillConfig) applyConnectionPrefill(props.prefillConfig);
     }
+    void loadInstalledPlugins().then(() => {
+      if (!open.value) return;
+      if (props.editConfig?.db_type === "plugin" && props.editConfig.plugin_id && props.editConfig.plugin_connection_provider) {
+        const entry = pluginProviderEntry(props.editConfig.plugin_id, props.editConfig.plugin_connection_provider);
+        if (entry) {
+          selectedType.value = pluginConnectionProviderOptionValue(props.editConfig.plugin_id, props.editConfig.plugin_connection_provider);
+          selectedDbCategory.value = "plugins";
+          pluginFormValues.value = pluginConnectionFormValues(entry.contribution, props.editConfig);
+        }
+      } else if (!props.prefillConfig) {
+        applyRequestedPluginProvider(props.pluginProvider);
+      }
+    });
     if (!props.prefillConfig?.oneTime) {
       void loadJdbcDrivers();
       void loadAgentDrivers();
@@ -5427,7 +5631,9 @@ watch(
     });
     // Preload database names so the summary count is accurate right away.
     void nextTick(() => {
-      if (canChooseVisibleDatabases.value && hasVisibleDatabaseFilter.value) {
+      // An external update may change the endpoint while retaining its saved
+      // password. Do not send credentials until the user tests or saves it.
+      if (!props.updatePrefill && canChooseVisibleDatabases.value && hasVisibleDatabaseFilter.value) {
         void preloadVisibleDatabaseNames();
       }
     });
@@ -5464,7 +5670,7 @@ watch([() => form.value.db_type, () => form.value.username], () => {
 watch(
   () => connectionConfigSnapshotForVisibleDatabases(),
   (current, previous) => {
-    if (!previous || !visibleObjectFiltersNeedReset(previous, current)) return;
+    if (applyingConnectionUpdate || !previous || !visibleObjectFiltersNeedReset(previous, current)) return;
     form.value.visible_databases = undefined;
     form.value.visible_schemas = undefined;
     resetVisibleDatabaseDraftState();
@@ -5695,83 +5901,84 @@ async function persistConnectionNoteVisibilityDraft() {
   await persistConnectionNoteVisibilityDraftState(connectionNoteVisibilityDraft, settingsStore.editorSettings.sidebarShowConnectionNotes, (value) => settingsStore.updateEditorSettingsAndPersist({ sidebarShowConnectionNotes: value }));
 }
 
-async function save(options: { connectAfterSave?: boolean; closeOnSuccess?: boolean } = {}) {
-  if (!ensureConnectionHostResolvedFromUrl()) return;
-  if (isSaving.value) return;
+function startSavedConnection(config: ConnectionConfig) {
+  emit("connectStarted", config.name);
+  void store
+    .connect(config)
+    .then(() => {
+      emit("connectSucceeded", config.name);
+    })
+    .catch((e: any) => {
+      const message = String(e?.message || e);
+      if (message.includes(CONNECTION_ATTEMPT_CANCELLED_MESSAGE)) return;
+      // Keep failed one-time connections available for retry and error inspection.
+      // They are still removed by connectionStore.disconnect after a successful session.
+      emit("connectFailed", appendConnectionErrorHints(config, mongodbAuthFailureHint(message), t));
+    });
+}
+
+function validateConnectionUpdateTarget() {
+  const update = props.updatePrefill ?? appliedConnectionUpdate;
+  if (!update) return;
+  const target = store.getConfig(update.connectionId);
+  resolveConnectionDeepLinkUpdate(update, target ? [target] : [], false);
+  if (editingId.value !== update.connectionId) throw new Error("The connection specified by the update link is no longer being edited.");
+}
+
+async function save(options: SaveConnectionOptions = {}): Promise<boolean> {
+  if (!ensureConnectionHostResolvedFromUrl()) return false;
+  if (isSaving.value) return false;
   if (!hasNacosNamespaceScopeForSave()) {
     testResult.value = null;
     await openVisibleNacosNamespacesPicker();
-    return;
+    return false;
   }
-  const connectAfterSave = options.connectAfterSave ?? (!editingId.value && form.value.db_type !== "jdbc");
+  const wasEditing = !!editingId.value;
+  const connectAfterSave = options.connectAfterSave ?? (!wasEditing && !isJdbcConnection.value);
   const closeOnSuccess = options.closeOnSuccess ?? true;
   const databaseInfoForSave = visibleTestDatabaseInfo.value ?? visibleSavedDatabaseInfo.value;
   isSaving.value = true;
   let connectionSaved = false;
   try {
+    let savedConfig: ConnectionConfig;
+    validateConnectionUpdateTarget();
     if (editingId.value) {
       const updated = withSavedDatabaseInfo(connectionConfigForSubmit(editingId.value), databaseInfoForSave);
       await ensureRequiredAgentDriverInstalled(updated);
       await ensureRequiredGaussdbMJdbcRuntime(updated);
+      validateConnectionUpdateTarget();
       await persistGlobalTimeoutDrafts();
       await store.updateConnection(updated);
+      savedConfig = updated;
       connectionSaved = true;
       await persistConnectionNoteVisibilityDraft();
-      store.stopEditing();
-      if (connectAfterSave) {
-        if (closeOnSuccess) {
-          open.value = false;
-          await nextTick();
-        }
-        emit("connectStarted", updated.name);
-        void store
-          .connect(updated)
-          .then(() => {
-            emit("connectSucceeded", updated.name);
-          })
-          .catch((e: any) => {
-            const message = String(e?.message || e);
-            if (message.includes(CONNECTION_ATTEMPT_CANCELLED_MESSAGE)) return;
-            emit("connectFailed", appendConnectionErrorHints(updated, mongodbAuthFailureHint(message), t));
-          });
-        return;
-      }
     } else {
       const config = withSavedDatabaseInfo(connectionConfigForSubmit(draftTestConnectionId.value), databaseInfoForSave);
       await ensureRequiredAgentDriverInstalled(config);
       await ensureRequiredGaussdbMJdbcRuntime(config);
       await persistGlobalTimeoutDrafts();
       await store.addConnection(config, selectedConnectionGroupId.value);
+      savedConfig = config;
       connectionSaved = true;
       await persistConnectionNoteVisibilityDraft();
       draftTestConnectionId.value = uuid();
-      if (!connectAfterSave) {
-        if (closeOnSuccess) open.value = false;
-        return;
-      }
-      if (closeOnSuccess) open.value = false;
-      await nextTick();
-      emit("connectStarted", config.name);
-      void store
-        .connect(config)
-        .then(() => {
-          emit("connectSucceeded", config.name);
-        })
-        .catch((e: any) => {
-          const message = String(e?.message || e);
-          if (message.includes(CONNECTION_ATTEMPT_CANCELLED_MESSAGE)) return;
-          // Keep failed one-time connections available for retry and error inspection.
-          // They are still removed by connectionStore.disconnect after a successful session.
-          emit("connectFailed", appendConnectionErrorHints(config, mongodbAuthFailureHint(message), t));
-        });
-      return;
     }
-    if (closeOnSuccess) open.value = false;
+    if (closeOnSuccess) {
+      if (wasEditing) store.stopEditing();
+      open.value = false;
+      await nextTick();
+    } else if (!wasEditing) {
+      editingId.value = savedConfig.id;
+      store.startEditing(savedConfig.id);
+    }
+    if (connectAfterSave && savedConfig.db_type !== "jdbc") startSavedConnection(savedConfig);
+    return true;
   } catch (e: any) {
     const cause = mongodbAuthFailureHint(String(e?.message || e));
     const message = connectionSaved ? t("connection.savedSettingsFailed", { message: cause }) : cause;
     testResult.value = { ok: false, message };
     showConnectionError(message);
+    return false;
   } finally {
     isSaving.value = false;
   }
@@ -6097,7 +6304,6 @@ async function loadSshConfigHosts() {
 async function loadAgentDrivers() {
   try {
     agentDrivers.value = await api.listInstalledAgentsLocal();
-    if (!settingsStore.editorSettings.updateNotificationsEnabled) return;
     api
       .listInstalledAgents()
       .then((drivers) => {
@@ -6210,7 +6416,7 @@ function openExternalUrl(url: string) {
               </div>
               <div class="connection-db-picker-search relative w-full sm:w-64">
                 <Search class="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                <Input v-model="dbSearchQuery" v-connection-dialog-auto-focus class="h-9 pl-8" :placeholder="t('connection.searchDatabasePlaceholder')" />
+                <Input data-connection-db-search v-model="dbSearchQuery" v-connection-dialog-auto-focus class="h-9 pl-8" :placeholder="t('connection.searchDatabasePlaceholder')" />
               </div>
             </div>
             <Button data-jdbc-connection-entry type="button" variant="outline" class="h-9 shrink-0 gap-2" @click="goToConnectionStep('jdbc')">
@@ -6424,7 +6630,15 @@ function openExternalUrl(url: string) {
                 </div>
 
                 <template v-if="isPluginConnection">
-                  <PluginConnectionFields v-if="selectedPluginProvider" :model-value="pluginFormValues" :contribution="selectedPluginProvider.contribution" :hidden-bindings="['name']" layout="connection-dialog" @update:model-value="updatePluginFormValues" />
+                  <PluginConnectionFields
+                    v-if="selectedPluginProvider"
+                    :model-value="pluginFormValues"
+                    :contribution="selectedPluginProvider.contribution"
+                    :hidden-bindings="['name']"
+                    layout="connection-dialog"
+                    :plugin-id="selectedPluginProvider.plugin.manifest.id"
+                    @update:model-value="updatePluginFormValues"
+                  />
                   <div v-else class="col-span-full rounded-lg border border-destructive/40 bg-destructive/5 p-4 text-sm text-destructive">
                     {{ pluginLoadError || t("connection.pluginProviderUnavailable") }}
                   </div>
@@ -7903,7 +8117,7 @@ function openExternalUrl(url: string) {
                       </div>
                     </div>
 
-                    <div v-if="form.db_type !== 'hbase' && form.db_type !== 'meilisearch' && form.db_type !== 'spanner'" class="grid grid-cols-4 items-center gap-4">
+                    <div v-if="form.db_type !== 'hbase' && form.db_type !== 'meilisearch' && form.db_type !== 'solr' && form.db_type !== 'spanner'" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ databaseLabel }}</Label>
                       <Input v-model="form.database" class="col-span-3" :placeholder="databasePlaceholder" />
                     </div>
@@ -8085,6 +8299,9 @@ function openExternalUrl(url: string) {
                         />
                         <p v-if="showGenericUrlParamsHint" class="text-xs leading-5 text-muted-foreground">
                           {{ t("connection.localInfilePathHint") }}
+                        </p>
+                        <p v-if="form.db_type === 'mysql'" class="text-xs leading-5 text-muted-foreground">
+                          {{ t("connection.sessionVariablesHint") }}
                         </p>
                       </div>
                     </div>
@@ -8344,7 +8561,7 @@ function openExternalUrl(url: string) {
                   </label>
                 </div>
 
-                <template v-if="form.db_type === 'etcd' || form.db_type === 'consul' || form.db_type === 'zookeeper'">
+                <template v-if="form.db_type === 'etcd' || form.db_type === 'consul' || form.db_type === 'zookeeper' || form.db_type === 'elasticsearch' || form.db_type === 'easysearch'">
                   <div class="grid grid-cols-4 items-start gap-4">
                     <Label :class="connectionLabelSmallPaddedClass">
                       <span class="inline-flex items-center justify-end gap-1">
@@ -8398,7 +8615,7 @@ function openExternalUrl(url: string) {
                         </Tooltip>
                       </div>
                       <p class="text-[11px] leading-4 text-muted-foreground">
-                        {{ t("connection.clientCertHint") }}
+                        {{ t("connection.etcdClientCertHint") }}
                       </p>
                     </div>
                   </div>
@@ -8881,7 +9098,11 @@ function openExternalUrl(url: string) {
                     <p class="text-xs leading-5 text-muted-foreground">{{ t("connection.etcdGrpcMaxInboundHint") }}</p>
                   </div>
                 </div>
-                <div class="grid grid-cols-4 items-center gap-4">
+                <!-- query_timeout_secs only feeds the database query pipeline
+                     (dataGrid/queryStore); plugin connections like SSH never
+                     consume it, so the generic radio would only suggest a
+                     budget the provider cannot honor. -->
+                <div v-if="!isPluginConnection" class="grid grid-cols-4 items-center gap-4">
                   <Label :class="connectionLabelSmallClass">{{ t("connection.queryTimeout") }}</Label>
                   <div class="col-span-3 grid grid-cols-2 gap-2">
                     <div class="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2 gap-y-1 rounded border px-2 py-1.5 sm:flex" :class="form.query_timeout_inherit === true ? 'border-primary/60 bg-background' : 'border-border bg-muted/30 text-muted-foreground'">
@@ -8944,7 +9165,7 @@ function openExternalUrl(url: string) {
                     </p>
                   </div>
                 </div>
-                <div class="grid grid-cols-4 items-start gap-4 rounded-[6px] border border-red-500/25 bg-red-500/[0.035] px-3 py-2.5">
+                <div v-if="!isPluginConnection" class="grid grid-cols-4 items-start gap-4 rounded-[6px] border border-red-500/25 bg-red-500/[0.035] px-3 py-2.5">
                   <Label :class="[connectionLabelSmallClass, 'pt-0.5 text-red-700 dark:text-red-300']">
                     <span class="inline-flex items-center justify-end gap-1"><ShieldAlert class="h-3.5 w-3.5" />PROD</span>
                   </Label>
@@ -9295,7 +9516,7 @@ function openExternalUrl(url: string) {
             <Button variant="outline" class="shrink-0" :disabled="isTesting || isTestingSshTunnel || isSaving" @click="testConnection">
               {{ isTesting ? t("connection.testing") : t("connection.test") }}
             </Button>
-            <Button class="shrink-0" @click="save" :disabled="isSaving || isTestingSshTunnel || !hasRequiredConnectionTarget">
+            <Button class="shrink-0" @click="save()" :disabled="isSaving || isTestingSshTunnel || !hasRequiredConnectionTarget">
               {{ isSaving ? t("common.loading") : editingId || isJdbcConnection ? t("connection.save") : t("connection.saveAndConnect") }}
             </Button>
           </template>

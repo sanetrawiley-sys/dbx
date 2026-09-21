@@ -22,14 +22,17 @@ function installBridge(channel) {
   };
   const decode = (value) => Uint8Array.from(atob(value), (c) => c.charCodeAt(0));
   const stream = async (method, params = {}, options = {}) => {
-    const streamId = options.streamId || (globalThis.crypto?.randomUUID?.() || "stream-" + Date.now() + "-" + (++sequence));
+    const streamId = options.streamId || globalThis.crypto?.randomUUID?.() || "stream-" + Date.now() + "-" + ++sequence;
     const closeMethod = options.closeMethod || "filesystem/stream/close";
     let removeListener;
     let closeRequested = false;
     let resolveOpen;
     let rejectOpen;
     const metadata = {};
-    const opened = new Promise((resolve, reject) => { resolveOpen = resolve; rejectOpen = reject; });
+    const opened = new Promise((resolve, reject) => {
+      resolveOpen = resolve;
+      rejectOpen = reject;
+    });
     const readable = new ReadableStream({
       start(controller) {
         const onEvent = (message) => {
@@ -37,7 +40,11 @@ function installBridge(channel) {
           const event = message.params || {};
           if (event.streamId !== streamId) return;
           if (message.method === "host.stream.chunk") {
-            try { controller.enqueue(decode(event.dataBase64 || "")); } catch (error) { controller.error(error); }
+            try {
+              controller.enqueue(decode(event.dataBase64 || ""));
+            } catch (error) {
+              controller.error(error);
+            }
             return;
           }
           removeListener?.();
@@ -53,7 +60,7 @@ function installBridge(channel) {
         };
         removeListener = () => listeners.event.delete(onEvent);
         listeners.event.add(onEvent);
-        request("backend.invoke", { method, params: { ...(params || {}), streamId }, timeoutMs: options.timeoutMs }).then(resolveOpen, (error) => {
+        request("backend.invoke", { method, params: { ...params, streamId }, timeoutMs: options.timeoutMs }).then(resolveOpen, (error) => {
           removeListener?.();
           removeListener = undefined;
           rejectOpen(error);
@@ -114,8 +121,15 @@ function installBridge(channel) {
       const asset = await request("ui.readAsset", { path });
       return URL.createObjectURL(new Blob([decode(asset.dataBase64)], { type: asset.contentType }));
     },
-    openWorkbench: (contributionId, context) => request("host.openWorkbench", { contributionId, context }),
+    openWorkbench: (contributionId, context, options) => request("host.openWorkbench", { contributionId, context, forceNew: !!(options && options.forceNew) }),
     openFilesystem: (providerId, context) => request("host.openFilesystem", { providerId, context }),
+    reopenConnection: (connectionId) => request("host.reopenConnection", { connectionId }),
+    copy: (text) => request("host.copy", { text }),
+    storage: {
+      get: (key) => request("host.storageGet", { key }),
+      set: (key, value) => request("host.storageSet", { key, value: value === undefined ? null : value }),
+      delete: (key) => request("host.storageDelete", { key }),
+    },
     onContext: (fn) => listen("context", fn),
     onEvent: (fn) => listen("event", fn),
     onBinary: (fn) => listen("binary", fn),

@@ -24,6 +24,7 @@ import { hexToRgba } from "@/lib/common/color";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
 import { formatShortcutDisplay } from "@/lib/editor/shortcutDisplay";
 import { resolveNextEditorToolbarTier, type EditorToolbarTier } from "@/lib/tabs/editorToolbarLayout";
+import { canSaveSqlTab } from "@/lib/tabs/sqlTabSaveTarget";
 import { looksLikeDmlStatement } from "@/lib/sql/dmlChangePreview";
 import { canFormatSqlForDatabaseType } from "@/lib/sql/sqlFormatter";
 import type { QueryTab, ConnectionConfig } from "@/types/database";
@@ -43,10 +44,10 @@ const props = defineProps<{
   txnAutoRolledBack?: boolean;
   /** Oracle-only: whether the current manual Oracle session executed a statement
    *  DBX cannot prove read-only. Commit/Rollback are hidden while false. */
-  oracleTxnPossiblyDirty?: boolean;
+  txnPossiblyDirty?: boolean;
   /** Oracle manual mode derived from the resolved database type (not raw
    *  db_type, which can be the agent transport). */
-  isOracleManualTransaction?: boolean;
+  stickyProvenReadOnlyState?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -84,39 +85,56 @@ const { databaseOptions, loadingDatabaseOptions, loadDatabaseOptions, catalogOpt
 const { loadSchemaOptions, getSchemaOptionsForDb, isLoadingSchemas, isSchemaAware } = useSchemaOptions();
 
 const toolbarRootRef = ref<HTMLElement | null>(null);
+const toolbarActionsRef = ref<HTMLElement | null>(null);
 const toolbarTier = ref<EditorToolbarTier>(0);
 // Available width when the current tier was condensed into; anchors the
 // step-down hysteresis so a static narrow layout cannot oscillate.
 const condensedAtWidth = ref(0);
 const expandedTierRequiredWidths: Partial<Record<EditorToolbarTier, number>> = {};
 let toolbarResizeObserver: ResizeObserver | undefined;
+let toolbarMeasureRaf = 0;
 
 function measureToolbarTier() {
-  const element = toolbarRootRef.value;
-  if (!element) {
+  const element = toolbarActionsRef.value;
+  const root = toolbarRootRef.value;
+  if (!element || !root) {
     return;
   }
+  const availableWidth = root.clientWidth;
+  // Use the stable full-row coordinate space, including the right controls.
+  // Tier-dependent helpers must not appear to grow the pane when they hide.
+  const contentWidth = element.scrollWidth + availableWidth - element.clientWidth;
   const next = resolveNextEditorToolbarTier({
     tier: toolbarTier.value,
-    availableWidth: element.clientWidth,
-    contentWidth: element.scrollWidth,
+    availableWidth,
+    contentWidth,
     condensedAtWidth: condensedAtWidth.value,
     expandedTierRequiredWidths,
   });
   if (next !== toolbarTier.value) {
     if (next > toolbarTier.value) {
       const currentTier = toolbarTier.value;
-      expandedTierRequiredWidths[currentTier] = Math.max(expandedTierRequiredWidths[currentTier] ?? 0, element.scrollWidth);
-      condensedAtWidth.value = element.clientWidth;
+      expandedTierRequiredWidths[currentTier] = Math.max(expandedTierRequiredWidths[currentTier] ?? 0, contentWidth);
+      condensedAtWidth.value = availableWidth;
     }
     toolbarTier.value = next;
   }
 }
 
+function scheduleToolbarMeasurement() {
+  if (toolbarMeasureRaf) {
+    return;
+  }
+  toolbarMeasureRaf = requestAnimationFrame(() => {
+    toolbarMeasureRaf = 0;
+    measureToolbarTier();
+  });
+}
+
 // Hiding or restoring controls changes the row content without resizing the
 // toolbar box, so every tier change re-measures until the row settles.
 watch(toolbarTier, () => {
-  void nextTick(measureToolbarTier);
+  void nextTick(scheduleToolbarMeasurement);
 });
 
 // The visible control set also changes with connection type and transaction
@@ -124,7 +142,7 @@ watch(toolbarTier, () => {
 watch(
   () => [props.activeConnection?.id, props.activeConnection?.db_type, props.txnSessionId, props.activeTab.isExecuting, props.activeTab.isExplaining] as const,
   () => {
-    void nextTick(measureToolbarTier);
+    void nextTick(scheduleToolbarMeasurement);
   },
 );
 
@@ -134,15 +152,19 @@ watch(
     toolbarResizeObserver?.disconnect();
     toolbarResizeObserver = undefined;
     if (element && typeof ResizeObserver !== "undefined") {
-      toolbarResizeObserver = new ResizeObserver(measureToolbarTier);
+      toolbarResizeObserver = new ResizeObserver(scheduleToolbarMeasurement);
       toolbarResizeObserver.observe(element);
     }
-    void nextTick(measureToolbarTier);
+    void nextTick(scheduleToolbarMeasurement);
   },
   { flush: "post" },
 );
 
 onUnmounted(() => {
+  if (toolbarMeasureRaf) {
+    cancelAnimationFrame(toolbarMeasureRaf);
+    toolbarMeasureRaf = 0;
+  }
   toolbarResizeObserver?.disconnect();
   toolbarResizeObserver = undefined;
 });
@@ -153,7 +175,10 @@ const activeCatalogs = computed(() => {
 });
 const activeCatalogNames = computed(() => activeCatalogs.value.map((catalog) => catalog.name));
 const catalogSelectorAvailable = computed(() => connectionIsDorisFamilyCatalogCapable(props.activeConnection) && queryCatalogSelectorVisible(activeCatalogs.value));
-const showCatalogSelector = computed(() => catalogSelectorAvailable.value && toolbarTier.value < 3);
+// Keep connection context controls mounted while the action group condenses.
+// Removing them changes the action group's available width and can make the
+// tier immediately expand again at the boundary, causing visible flicker.
+const showCatalogSelector = computed(() => catalogSelectorAvailable.value);
 const activeCatalogValue = computed(() => selectedQueryCatalogName(activeCatalogs.value, props.activeTab.catalog));
 const activeCatalogDatabaseKey = computed(() => (props.activeConnection && props.activeTab.catalog ? catalogDatabaseOptionsKey(props.activeConnection.id, props.activeTab.catalog) : ""));
 const activeDatabaseOptions = computed(() => {
@@ -184,6 +209,7 @@ const supportsExplain = computed(() => {
     dbType !== "elasticsearch" &&
     dbType !== "easysearch" &&
     dbType !== "meilisearch" &&
+    dbType !== "solr" &&
     dbType !== "qdrant" &&
     dbType !== "milvus" &&
     dbType !== "weaviate" &&
@@ -225,7 +251,7 @@ const explainAnalyzeTooltip = computed(() => {
   if (dbType === "sqlserver") return t("toolbar.actualPlan");
   return t("toolbar.autotrace");
 });
-const canSaveSql = computed(() => !!props.activeTab.externalSqlPath || !!props.activeTab.sql.trim());
+const canSaveSql = computed(() => canSaveSqlTab(props.activeTab));
 const keywordCaseIsLower = computed(() => props.sqlKeywordCase === "lower");
 const keywordCaseToggleTooltip = computed(() => (keywordCaseIsLower.value ? t("toolbar.keywordCaseUpper") : t("toolbar.keywordCaseLower")));
 const sqlSemanticDiagnosticsEnabled = computed(() => settingsStore.editorSettings.sqlSemanticDiagnosticsEnabled);
@@ -248,10 +274,11 @@ function toggleInsertValueHints() {
 const isTransactionActive = computed(() => !!props.txnSessionId);
 const isManualTransactionMode = computed(() => props.autoCommit === false || isTransactionActive.value);
 const transactionModeBadge = computed(() => (isManualTransactionMode.value ? "M" : "A"));
-// Oracle manual mode hides Commit/Rollback while the session is clean (no
-// unproven statement executed). Every other database keeps the existing rule.
+// Sticky proven-read-only dialects (Oracle/OceanBase-Oracle/MySQL/PostgreSQL)
+// hide Commit/Rollback while the session is clean (no unproven statement
+// executed). Every other database keeps the existing rule.
 const showTxnActions = computed(() => {
-  if (props.isOracleManualTransaction) return isTransactionActive.value && props.oracleTxnPossiblyDirty === true;
+  if (props.stickyProvenReadOnlyState) return isTransactionActive.value && props.txnPossiblyDirty === true;
   return isTransactionActive.value;
 });
 const transactionTooltip = computed(() => {
@@ -269,7 +296,7 @@ const executeButtonClass = computed(() => {
 const canMultiExecute = computed(() => {
   if (!supportsQueryExecution(props.activeConnection?.db_type)) return false;
   if (props.activeTab.isExecuting || props.activeTab.isExplaining || props.activeTab.isCancelling) return false;
-  if (props.autoCommit === false || isTransactionActive.value) return false;
+  if (isTransactionActive.value) return false;
   return !!props.executableSql.trim();
 });
 
@@ -277,7 +304,7 @@ const schemaSelectorAvailable = computed(() => {
   const connection = props.activeConnection;
   return connection && isSchemaAware(connection.id) && (props.activeTab.database || isSingleDb.value || hasDefaultDatabaseOption.value);
 });
-const showSchemaSelector = computed(() => schemaSelectorAvailable.value && toolbarTier.value < 3);
+const showSchemaSelector = computed(() => schemaSelectorAvailable.value);
 
 const activeSchemaOptions = computed(() => {
   const connection = props.activeConnection;
@@ -389,8 +416,8 @@ async function changeCatalog(selectedCatalog: string) {
 </script>
 
 <template>
-  <div ref="toolbarRootRef" class="app-editor-toolbar h-9 shrink-0 border-b bg-background/80 px-3 flex items-center gap-1 text-xs text-muted-foreground relative z-10 overflow-hidden" :style="toolbarStyle">
-    <div class="flex items-center gap-0.5">
+  <div ref="toolbarRootRef" class="app-editor-toolbar h-9 min-w-0 shrink-0 border-b bg-background/80 px-3 flex items-center gap-1 text-xs text-muted-foreground relative z-10 overflow-hidden" :style="toolbarStyle">
+    <div ref="toolbarActionsRef" class="min-w-0 flex flex-1 items-center gap-0.5 overflow-hidden">
       <Tooltip>
         <TooltipTrigger as-child>
           <Button
@@ -677,9 +704,8 @@ async function changeCatalog(selectedCatalog: string) {
         </Tooltip>
       </div>
     </div>
-    <span class="flex-1 min-w-0" />
-    <div class="flex min-w-0 items-center gap-2">
-      <div class="flex min-w-0 items-center gap-1">
+    <div class="flex shrink-0 items-center gap-2">
+      <div class="flex shrink-0 items-center gap-1">
         <span v-if="activeConnection?.color" class="h-4 w-1 rounded-full shrink-0" :style="{ backgroundColor: activeConnection.color }" />
         <ConnectionTreeSelect
           :model-value="activeConnectionValue"
@@ -703,7 +729,7 @@ async function changeCatalog(selectedCatalog: string) {
           </template>
         </ConnectionTreeSelect>
       </div>
-      <div v-if="showCatalogSelector" class="flex min-w-0 items-center gap-1">
+      <div v-if="showCatalogSelector" class="flex shrink-0 items-center gap-1">
         <SearchableSelect
           :model-value="activeCatalogValue"
           :options="activeCatalogNames"
@@ -733,6 +759,7 @@ async function changeCatalog(selectedCatalog: string) {
           activeConnection?.db_type !== 'elasticsearch' &&
           activeConnection?.db_type !== 'easysearch' &&
           activeConnection?.db_type !== 'meilisearch' &&
+          activeConnection?.db_type !== 'solr' &&
           activeConnection?.db_type !== 'qdrant' &&
           activeConnection?.db_type !== 'milvus' &&
           activeConnection?.db_type !== 'weaviate' &&
@@ -741,7 +768,7 @@ async function changeCatalog(selectedCatalog: string) {
           activeConnection?.db_type !== 'consul' &&
           !isSingleDb
         "
-        class="flex items-center gap-1"
+        class="flex shrink-0 items-center gap-1"
         :class="{ 'database-required-prompt': databaseRequiredVisible }"
       >
         <SearchableSelect
@@ -790,7 +817,7 @@ async function changeCatalog(selectedCatalog: string) {
           {{ isActiveDatabaseDefault ? t("editor.defaultDatabase") : t("editor.setDefaultDatabase") }}
         </Button>
       </div>
-      <div v-if="showSchemaSelector" class="flex min-w-0 items-center gap-1">
+      <div v-if="showSchemaSelector" class="flex shrink-0 items-center gap-1">
         <SearchableSelect
           :model-value="activeSchemaValue"
           :options="activeSchemaOptions.length ? activeSchemaOptions : activeSchemaValue ? [activeSchemaValue] : []"

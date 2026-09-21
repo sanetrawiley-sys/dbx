@@ -144,12 +144,15 @@ async fn live_postgres_all_schema_export_restores_one_sql_file() {
     execute_sql_file_path(
         &state,
         &SqlFileRequest {
+            txn_session_id: None,
             execution_id: format!("postgres-all-schema-import-{suffix}"),
             connection_id: target_connection_id.clone(),
             database: target_database.clone(),
             file_path: export_path.display().to_string(),
             continue_on_error: false,
             selected_tables: None,
+            part_cooldown_ms: 0,
+            skip_relational_constraints: false,
         },
         &export_path,
         CancellationToken::new(),

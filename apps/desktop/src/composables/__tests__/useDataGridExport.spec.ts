@@ -75,6 +75,8 @@ function createMongoExportState(options: {
   contextColumn?: number;
   syntheticContext?: boolean;
   fullExportResult?: UseDataGridExportOptions["fullExportResult"];
+  hasCompleteLocalResult?: UseDataGridExportOptions["hasCompleteLocalResult"];
+  completeLocalResult?: UseDataGridExportOptions["completeLocalResult"];
   externalCellValue?: UseDataGridExportOptions["externalCellValue"];
 }) {
   const items = options.items ?? [options.item];
@@ -106,6 +108,8 @@ function createMongoExportState(options: {
     selectedRowIds: ref(selectedRowIds),
     hasRowSelection: computed(() => selectedRowIds.size > 0),
     fullExportResult: options.fullExportResult,
+    hasCompleteLocalResult: options.hasCompleteLocalResult,
+    completeLocalResult: options.completeLocalResult,
     externalCellValue: options.externalCellValue,
   };
   return useDataGridExport(state);
@@ -965,6 +969,32 @@ describe("useDataGridExport prepared row statements", () => {
     expect(state.canCopyWithExtractor("sql-inserts")).toBe(false);
   });
 
+  it("recognizes PostgreSQL serial primary keys when excluding primary keys", () => {
+    const serialTable: DataGridTableMeta = {
+      tableName: "users",
+      primaryKeys: ["id"],
+      columns: [
+        {
+          name: "id",
+          data_type: "integer",
+          is_nullable: false,
+          is_primary_key: true,
+          extra: "serial",
+        },
+        { name: "name", data_type: "text", is_nullable: false },
+      ],
+    };
+    const matrix: CellSelectionMatrix = { rowIndexes: [0], columnIndexes: [0], columns: ["id"], rows: [[1]] };
+    const excludePrimaryKeys = {
+      ...DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS,
+      sql: { ...DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS.sql, excludePrimaryKeysFromInsert: true },
+    };
+
+    const state = createExportState(serialTable, ["id"], matrix, [1], undefined, undefined, [], excludePrimaryKeys);
+
+    expect(state.canCopyWithExtractor("sql-inserts")).toBe(false);
+  });
+
   it("keeps a manually-assigned primary key insertable under primary-key exclusion", () => {
     const compositeKeyTable: DataGridTableMeta = {
       tableName: "daily_stats",
@@ -1564,6 +1594,58 @@ describe("useDataGridExport prepared row statements", () => {
     expect(exportQueryResultCsv).toHaveBeenLastCalledWith(expect.any(String), ["_id", "value"], [["1", reservedString]], expect.anything());
   });
 
+  it("exports only visible Mongo columns from the full result set", async () => {
+    setActivePinia(createPinia());
+    const state = createMongoExportState({
+      columns: ["name"],
+      item: { ...row(["Visible"]), sourceIndex: 0 },
+      mongoDocuments: [{ _id: "1", name: "Visible", secret: "hidden" }],
+      fullExportResult: async () => ({
+        columns: ["_id", "name", "secret"],
+        column_types: ["", "varchar", "varchar"],
+        rows: [
+          ["1", "Visible", "hidden"],
+          ["2", "Other", "hidden-too"],
+        ],
+        affected_rows: 2,
+        execution_time_ms: 1,
+      }),
+    });
+
+    await state.exportCsv();
+
+    expect(exportQueryResultCsv).toHaveBeenLastCalledWith(expect.any(String), ["name"], [["Visible"], ["Other"]], expect.anything());
+  });
+
+  it("applies visible Mongo columns when the complete result is already local", async () => {
+    setActivePinia(createPinia());
+    const completeLocalResult = {
+      columns: ["_id", "name", "secret"],
+      column_types: ["", "varchar", "varchar"],
+      rows: [
+        ["1", "Visible", "hidden"],
+        ["2", "Other", "hidden-too"],
+      ],
+      mongo_copy_documents: [
+        { _id: "1", name: "Visible", secret: "hidden" },
+        { _id: "2", name: "Other", secret: "hidden-too" },
+      ],
+      affected_rows: 2,
+      execution_time_ms: 1,
+    };
+    const state = createMongoExportState({
+      columns: ["name"],
+      item: { ...row(["Visible"]), sourceIndex: 0 },
+      mongoDocuments: [completeLocalResult.mongo_copy_documents[0]],
+      hasCompleteLocalResult: computed(() => true),
+      completeLocalResult: computed(() => completeLocalResult),
+    });
+
+    await state.exportCsv();
+
+    expect(exportQueryResultCsv).toHaveBeenLastCalledWith(expect.any(String), ["name"], [["Visible"], ["Other"]], expect.anything());
+  });
+
   it("exports missing Mongo fields as null while retaining explicit empty strings", async () => {
     const columns = ["_id", "missing", "nullable", "empty"];
     const document = { _id: "1", nullable: null, empty: "" };
@@ -1644,14 +1726,14 @@ describe("useDataGridExport VARBINARY 文本复制 (#7471)", () => {
     expect(parseDataGridClipboard("abc")).toEqual([["0x616263"]]);
   });
 
-  it("非文本 VARBINARY 保持 0x/hex，避免破坏任意 bytes", async () => {
+  it("恰好构成合法 GBK 序列的 VARBINARY 按解码文本复制（与网格显示一致）", async () => {
     const matrix: CellSelectionMatrix = { rowIndexes: [0], columnIndexes: [1], columns: ["name"], rows: [["0xdeadbeef"]] };
-    vi.mocked(extractDataGridSelection).mockResolvedValueOnce({ text: "0xdeadbeef", mimeType: "text/plain", fileExtension: "txt", rowCount: 1, columnCount: 1 });
+    vi.mocked(extractDataGridSelection).mockResolvedValueOnce({ text: "蕲撅", mimeType: "text/plain", fileExtension: "txt", rowCount: 1, columnCount: 1 });
     const state = createExportState(varbinTable, ["id", "name"], matrix, [1, "0xdeadbeef"]);
 
     await expect(state.copyWithPreference("smart")).resolves.toBe(true);
 
-    expect(extractDataGridSelection).toHaveBeenCalledWith(expect.objectContaining({ extractor: "raw", rows: [["0xdeadbeef"]] }));
+    expect(extractDataGridSelection).toHaveBeenCalledWith(expect.objectContaining({ extractor: "raw", rows: [["蕲撅"]] }));
   });
 
   it("多选 TSV 复制同样对文本型 VARBINARY 解码", async () => {
@@ -1702,12 +1784,12 @@ describe("useDataGridExport VARBINARY 文本复制 (#7471)", () => {
     expect(extractDataGridSelection).not.toHaveBeenCalled();
   });
 
-  it("右键「复制单元格」对非文本 VARBINARY 保持 0x/hex", async () => {
+  it("右键「复制单元格」对 GBK 可解码 VARBINARY 复制解码文本", async () => {
     const state = createExportState(varbinTable, ["id", "name"], undefined, [1, "0xdeadbeef"], undefined, undefined, [], DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS, false, undefined, false, 1, 1);
 
     await state.copyCell();
 
-    expect(copyToClipboard).toHaveBeenCalledWith("0xdeadbeef");
+    expect(copyToClipboard).toHaveBeenCalledWith("蕲撅");
   });
 
   it("复制整行 JSON 时呈现文本型 VARBINARY", async () => {

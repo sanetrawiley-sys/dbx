@@ -402,25 +402,8 @@ pub async fn get_custom_type_details(
     Ok(Json(result))
 }
 
-const OBJECT_METADATA_CACHE_PREFIX: &str = "object-meta:v1";
-
-fn metadata_cache_segment(value: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')' => {
-                encoded.push(byte as char)
-            }
-            _ => {
-                encoded.push('%');
-                encoded.push(HEX[(byte >> 4) as usize] as char);
-                encoded.push(HEX[(byte & 0x0f) as usize] as char);
-            }
-        }
-    }
-    encoded
-}
+pub(crate) use dbx_core::object_cache::object_metadata_cache_prefix;
+use dbx_core::object_cache::{metadata_cache_segment, OBJECT_METADATA_CACHE_PREFIX};
 
 fn metadata_cache_key(
     connection_id: &str,
@@ -441,15 +424,6 @@ fn metadata_cache_key(
         String::new(),
     ]
     .join(":")
-}
-
-pub(crate) fn object_metadata_cache_prefix(connection_id: &str, database: &str) -> String {
-    format!(
-        "{}:{}:{}:",
-        OBJECT_METADATA_CACHE_PREFIX,
-        metadata_cache_segment(connection_id),
-        metadata_cache_segment(database)
-    )
 }
 
 fn decode_metadata_cache<T: DeserializeOwned>(value: serde_json::Value) -> Option<T> {
@@ -724,6 +698,19 @@ pub async fn get_table_partition_status(
     let schema = q.schema.as_deref().unwrap_or("");
     let table = q.table.as_deref().unwrap_or("");
     dbx_core::schema::table_partition_status_core(&state.app, &q.connection_id, database, schema, table)
+        .await
+        .map(Json)
+        .map_err(AppError::from)
+}
+
+pub async fn get_table_partitioning(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<SchemaQuery>,
+) -> Result<Json<dbx_core::db::PgTablePartitioning>, AppError> {
+    let database = q.database.as_deref().unwrap_or("");
+    let schema = q.schema.as_deref().unwrap_or("");
+    let table = q.table.as_deref().unwrap_or("");
+    dbx_core::schema::get_table_partitioning_core(&state.app, &q.connection_id, database, schema, table)
         .await
         .map(Json)
         .map_err(AppError::from)
