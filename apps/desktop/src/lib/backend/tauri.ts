@@ -36,7 +36,7 @@ function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> 
 
 import type { MigrationPreflight, MigrationReport } from "./migration";
 export type { MigrationPreflight, MigrationReport } from "./migration";
-export const migrationStatus = (): Promise<MigrationPreflight> => invoke("migration_status");
+export const migrationStatus = (retry = false): Promise<MigrationPreflight> => invoke("migration_status", { retry });
 export const migrationStart = (): Promise<MigrationReport> => invoke("migration_start");
 export const migrationRetry = (): Promise<MigrationReport> => invoke("migration_retry");
 export const migrationCleanupBackups = (): Promise<void> => invoke("migration_cleanup_backups");
@@ -122,6 +122,7 @@ import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
 import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
 import type {
   ActivePluginSession,
+  ConnectionLivenessMessage,
   PluginBinaryEvent,
   PluginConnectionActionResult,
   PluginEvent,
@@ -389,6 +390,55 @@ export interface WebDavSyncSummary {
   appVersion?: string;
 }
 
+export interface SyncCatalogItem {
+  id: string;
+  label: string;
+}
+
+export interface PluginUiStorageItemRef {
+  pluginId: string;
+  key: string;
+  pluginName?: string;
+}
+
+export interface SyncSelection {
+  connections?: string[];
+  connectionSecrets?: string[];
+  tunnelProfiles?: string[];
+  tunnelSecrets?: string[];
+  savedSqlFolders?: string[];
+  savedSqlFiles?: string[];
+  desktopSettings?: string[];
+  editorSettings?: string[];
+  aiConfigs?: string[];
+  pluginUiStorage?: PluginUiStorageItemRef[];
+  sidebarLayout?: boolean;
+  pinnedTreeNodeIds?: boolean;
+  includeSecrets: boolean;
+  syncCredentials: boolean;
+}
+
+export interface SyncSnapshotCatalog {
+  exportedAt: string;
+  appVersion: string;
+  hasEncryptedSecrets: boolean;
+  connections: SyncCatalogItem[];
+  connectionSecrets: string[];
+  tunnelProfiles: SyncCatalogItem[];
+  tunnelSecrets: string[];
+  savedSqlFolders: SyncCatalogItem[];
+  savedSqlFiles: SyncCatalogItem[];
+  desktopSettings: SyncCatalogItem[];
+  editorSettings: SyncCatalogItem[];
+  aiConfigs: SyncCatalogItem[];
+  aiConfigsLocked: boolean;
+  pluginUiStorage: PluginUiStorageItemRef[];
+  pluginUiStorageLocked: boolean;
+  hasSidebarLayout: boolean;
+  hasPinnedTreeNodeIds: boolean;
+  selection?: SyncSelection;
+}
+
 export interface WebDavDownloadResult {
   summary: WebDavSyncSummary;
   editorSettings?: unknown;
@@ -397,6 +447,16 @@ export interface WebDavDownloadResult {
     encryptedSecretsPresent: boolean;
     secretsApplied: boolean;
   };
+}
+
+export interface LocalBackupImportResult {
+  editorSettings?: unknown;
+  desktopSettings: DesktopSettings;
+  applySummary: WebDavDownloadResult["applySummary"];
+}
+
+export interface LocalBackupExportSummary {
+  bytes: number;
 }
 
 export interface WebDavPasswordStatus {
@@ -479,6 +539,7 @@ export interface QueryPaginationExecutionPlan {
   exactQueryRowBound?: number;
   useAgentResultSession: boolean;
   paginationRowNumberColumn?: string;
+  paginationError?: string;
 }
 
 export type QuerySortDirection = "asc" | "desc";
@@ -1061,17 +1122,38 @@ export async function forgetWebdavSyncSecretsPassphrase(): Promise<void> {
   return invoke("forget_webdav_sync_secrets_passphrase");
 }
 
-export async function webdavSyncUpload(config: WebDavConfig, editorSettings?: unknown, secretsPassphrase?: string, includeSecrets = false): Promise<WebDavSyncSummary> {
+export async function cloudSyncLocalCatalog(editorSettings?: unknown): Promise<SyncSnapshotCatalog> {
+  return invoke("cloud_sync_local_catalog", { editorSettings });
+}
+
+export async function localBackupExport(path: string, editorSettings: unknown, secretsPassphrase: string | undefined, selection: SyncSelection): Promise<LocalBackupExportSummary> {
+  return invoke("local_backup_export", { path, editorSettings, secretsPassphrase, selection });
+}
+
+export async function localBackupInspect(path: string, secretsPassphrase?: string): Promise<SyncSnapshotCatalog> {
+  return invoke("local_backup_inspect", { path, secretsPassphrase });
+}
+
+export async function localBackupImport(path: string, secretsPassphrase: string | undefined, restoreSecrets: boolean, selection: SyncSelection): Promise<LocalBackupImportResult> {
+  return invoke("local_backup_import", { path, secretsPassphrase, restoreSecrets, selection });
+}
+
+export async function webdavSyncInspect(config: WebDavConfig, secretsPassphrase?: string): Promise<SyncSnapshotCatalog> {
+  return invoke("webdav_sync_inspect", { config, secretsPassphrase });
+}
+
+export async function webdavSyncUpload(config: WebDavConfig, editorSettings?: unknown, secretsPassphrase?: string, includeSecrets = false, selection?: SyncSelection): Promise<WebDavSyncSummary> {
   return invoke("webdav_sync_upload", {
     config,
     editorSettings,
     secretsPassphrase,
     includeSecrets,
+    selection,
   });
 }
 
-export async function webdavSyncDownload(config: WebDavConfig, secretsPassphrase?: string, restoreSecrets = true): Promise<WebDavDownloadResult> {
-  return invoke("webdav_sync_download", { config, secretsPassphrase, restoreSecrets });
+export async function webdavSyncDownload(config: WebDavConfig, secretsPassphrase?: string, restoreSecrets = true, selection?: SyncSelection): Promise<WebDavDownloadResult> {
+  return invoke("webdav_sync_download", { config, secretsPassphrase, restoreSecrets, selection });
 }
 
 export async function snippetSyncTest(config: SnippetSyncConfig): Promise<void> {
@@ -1102,18 +1184,23 @@ export async function retrySnippetLegacyCleanup(config: SnippetSyncConfig): Prom
   return invoke("retry_snippet_legacy_cleanup", { config });
 }
 
-export async function snippetSyncUpload(config: SnippetSyncConfig, editorSettings?: unknown, snippetPassphrase?: string, includeSecrets = false, secretsPassphrase?: string): Promise<SnippetSyncSummary> {
+export async function snippetSyncInspect(config: SnippetSyncConfig, snippetPassphrase?: string, secretsPassphrase?: string): Promise<SyncSnapshotCatalog> {
+  return invoke("snippet_sync_inspect", { config, snippetPassphrase, secretsPassphrase });
+}
+
+export async function snippetSyncUpload(config: SnippetSyncConfig, editorSettings?: unknown, snippetPassphrase?: string, includeSecrets = false, secretsPassphrase?: string, selection?: SyncSelection): Promise<SnippetSyncSummary> {
   return invoke("snippet_sync_upload", {
     config,
     editorSettings,
     snippetPassphrase,
     includeSecrets,
     secretsPassphrase,
+    selection,
   });
 }
 
-export async function snippetSyncDownload(config: SnippetSyncConfig, snippetPassphrase?: string, restoreSecrets = false, secretsPassphrase?: string): Promise<SnippetDownloadResult> {
-  return invoke("snippet_sync_download", { config, snippetPassphrase, restoreSecrets, secretsPassphrase });
+export async function snippetSyncDownload(config: SnippetSyncConfig, snippetPassphrase?: string, restoreSecrets = false, secretsPassphrase?: string, selection?: SyncSelection): Promise<SnippetDownloadResult> {
+  return invoke("snippet_sync_download", { config, snippetPassphrase, restoreSecrets, secretsPassphrase, selection });
 }
 
 export async function loadPinnedTreeNodeIds(): Promise<string[]> {
@@ -1254,6 +1341,13 @@ export interface AiChatMessage {
   failed?: boolean;
   /** Target frozen when this assistant turn started, retained for confirmation. */
   sourceBinding?: import("@/lib/ai/aiConversationBinding").AiConversationBinding;
+  /**
+   * Footprint of a turn that carried a context selection (#10058). The selection
+   * text is never persisted (it can be 12 000 chars and records are
+   * cloud-synced), so this boolean is all a reloaded transcript has left to say
+   * the turn was not empty. Absent on records written before the field existed.
+   */
+  selectionsOmitted?: boolean;
 }
 
 export interface AiConversation {
@@ -1469,6 +1563,17 @@ export async function replaceNacosSessionCredential(connectionId: string, userna
 
 export async function checkConnectionHealth(connectionId: string): Promise<void> {
   return invokeBackend("check_connection_health", { connectionId });
+}
+
+/**
+ * Read-only counterpart of `checkConnectionHealth`: reports whether the connection still has a
+ * pool, without probing or mutating anything (#4339).
+ *
+ * Liveness events must be confirmed through this, never through `checkConnectionHealth`: the
+ * latter removes unhealthy pools and is the path `ensureConnected` uses to trigger a reconnect.
+ */
+export async function connectionIsOpen(connectionId: string): Promise<boolean> {
+  return invokeBackend("connection_is_open", { connectionId });
 }
 
 export async function prewarmConnection(connectionId: string, database?: string, catalog?: string, clientSessionId?: string): Promise<void> {
@@ -2644,6 +2749,8 @@ export interface PluginLocalFileHandle {
   size: number;
   contentType: string;
   write: boolean;
+  /** Only for files expanded out of a dropped folder: '/'-separated path relative to the dropped folder root. */
+  relativePath?: string;
 }
 
 export interface PluginLocalFileChunk {
@@ -2657,8 +2764,29 @@ export interface PluginLocalFileWriteResult {
   nextOffset: number;
 }
 
-export async function openPluginLocalFile(pluginId: string, path: string, write: boolean): Promise<PluginLocalFileHandle> {
-  return invoke("plugin_file_open", { pluginId, path, write });
+// The native open/save dialogs run on the Rust side: the host never passes
+// paths into the plugin-file registry, it only receives handles for what the
+// user picked. Only the OS drop flow goes through openDroppedPluginLocalFiles:
+// the Rust command accepts exactly the paths its own drop pipeline granted to
+// this webview (one open attempt per granted path); a granted folder expands
+// to its contained files on the Rust side, and `truncated` flags any cap
+// cutoff so partial delivery is visible to the plugin.
+export interface PluginDroppedFilesResult {
+  dropId: string;
+  files: PluginLocalFileHandle[];
+  truncated: boolean;
+}
+
+export async function openDroppedPluginLocalFiles(pluginId: string, paths: string[]): Promise<PluginDroppedFilesResult> {
+  return invoke("plugin_file_open_dropped", { pluginId, paths });
+}
+
+export async function pickPluginLocalFiles(pluginId: string, multiple: boolean): Promise<PluginLocalFileHandle[]> {
+  return invoke("plugin_file_pick_files", { pluginId, multiple });
+}
+
+export async function savePluginLocalFileAs(pluginId: string, defaultFileName: string): Promise<PluginLocalFileHandle | null> {
+  return invoke("plugin_file_save_as", { pluginId, defaultFileName });
 }
 
 export async function readPluginLocalFileChunk(pluginId: string, handleId: string, offset: number, length?: number): Promise<PluginLocalFileChunk> {
@@ -2736,6 +2864,16 @@ export async function subscribePluginEvents(onEvent: (event: PluginEvent) => voi
     unlistenEvent();
     unlistenBinary();
   };
+}
+
+/**
+ * Subscribe to backend connection-liveness messages (#4339).
+ *
+ * The listener receives the message unwrapped; the web transport's SSE handler parses the same
+ * shape, so the store can stay transport-agnostic.
+ */
+export async function subscribeConnectionLiveness(onEvent: (event: ConnectionLivenessMessage) => void): Promise<UnlistenFn> {
+  return listen<ConnectionLivenessMessage>("dbx-connection-liveness", (event) => onEvent(event.payload));
 }
 
 export async function listJdbcDrivers(): Promise<JdbcDriverInfo[]> {
@@ -3295,6 +3433,10 @@ export async function redisScanValues(connectionId: string, db: number, cursor: 
 
 export async function redisGetValue(connectionId: string, db: number, keyRaw: string): Promise<RedisValue> {
   return invoke("redis_get_value", { connectionId, db, keyRaw });
+}
+
+export async function redisGetRawValue(connectionId: string, db: number, keyRaw: string): Promise<RedisBlob> {
+  return invoke("redis_get_raw_value", { connectionId, db, keyRaw });
 }
 
 export async function redisGetTtl(connectionId: string, db: number, keyRaw: string): Promise<number> {
@@ -5204,6 +5346,7 @@ export interface SqlFileRequest {
   executionId: string;
   connectionId: string;
   database: string;
+  schema?: string;
   filePath: string;
   continueOnError: boolean;
   txnSessionId?: string;
@@ -5307,13 +5450,32 @@ export interface TransferRequest {
   dropTargetConfirmed: boolean;
 }
 
+export interface TransferStructurePreviewTable {
+  sourceTable: string;
+  targetTable: string;
+  /** The target table already exists, so this transfer plans no structure DDL for it. */
+  preexisting: boolean;
+  sql: string;
+}
+
+export interface TransferStructurePreview {
+  sql: string;
+  tables: TransferStructurePreviewTable[];
+}
+
 export interface TransferOwnershipPreview {
   missingOwners: string[];
   targetOwner: string;
   rebuild?: {
     sql: string;
     tables: Array<{ sourceTable: string; targetTable: string; backupTable?: string }>;
+    /** The rename phase on its own, so the structure plan can sit between rename and cleanup. */
+    backupSql?: string;
+    /** The drop-backups phase on its own. */
+    cleanupSql?: string;
   };
+  /** Structure-plan preview: present for structure-only transfers. */
+  structure?: TransferStructurePreview;
 }
 
 export interface TransferProgress {
@@ -5384,7 +5546,7 @@ export type TableImportMode = "append" | "truncate";
 export type TableImportConflictPolicy = "error" | "skip" | "updateExisting";
 export type TableImportStatus = "running" | "done" | "error" | "cancelled";
 export type TableImportPhase = "preparing" | "detectingEncoding" | "reading" | "writing" | "finalizing" | "done";
-export type TableImportSourceFormat = "csv" | "tsv" | "delimited" | "json" | "excel" | "sql";
+export type TableImportSourceFormat = "csv" | "tsv" | "delimited" | "json" | "excel" | "sql" | "parquet";
 export type TableImportJsonShape = "auto" | "objects" | "arrays";
 export type TableImportTextEncoding = "auto" | "utf8" | "gbk" | "utf16Le" | "utf16Be";
 
@@ -5396,6 +5558,7 @@ export interface TableImportColumnMapping {
 
 export interface TableImportParseOptions {
   delimiter?: string | null;
+  decimalSeparator?: string | null;
   encoding?: TableImportTextEncoding | null;
   hasHeader?: boolean | null;
   titleRow?: number | null;
@@ -5403,6 +5566,8 @@ export interface TableImportParseOptions {
   lastDataRow?: number | null;
   trimValues?: boolean | null;
   emptyStringAsNull?: boolean | null;
+  /** 分隔文本里代表 NULL 的字面量。缺省表示用后端默认值 `\N`；空串表示关闭字面量，退回「空字段即 NULL」。 */
+  nullLiteral?: string | null;
   sheetName?: string | null;
   sheetIndex?: number | null;
   jsonShape?: TableImportJsonShape | null;
@@ -5411,6 +5576,8 @@ export interface TableImportParseOptions {
 
 export interface TableImportPreviewRequest {
   filePath: string;
+  connectionId?: string | null;
+  database?: string | null;
   sourceRef?: string | null;
   sourceFormat?: TableImportSourceFormat | null;
   parseOptions?: TableImportParseOptions | null;
@@ -5750,10 +5917,12 @@ export interface DatabaseExportRequest {
   includeCreateDatabase?: boolean;
   dropTableIfExists?: boolean;
   omitAutoIncrement?: boolean;
+  preserveOriginalLanguage?: boolean;
   failOnError?: boolean;
   preventOverwrite?: boolean;
   outputCompression?: "none" | "gzip";
   insertDialect?: SqlInsertDialect;
+  insertMode?: "batch" | "single";
   snapshotSessionId?: string;
   batchSize: number;
   splitMaxMb?: number;
@@ -5796,6 +5965,8 @@ export interface TableExportRequest {
   insertMode?: SqlInsertMode;
   insertDialect?: SqlInsertDialect;
   csvQuoteMode?: CsvQuoteMode;
+  /** CSV 里 NULL 写成什么。缺省表示用后端默认值 `\N`；空串表示关闭字面量。 */
+  nullLiteral?: string;
   columns?: string[];
   selectedColumns?: SqlExportColumnSelection[];
   columnTypes?: Array<string | null | undefined>;
@@ -5814,6 +5985,11 @@ export interface TableExportRequest {
   numericColumnRightAlign?: boolean;
   autoFilter?: boolean;
   splitMaxMb?: number;
+  /**
+   * SQL 导出时省略 INSERT 目标的库/模式限定（前端按「生成 SQL 时包含数据库名」设置 +
+   * `dropsSchemaQualifier` 引擎规则解析；仅影响 INSERT 目标，读取 SQL 不变）。
+   */
+  omitDatabaseQualifier?: boolean;
 }
 
 export interface TableCsvExportOptions {
@@ -5826,6 +6002,8 @@ export interface TableCsvExportOptions {
   pageSize?: number;
   timeoutSecs?: number;
   csvQuoteMode?: CsvQuoteMode;
+  /** CSV 里 NULL 写成什么。缺省表示用后端默认值 `\N`；空串表示关闭字面量。 */
+  nullLiteral?: string;
 }
 
 export interface TableExportProgress {
@@ -5852,6 +6030,8 @@ export interface QueryResultExportRequest {
   format: "csv" | "xlsx" | "json" | "txt" | "sql";
   insertMode?: SqlInsertMode;
   csvQuoteMode?: CsvQuoteMode;
+  /** CSV 里 NULL 写成什么。缺省表示用后端默认值 `\N`；空串表示关闭字面量。 */
+  nullLiteral?: string;
   includeSqlSheet?: boolean;
   pageSize: number;
   rowLimit?: number | null;
@@ -5972,6 +6152,10 @@ export async function cancelQueryResultExport(exportId: string, executionId?: st
   });
 }
 
+export async function createQueryResultTempFile(extension = "xlsx"): Promise<string> {
+  return invoke("create_query_result_temp_file", { extension });
+}
+
 export async function beginDatabaseBackupSnapshot(connectionId: string, database: string, exportId?: string): Promise<DatabaseBackupSnapshot> {
   return invoke("begin_database_backup_snapshot", { connectionId, database, exportId: exportId || null });
 }
@@ -6009,13 +6193,14 @@ export async function recordDatabaseExportDestination(directory: string): Promis
   await invoke("record_database_export_destination", { directory });
 }
 
-export async function exportQueryResultCsv(filePath: string, columns: string[], rows: readonly (readonly XlsxCellValue[])[], csvQuoteMode: CsvQuoteMode = "all"): Promise<void> {
+export async function exportQueryResultCsv(filePath: string, columns: string[], rows: readonly (readonly XlsxCellValue[])[], csvQuoteMode: CsvQuoteMode = "all", nullLiteral?: string): Promise<void> {
   return invoke("export_query_result_csv", {
     request: {
       filePath,
       columns,
       rows,
       csvQuoteMode,
+      ...(nullLiteral === undefined ? {} : { nullLiteral }),
     },
   });
 }
@@ -6108,3 +6293,7 @@ export async function exportQueryResultHtml(filePath: string, title: string | un
 export * from "@/lib/backend/mq-tauri";
 export * from "@/lib/backend/mqtt-tauri";
 export * from "@/lib/backend/nacos-tauri";
+
+export async function openQueryResultTempFile(path: string): Promise<void> {
+  return invoke("open_query_result_temp_file", { path });
+}

@@ -38,6 +38,8 @@ export interface EditableStructureIndex {
   name: string;
   columns: string[];
   nameEdited?: boolean;
+  /** First selected field, retained when a composite index's members change. */
+  autoNameColumn?: string;
   isUnique: boolean;
   isPrimary: boolean;
   filter: string;
@@ -90,6 +92,7 @@ export interface BuildTableStructureChangeSqlOptions {
   tableComment?: string;
   originalTableComment?: string;
   mysqlEngine?: string;
+  transwarpCreate?: TranswarpCreateTableOptions;
   /** MySQL only: the table's current default collation. Columns whose collation merely
    * matches it inherit the table default, so the backend leaves their redundant
    * `CHARACTER SET`/`COLLATE` clauses out of the generated DDL. */
@@ -101,6 +104,14 @@ export interface BuildTableStructureChangeSqlOptions {
   /** When true, the connection is GaussDB M-mode which uses MySQL-compatible
    * SQL dialect with backtick quoting. */
   isGaussdbMMode?: boolean;
+}
+
+export interface TranswarpCreateTableOptions {
+  partitionColumns: string[];
+  bucketColumns: string[];
+  bucketCount?: number;
+  storageFormat?: string;
+  transactional: boolean;
 }
 
 export interface TableStructureChangeSql {

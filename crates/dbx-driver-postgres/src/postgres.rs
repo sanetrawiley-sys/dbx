@@ -16,13 +16,15 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::future::Future;
 use std::io::BufReader;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
-use tokio::task::JoinHandle;
-use tokio_postgres::config::SslMode;
+use tokio::net::TcpStream;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio_postgres::config::{Host, SslMode};
 use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
 use tokio_postgres::types::{FromSql, Kind, Type};
 use tokio_postgres::{AsyncMessage, NoTls, Row, SimpleQueryMessage, Socket};
@@ -2561,6 +2563,125 @@ fn postgres_client_keys() -> &'static Mutex<PostgresClientKeys> {
 /// (`RAISE NOTICE`/`WARNING`, etc.) into a per-backend buffer instead of
 /// discarding them. Query execution drains the buffer so notices are
 /// attached to the `QueryResult` of the statement that raised them.
+/// Delay between staggered TCP connection attempts when a hostname resolves
+/// to several addresses (Happy Eyeballs, RFC 8305 §4): short enough that
+/// falling back to a reachable address feels instant, long enough that a
+/// healthy preferred address still wins the race.
+const HAPPY_EYEBALLS_STAGGER: Duration = Duration::from_millis(250);
+
+/// Dial `addr` once. Split out so the happy-eyeballs racer below stays readable.
+async fn dial_socket_addr_once(addr: SocketAddr) -> std::io::Result<TcpStream> {
+    TcpStream::connect(addr).await
+}
+
+/// Connect to the first reachable address in `addrs`, racing the attempts
+/// with a short stagger instead of trying them strictly one after another.
+/// See [`happy_eyeballs_dial_with`] for the racing semantics.
+async fn happy_eyeballs_dial(addrs: &[SocketAddr], stagger: Duration) -> std::io::Result<TcpStream> {
+    happy_eyeballs_dial_with(addrs, stagger, dial_socket_addr_once).await
+}
+
+/// Racing dial with an injectable per-address dial function, so tests can
+/// script a hanging address deterministically (the dial is the external
+/// boundary; the racing orchestration is the behavior under test).
+///
+/// The first address is dialed immediately; each further address is started
+/// after `stagger` unless an earlier attempt already failed, in which case the
+/// next address is tried at once. The first successful dial wins and the
+/// remaining attempts are aborted. When every attempt fails, the last error
+/// is returned.
+async fn happy_eyeballs_dial_with<F, Fut>(
+    addrs: &[SocketAddr],
+    stagger: Duration,
+    dial: F,
+) -> std::io::Result<TcpStream>
+where
+    F: Fn(SocketAddr) -> Fut + Send,
+    Fut: Future<Output = std::io::Result<TcpStream>> + Send + 'static,
+{
+    let mut remaining = addrs.iter();
+    let mut in_flight: JoinSet<std::io::Result<TcpStream>> = JoinSet::new();
+    let mut last_err: Option<std::io::Error> = None;
+
+    let Some(first) = remaining.next() else {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "no socket addresses to dial"));
+    };
+    in_flight.spawn(dial(*first));
+
+    loop {
+        tokio::select! {
+            biased;
+            result = in_flight.join_next(), if !in_flight.is_empty() => {
+                match result {
+                    Some(Ok(Ok(stream))) => {
+                        in_flight.abort_all();
+                        return Ok(stream);
+                    }
+                    Some(Ok(Err(err))) => last_err = Some(err),
+                    Some(Err(join_err)) => {
+                        last_err = Some(std::io::Error::other(join_err.to_string()));
+                    }
+                    // Unreachable: this arm is disabled while the set is empty.
+                    None => break,
+                }
+                // A finished attempt immediately frees the way for the next address.
+                if let Some(addr) = remaining.next() {
+                    in_flight.spawn(dial(*addr));
+                } else if in_flight.is_empty() {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep(stagger), if remaining.len() > 0 => {
+                if let Some(addr) = remaining.next() {
+                    in_flight.spawn(dial(*addr));
+                }
+            }
+        }
+    }
+
+    Err(last_err
+        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no socket addresses to dial")))
+}
+
+/// Resolve a single-host PostgreSQL config ahead of the driver's own dial and
+/// pin it to the first reachable resolved address (Happy Eyeballs, RFC 8305).
+///
+/// The winning IP is passed as `hostaddr`, so the driver's dial goes straight
+/// to the reachable address while TLS still validates against the original
+/// hostname. Returns the config unchanged when there is nothing to race:
+/// several hosts, an explicit `hostaddr`, a Unix socket, an IP literal, a
+/// single resolved address, or an inconclusive probe (the driver's own dial
+/// then surfaces the real error).
+async fn pin_postgres_hostaddr(pg_config: &tokio_postgres::Config) -> tokio_postgres::Config {
+    let mut pg_config = pg_config.clone();
+    let [Host::Tcp(host)] = pg_config.get_hosts() else {
+        return pg_config;
+    };
+    if !pg_config.get_hostaddrs().is_empty() || host.parse::<IpAddr>().is_ok() {
+        return pg_config;
+    }
+    let port = pg_config.get_ports().first().copied().unwrap_or(5432);
+    let Ok(resolved) = tokio::net::lookup_host((host.as_str(), port)).await else {
+        return pg_config;
+    };
+    let mut addrs: Vec<SocketAddr> = resolved.collect();
+    addrs.sort();
+    addrs.dedup();
+    if addrs.len() < 2 {
+        return pg_config;
+    }
+    // The probe only picks the address; the driver's own dial (with its
+    // connect_timeout and TLS setup) still opens the real connection.
+    let probe =
+        tokio::time::timeout(super::tcp_probe_timeout(), happy_eyeballs_dial(&addrs, HAPPY_EYEBALLS_STAGGER)).await;
+    if let Ok(Ok(winner)) = probe {
+        if let Ok(addr) = winner.peer_addr() {
+            pg_config.hostaddr(addr.ip());
+        }
+    }
+    pg_config
+}
+
 struct NoticeCapturingConnect<T>
 where
     T: MakeTlsConnect<Socket> + Clone + Sync + Send + 'static,
@@ -2587,6 +2708,10 @@ where
         let tls = self.tls.clone();
         let pg_config = pg_config.clone();
         Box::pin(async move {
+            // Prefer the first reachable resolved address so an unreachable
+            // IPv6 address cannot burn the whole connect timeout before IPv4
+            // is tried (issue #10955).
+            let pg_config = pin_postgres_hostaddr(&pg_config).await;
             let (client, mut connection) = pg_config.connect(tls).await?;
             // No query can complete before the connection is being driven, so
             // the notice buffer is handed to the driver task through a slot
@@ -4611,8 +4736,8 @@ fn postgres_columns_for_relations_sql() -> &'static str {
              ) AS is_pk, \
              col_description(a.attrelid, a.attnum) AS column_comment, \
              CASE a.attidentity \
-               WHEN 'd' THEN 'generated by default as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s)', pseq.seqstart, pseq.seqincrement) ELSE '' END \
-               WHEN 'a' THEN 'generated always as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s)', pseq.seqstart, pseq.seqincrement) ELSE '' END \
+               WHEN 'd' THEN 'generated by default as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s minvalue %s maxvalue %s cache %s %s)', pseq.seqstart, pseq.seqincrement, pseq.seqmin, pseq.seqmax, pseq.seqcache, CASE WHEN pseq.seqcycle THEN 'cycle' ELSE 'no cycle' END) ELSE '' END \
+               WHEN 'a' THEN 'generated always as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s minvalue %s maxvalue %s cache %s %s)', pseq.seqstart, pseq.seqincrement, pseq.seqmin, pseq.seqmax, pseq.seqcache, CASE WHEN pseq.seqcycle THEN 'cycle' ELSE 'no cycle' END) ELSE '' END \
                ELSE CASE a.attgenerated \
                  WHEN 's' THEN 'generated always as (' || pg_get_expr(ad.adbin, ad.adrelid) || ') stored' \
                  WHEN 'v' THEN 'generated always as (' || pg_get_expr(ad.adbin, ad.adrelid) || ') virtual' \
@@ -4862,6 +4987,10 @@ fn postgres_indexes_for_relations_query_tiers() -> [&'static str; 2] {
 // `COALESCE(name, text)` resolves to `name`, so PostgreSQL silently truncates an
 // expression key part to 63 bytes (NAMEDATALEN - 1) and the rebuilt CREATE INDEX
 // becomes invalid SQL (#9988).
+// `constraint_backed` must require the constraint to be owned by the index's own
+// relation: a FOREIGN KEY stores the referenced table's unique index in
+// `conindid`, so matching on `conindid` alone marked that standalone index as
+// constraint-backed and dropped it from generated DDL (#10484).
 fn postgres_indexes_for_relations_sql() -> &'static str {
     "SELECT t.oid::bigint AS relid, i.relname AS index_name, \
              array_agg(COALESCE(a.attname::text, pg_get_indexdef(ix.indexrelid, k.n::int, false)) ORDER BY k.n) AS columns, \
@@ -4875,7 +5004,7 @@ fn postgres_indexes_for_relations_sql() -> &'static str {
              obj_description(i.oid, 'pg_class') AS index_comment, \
              array_agg(a.attname IS NULL ORDER BY k.n) AS key_is_expression, \
              array_agg(ix.indoption[(k.n - 1)::int] ORDER BY k.n) FILTER (WHERE k.n <= ix.indnkeyatts) AS key_options, \
-             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid AND con.conrelid = ix.indrelid AND con.contype IN ('p', 'u', 'x')) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -4932,7 +5061,7 @@ fn postgres_indexes_for_relations_compat_sql() -> &'static str {
                ORDER BY pos.n \
              ) AS key_is_expression, \
              string_to_array(ix.indoption::text, ' ')::smallint[] AS key_options, \
-             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid AND con.conrelid = ix.indrelid AND con.contype IN ('p', 'u', 'x')) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -7343,22 +7472,47 @@ pub async fn get_custom_type_details(pool: &Pool, schema: &str, name: &str) -> R
     })
 }
 
+/// Row/size estimates for the object browser, per schema.
+///
+/// `pg_class.reltuples` only moves when ANALYZE (or autovacuum) rewrites it, so a
+/// table that was written to — or never analyzed at all — keeps reporting its
+/// last known count, often `0` (#10461). `pg_stat_user_tables.n_live_tup` is the
+/// statistics collector's live estimate: it tracks DML within seconds and still
+/// avoids a `COUNT(*)` scan, which is what the UI promises in its column hint.
+const POSTGRES_OBJECT_STATISTICS_SQL: &str = "SELECT c.relname, \
+        GREATEST(COALESCE(s.n_live_tup, c.reltuples), 0)::bigint AS estimated_rows, \
+        pg_catalog.pg_total_relation_size(c.oid)::bigint AS total_bytes \
+ FROM pg_catalog.pg_class c \
+ JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+ LEFT JOIN pg_catalog.pg_stat_user_tables s ON s.relid = c.oid \
+ WHERE n.nspname = $1 AND c.relkind IN ('r','m','f','p') \
+ ORDER BY c.relname";
+
+/// Some Postgres-compatible engines do not expose `pg_stat_user_tables`; fall
+/// back to the ANALYZE-time estimate rather than dropping the columns entirely.
+const POSTGRES_OBJECT_STATISTICS_FALLBACK_SQL: &str = "SELECT c.relname, \
+        GREATEST(c.reltuples, 0)::bigint AS estimated_rows, \
+        pg_catalog.pg_total_relation_size(c.oid)::bigint AS total_bytes \
+ FROM pg_catalog.pg_class c \
+ JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+ WHERE n.nspname = $1 AND c.relkind IN ('r','m','f','p') \
+ ORDER BY c.relname";
+
 pub async fn list_object_statistics(pool: &Pool, schema: &str) -> Result<Vec<ObjectStatistics>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(
-        &client,
-        "SELECT c.relname, \
-                GREATEST(c.reltuples, 0)::bigint AS estimated_rows, \
-                pg_catalog.pg_total_relation_size(c.oid)::bigint AS total_bytes \
-         FROM pg_catalog.pg_class c \
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = $1 AND c.relkind IN ('r','m','f','p') \
-         ORDER BY c.relname",
-        &[&schema],
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let rows = match postgres_query_cached(&client, POSTGRES_OBJECT_STATISTICS_SQL, &[&schema]).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            log::warn!(
+                "[postgres][object-statistics] live tuple estimate unavailable, falling back to reltuples: {}",
+                pg_error_to_string(error)
+            );
+            postgres_query_cached(&client, POSTGRES_OBJECT_STATISTICS_FALLBACK_SQL, &[&schema])
+                .await
+                .map_err(|e| e.to_string())?
+        }
+    };
     Ok(rows
         .iter()
         .map(|row| ObjectStatistics {
@@ -7440,8 +7594,8 @@ const POSTGRES_COLUMNS_SQL: &str = "SELECT a.attname AS column_name, \
              ) AS is_pk, \
              col_description(a.attrelid, a.attnum) AS column_comment, \
              CASE a.attidentity \
-               WHEN 'd' THEN 'generated by default as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s)', pseq.seqstart, pseq.seqincrement) ELSE '' END \
-               WHEN 'a' THEN 'generated always as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s)', pseq.seqstart, pseq.seqincrement) ELSE '' END \
+               WHEN 'd' THEN 'generated by default as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s minvalue %s maxvalue %s cache %s %s)', pseq.seqstart, pseq.seqincrement, pseq.seqmin, pseq.seqmax, pseq.seqcache, CASE WHEN pseq.seqcycle THEN 'cycle' ELSE 'no cycle' END) ELSE '' END \
+               WHEN 'a' THEN 'generated always as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s minvalue %s maxvalue %s cache %s %s)', pseq.seqstart, pseq.seqincrement, pseq.seqmin, pseq.seqmax, pseq.seqcache, CASE WHEN pseq.seqcycle THEN 'cycle' ELSE 'no cycle' END) ELSE '' END \
                ELSE CASE a.attgenerated \
                  WHEN 's' THEN 'generated always as (' || pg_get_expr(ad.adbin, ad.adrelid) || ') stored' \
                  WHEN 'v' THEN 'generated always as (' || pg_get_expr(ad.adbin, ad.adrelid) || ') virtual' \
@@ -8976,6 +9130,10 @@ async fn execute_query_with_max_rows_inner(
 // `COALESCE(name, text)` resolves to `name`, so PostgreSQL silently truncates an
 // expression key part to 63 bytes (NAMEDATALEN - 1) and the rebuilt CREATE INDEX
 // becomes invalid SQL (#9988).
+// `constraint_backed` must require the constraint to be owned by the index's own
+// relation: a FOREIGN KEY stores the referenced table's unique index in
+// `conindid`, so matching on `conindid` alone marked that standalone index as
+// constraint-backed and dropped it from generated DDL (#10484).
 const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
              array_agg(COALESCE(a.attname::text, pg_get_indexdef(ix.indexrelid, k.n::int, false)) ORDER BY k.n) AS columns, \
              array_agg(CASE WHEN oc.opcdefault THEN NULL ELSE quote_ident(opcns.nspname) || '.' || quote_ident(oc.opcname) END ORDER BY k.n) AS column_opclasses, \
@@ -8988,7 +9146,7 @@ const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
              obj_description(i.oid, 'pg_class') AS index_comment, \
              array_agg(a.attname IS NULL ORDER BY k.n) AS key_is_expression, \
              array_agg(ix.indoption[(k.n - 1)::int] ORDER BY k.n) FILTER (WHERE k.n <= ix.indnkeyatts) AS key_options, \
-             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid AND con.conrelid = ix.indrelid AND con.contype IN ('p', 'u', 'x')) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -9044,7 +9202,7 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
                ORDER BY pos.n \
              ) AS key_is_expression, \
              string_to_array(ix.indoption::text, ' ')::smallint[] AS key_options, \
-             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid AND con.conrelid = ix.indrelid AND con.contype IN ('p', 'u', 'x')) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -14152,7 +14310,12 @@ mod tests {
         ] {
             assert!(sql.contains("ix.indisunique AND ix.indisvalid"));
             assert!(sql.contains("AS constraint_backed"));
-            assert!(sql.contains("con.conindid = i.oid"));
+            // A foreign key's `conindid` is the referenced table's unique index, so the
+            // ownership check also requires the constraint to live on the same relation
+            // and to be an index-owning kind (#10484).
+            assert!(
+                sql.contains("con.conindid = i.oid AND con.conrelid = ix.indrelid AND con.contype IN ('p', 'u', 'x')")
+            );
         }
     }
 
@@ -15593,5 +15756,113 @@ mod tests {
         assert_eq!(parse_pg_partition_bound("NOT A BOUND"), None);
         // `IN` must not match the start of `INTO`.
         assert_eq!(parse_pg_partition_bound("FOR VALUES INTO (1)"), None);
+    }
+
+    #[test]
+    fn object_statistics_prefers_live_tuples_and_keeps_a_reltuples_fallback() {
+        // #10461: `reltuples` lags behind DML, so the live estimate must win when
+        // `pg_stat_user_tables` is available...
+        assert!(POSTGRES_OBJECT_STATISTICS_SQL.contains("pg_catalog.pg_stat_user_tables"));
+        assert!(POSTGRES_OBJECT_STATISTICS_SQL.contains("COALESCE(s.n_live_tup, c.reltuples)"));
+        // ...while an engine without that view still reports counts.
+        assert!(!POSTGRES_OBJECT_STATISTICS_FALLBACK_SQL.contains("pg_stat_user_tables"));
+        assert!(POSTGRES_OBJECT_STATISTICS_FALLBACK_SQL.contains("GREATEST(c.reltuples, 0)"));
+        for sql in [POSTGRES_OBJECT_STATISTICS_SQL, POSTGRES_OBJECT_STATISTICS_FALLBACK_SQL] {
+            // Both queries must keep the same projection so the row mapping stays valid.
+            assert!(sql.contains("AS estimated_rows"));
+            assert!(sql.contains("AS total_bytes"));
+            assert!(sql.contains("c.relkind IN ('r','m','f','p')"));
+            assert!(sql.contains("WHERE n.nspname = $1"));
+        }
+    }
+
+    // Issue #10955: a hostname resolving to both IPv6 and IPv4 must connect
+    // through the reachable address instead of stalling on the unreachable
+    // one until the pool's create timeout fires.
+
+    #[tokio::test]
+    async fn happy_eyeballs_dial_does_not_wait_for_hung_first_attempt() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reachable = listener.local_addr().unwrap();
+        let bad_ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let unreachable = SocketAddr::new(bad_ip, reachable.port());
+        let started = Instant::now();
+        let stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            happy_eyeballs_dial_with(&[unreachable, reachable], Duration::from_millis(50), |addr| async move {
+                if addr.ip() == bad_ip {
+                    // The unreachable IPv6/NAT64 address from #10955: the
+                    // SYN is never answered, so this dial never resolves.
+                    futures::future::pending::<std::io::Result<TcpStream>>().await
+                } else {
+                    TcpStream::connect(addr).await
+                }
+            }),
+        )
+        .await
+        .expect("dial must not stall on the unreachable address")
+        .expect("dial must succeed through the reachable address");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "fallback must be near-instant, not wait out the hung attempt"
+        );
+        assert_eq!(stream.peer_addr().unwrap(), reachable);
+    }
+
+    #[tokio::test]
+    async fn happy_eyeballs_dial_tries_next_address_on_fast_failure() {
+        let closed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reachable = listener.local_addr().unwrap();
+        let started = Instant::now();
+        let stream = happy_eyeballs_dial(&[refused, reachable], Duration::from_millis(50))
+            .await
+            .expect("dial must fall through to the reachable address");
+        assert!(started.elapsed() < Duration::from_secs(5), "a refused address must not cost a full stagger");
+        assert_eq!(stream.peer_addr().unwrap(), reachable);
+    }
+
+    #[tokio::test]
+    async fn happy_eyeballs_dial_succeeds_with_single_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = happy_eyeballs_dial(&[addr], Duration::from_millis(50))
+            .await
+            .expect("a single reachable address must connect");
+        assert_eq!(stream.peer_addr().unwrap(), addr);
+    }
+
+    #[tokio::test]
+    async fn happy_eyeballs_dial_reports_error_when_all_addresses_refused() {
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed: Vec<SocketAddr> = [&first, &second].into_iter().map(|l| l.local_addr().unwrap()).collect();
+        drop(first);
+        drop(second);
+        let started = Instant::now();
+        happy_eyeballs_dial(&closed, Duration::from_millis(50))
+            .await
+            .expect_err("all addresses refused: the dial must fail");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "refused dials must fail fast instead of waiting out a stagger"
+        );
+    }
+
+    #[tokio::test]
+    async fn pin_postgres_hostaddr_leaves_ip_literal_alone() {
+        let config = tokio_postgres::Config::from_str("host=127.0.0.1 port=5432 user=dbx connect_timeout=2").unwrap();
+        let pinned = pin_postgres_hostaddr(&config).await;
+        assert!(pinned.get_hostaddrs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pin_postgres_hostaddr_keeps_explicit_hostaddr() {
+        let mut config = tokio_postgres::Config::from_str("host=localhost port=5432 user=dbx").unwrap();
+        config.hostaddr("127.0.0.1".parse().unwrap());
+        let pinned = pin_postgres_hostaddr(&config).await;
+        assert_eq!(pinned.get_hostaddrs().first(), Some(&"127.0.0.1".parse().unwrap()));
     }
 }

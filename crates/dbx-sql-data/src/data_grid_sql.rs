@@ -98,6 +98,11 @@ pub struct DataGridSaveStatementOptions {
     pub database_type: Option<DatabaseType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identifier_quote: Option<String>,
+    /// Server version reported by the connection (for example `Neo4j/4.4.44`). Neo4j renamed the
+    /// node identity function in 5.0, so the saved statements must address rows the same way the
+    /// grid read them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_version: Option<String>,
     pub table_meta: DataGridTableMeta,
     pub columns: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -336,6 +341,8 @@ pub struct DataGridConditionalUpdateSqlOptions {
 #[serde(rename_all = "camelCase")]
 pub struct HiveTablePropertiesSqlOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_type: Option<DatabaseType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
     pub table_name: String,
     pub property_name: String,
@@ -396,6 +403,22 @@ pub fn prepare_data_grid_save_for_driver_profile(
     }
 
     let mut keyless_guards = Vec::new();
+    if options.database_type == Some(DatabaseType::Neo4j) {
+        let generated = build_neo4j_data_grid_save_statements(&options).and_then(|statements| {
+            build_neo4j_data_grid_rollback_statements(&options).map(|rollback| (statements, rollback))
+        });
+        let (validation_error, statements, rollback_statements) = match generated {
+            Ok((statements, rollback)) => (None, statements, rollback),
+            Err(error) => (Some(error), Vec::new(), Vec::new()),
+        };
+        return DataGridSavePreparation {
+            validation_error,
+            statements,
+            rollback_statements,
+            execution_schema: None,
+            keyless_guards,
+        };
+    }
     let statements = build_data_grid_save_statements(&options, driver_profile, &mut keyless_guards);
     DataGridSavePreparation {
         validation_error: None,
@@ -513,6 +536,18 @@ pub fn build_data_grid_copy_update_statements(options: DataGridCopyUpdateStateme
 }
 
 pub fn build_data_grid_copy_insert_statement(options: DataGridCopyInsertStatementOptions) -> Option<String> {
+    build_data_grid_copy_insert_statement_with_formatters(
+        options,
+        |reference| reference,
+        format_grid_copy_insert_sql_literal,
+    )
+}
+
+pub(crate) fn build_data_grid_copy_insert_statement_with_formatters(
+    options: DataGridCopyInsertStatementOptions,
+    format_reference: impl Fn(String) -> String,
+    format_literal: impl Fn(&Value, Option<DatabaseType>, Option<&DataGridColumnInfo>, Option<&str>) -> String,
+) -> Option<String> {
     let save_columns = effective_copy_columns(options.source_columns.as_deref(), &options.columns);
     let column_info = options.table_meta.as_ref().and_then(|meta| meta.columns.as_deref()).unwrap_or(&[]);
     let primary_key_set: Vec<String> = options
@@ -617,10 +652,15 @@ pub fn build_data_grid_copy_insert_statement(options: DataGridCopyInsertStatemen
             )
         },
     );
+    let table = format_reference(table);
     let columns = insert_columns
         .iter()
         .map(|(_, index, _)| {
-            data_grid_identifier(options.database_type, &options.columns[*index], options.identifier_quote.as_deref())
+            format_reference(data_grid_identifier(
+                options.database_type,
+                &options.columns[*index],
+                options.identifier_quote.as_deref(),
+            ))
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -633,7 +673,7 @@ pub fn build_data_grid_copy_insert_statement(options: DataGridCopyInsertStatemen
                 insert_columns
                     .iter()
                     .map(|(_, index, info)| {
-                        format_grid_copy_insert_sql_literal(
+                        format_literal(
                             row.get(*index).unwrap_or(&Value::Null),
                             options.database_type,
                             info.as_ref(),
@@ -1086,6 +1126,12 @@ fn is_sqlserver_legacy_profile(driver_profile: Option<&str>) -> bool {
 }
 
 pub fn build_data_grid_count_sql(options: DataGridCountSqlOptions) -> String {
+    if options.database_type == Some(DatabaseType::Neo4j) {
+        let label = quote_ident(Some(DatabaseType::Neo4j), &options.table_name);
+        let predicate = crate::sql_dialect::normalize_where_input(options.where_input.as_deref());
+        let where_clause = if predicate.is_empty() { String::new() } else { format!(" WHERE ({predicate})") };
+        return format!("MATCH (n:{label}){where_clause} RETURN count(n) AS cnt");
+    }
     // Keep the reference identical to the one the grid's SELECT uses: Caché/IRIS
     // reject quoted ordinary names when delimited identifiers are disabled, so
     // the count must not be the only statement that quotes them (#8929).
@@ -1154,6 +1200,15 @@ pub fn build_data_grid_conditional_update_sql(options: DataGridConditionalUpdate
 }
 
 pub fn build_hive_table_properties_sql(options: HiveTablePropertiesSqlOptions) -> String {
+    if options.database_type == Some(DatabaseType::Transwarp)
+        && options.property_name.eq_ignore_ascii_case("transactional")
+    {
+        let database = options.schema.as_deref().unwrap_or("default").replace('\'', "''");
+        let table = options.table_name.replace('\'', "''");
+        return format!(
+            "SELECT transactional FROM system.tables_v WHERE database_name = '{database}' AND table_name = '{table}'"
+        );
+    }
     let table = qualified_table_name(Some(DatabaseType::Hive), options.schema.as_deref(), &options.table_name);
     let property = options.property_name.replace('\'', "''");
     format!("SHOW TBLPROPERTIES {table} ('{property}')")
@@ -1569,9 +1624,6 @@ fn build_data_grid_save_statements(
     driver_profile: Option<&str>,
     keyless_guards: &mut Vec<DataGridSaveGuard>,
 ) -> Vec<String> {
-    if options.database_type == Some(DatabaseType::Neo4j) {
-        return build_neo4j_data_grid_save_statements(options);
-    }
     if options.database_type == Some(DatabaseType::Tdengine) {
         return build_tdengine_data_grid_save_statements(options);
     }
@@ -1750,7 +1802,11 @@ fn build_data_grid_save_statements(
             .join(", ");
         statements.push(data_grid_statement(
             options.database_type,
-            format!("INSERT INTO {table} ({columns}) VALUES ({values})"),
+            if options.database_type == Some(DatabaseType::Transwarp) {
+                format!("INSERT INTO {table} ({columns}) SELECT {values}")
+            } else {
+                format!("INSERT INTO {table} ({columns}) VALUES ({values})")
+            },
         ));
     }
 
@@ -1767,9 +1823,6 @@ fn build_data_grid_rollback_statements(
     options: &DataGridSaveStatementOptions,
     driver_profile: Option<&str>,
 ) -> Vec<String> {
-    if options.database_type == Some(DatabaseType::Neo4j) {
-        return build_neo4j_data_grid_rollback_statements(options);
-    }
     if options.database_type == Some(DatabaseType::Tdengine) {
         return build_tdengine_data_grid_rollback_statements(options);
     }
@@ -1870,7 +1923,11 @@ fn build_data_grid_rollback_statements(
         } else {
             statements.push(data_grid_statement(
                 options.database_type,
-                format!("INSERT INTO {table} ({columns}) VALUES ({values})"),
+                if options.database_type == Some(DatabaseType::Transwarp) {
+                    format!("INSERT INTO {table} ({columns}) SELECT {values}")
+                } else {
+                    format!("INSERT INTO {table} ({columns}) VALUES ({values})")
+                },
             ));
         }
     }
@@ -2352,7 +2409,7 @@ pub fn normalize_data_grid_save_error(database_type: Option<DatabaseType>, error
     error.to_string()
 }
 
-fn format_grid_copy_insert_sql_literal(
+pub(crate) fn format_grid_copy_insert_sql_literal(
     value: &Value,
     database_type: Option<DatabaseType>,
     column_info: Option<&DataGridColumnInfo>,
@@ -3939,6 +3996,7 @@ mod tests {
         DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Mysql),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -4175,10 +4233,193 @@ mod tests {
     }
 
     #[test]
+    fn neo4j_data_grid_save_addresses_nodes_with_the_identity_function_of_the_server() {
+        let options = |server_version: Option<&str>, rows: Vec<Vec<Value>>| DataGridSaveStatementOptions {
+            database_type: Some(DatabaseType::Neo4j),
+            identifier_quote: None,
+            server_version: server_version.map(str::to_string),
+            table_meta: DataGridTableMeta {
+                catalog: None,
+                database: None,
+                schema: None,
+                table_name: "Employee".to_string(),
+                primary_keys: vec![],
+                columns: Some(vec![
+                    column(DBX_NEO4J_ELEMENT_ID_COLUMN, "string", false, None),
+                    column("name", "string", true, None),
+                ]),
+            },
+            columns: vec![DBX_NEO4J_ELEMENT_ID_COLUMN.to_string(), "name".to_string()],
+            source_columns: None,
+            rows,
+            dirty_rows: vec![(0, vec![(1, json!("after"))])],
+            deleted_rows: vec![1],
+            new_rows: vec![],
+            include_database_name: false,
+        };
+        let legacy_rows = || vec![vec![json!(23), json!("before")], vec![json!(24), json!("gone")]];
+
+        // Neo4j 4.x only knows `id()`; `elementId()` would be an unknown function there (#10503).
+        // That `id()` is an Integer while grids carry text, so the predicate compares numbers —
+        // with a quoted literal the edit would silently match no row.
+        for rows in [legacy_rows(), vec![vec![json!("23"), json!("before")], vec![json!("24"), json!("gone")]]] {
+            let on_neo4j_4 = prepare_data_grid_save(options(Some("Neo4j/4.4.44"), rows));
+            assert_eq!(
+                on_neo4j_4.statements,
+                vec![
+                    "MATCH (n:`Employee`) WHERE id(n) = 23 SET n.`name` = 'after';".to_string(),
+                    "MATCH (n:`Employee`) WHERE id(n) = 24 DETACH DELETE n;".to_string(),
+                ]
+            );
+        }
+
+        // Neo4j 5.0+ renamed the identity function, and `elementId()` returns a string.
+        let on_neo4j_5 = prepare_data_grid_save(options(
+            Some("Neo4j/5.26.0"),
+            vec![vec![json!("4:0db5d0e9:1:6"), json!("before")], vec![json!("4:0db5d0e9:1:7"), json!("gone")]],
+        ));
+        assert_eq!(
+            on_neo4j_5.statements,
+            vec![
+                "MATCH (n:`Employee`) WHERE elementId(n) = '4:0db5d0e9:1:6' SET n.`name` = 'after';".to_string(),
+                "MATCH (n:`Employee`) WHERE elementId(n) = '4:0db5d0e9:1:7' DETACH DELETE n;".to_string(),
+            ]
+        );
+
+        // A non-numeric identity never becomes a bare Cypher number, even on the legacy function.
+        let legacy_text_id = prepare_data_grid_save(options(
+            Some("Neo4j/4.4.44"),
+            vec![vec![json!("4:0db5d0e9:1:6"), json!("before")], vec![json!("4:0db5d0e9:1:7"), json!("gone")]],
+        ));
+        assert_eq!(
+            legacy_text_id.statements,
+            vec![
+                "MATCH (n:`Employee`) WHERE id(n) = '4:0db5d0e9:1:6' SET n.`name` = 'after';".to_string(),
+                "MATCH (n:`Employee`) WHERE id(n) = '4:0db5d0e9:1:7' DETACH DELETE n;".to_string(),
+            ]
+        );
+
+        // Callers without connection metadata keep the historical `elementId()` spelling.
+        let without_version = prepare_data_grid_save(options(
+            None,
+            vec![vec![json!("4:0db5d0e9:1:6"), json!("before")], vec![json!("4:0db5d0e9:1:7"), json!("gone")]],
+        ));
+        assert_eq!(without_version.statements, on_neo4j_5.statements);
+    }
+
+    #[test]
+    fn neo4j_property_writes_preserve_types_and_exact_integers() {
+        for (kind, value, expected) in [
+            ("Long", json!("9223372036854775807"), "toInteger('9223372036854775807')"),
+            ("Integer", json!("-9223372036854775808"), "toInteger('-9223372036854775808')"),
+            ("Double", json!(2), "toFloat('2')"),
+            ("Boolean", json!("false"), "false"),
+            ("Date", json!("2026-09-30"), "date('2026-09-30')"),
+            ("Duration", json!("P1D"), "duration('P1D')"),
+            ("StringArray", json!("[\"A\",\"B\"]"), "['A', 'B']"),
+            ("LongArray", json!("[9007199254740997]"), "[toInteger('9007199254740997')]"),
+            ("BooleanArray", json!([true, false]), "[true, false]"),
+            ("String", json!("a'b\\c"), "'a\\'b\\\\c'"),
+        ] {
+            let prepared = prepare_data_grid_save(neo4j_property_save_options(kind, value));
+            assert_eq!(prepared.validation_error, None, "{kind}");
+            assert_eq!(
+                prepared.statements,
+                vec![format!("MATCH (n:`Person`) WHERE elementId(n) = 'sample-id' SET n.`value` = {expected};")]
+            );
+            assert_eq!(prepared.rollback_statements, prepared.statements);
+        }
+    }
+
+    #[test]
+    fn neo4j_property_writes_reject_invalid_and_ambiguous_types_before_execution() {
+        for (kind, value) in [
+            ("Long", json!("9223372036854775808")),
+            ("Long", json!("1.5")),
+            ("Long", json!("1); MATCH (n) DELETE n")),
+            ("Double", json!("NaN")),
+            ("Double", json!("Infinity")),
+            ("Boolean", json!("not-a-boolean")),
+            ("LongArray", json!("[null]")),
+            ("StringArray", json!("[1]")),
+            ("LongArray", json!("[1.5]")),
+            ("StringArray", json!("invalid JSON")),
+            ("Long | String", json!("12")),
+            ("Unknown", json!("12")),
+            ("Point", json!("{x:1,y:2}")),
+        ] {
+            let prepared = prepare_data_grid_save(neo4j_property_save_options(kind, value));
+            assert!(prepared.validation_error.is_some(), "{kind}");
+            assert!(prepared.statements.is_empty(), "{kind}");
+            assert!(prepared.rollback_statements.is_empty(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn neo4j_insert_and_delete_do_not_generate_unsafe_history_reversals() {
+        let mut options = neo4j_property_save_options("Long", json!("9007199254740997"));
+        options.dirty_rows.clear();
+        options.new_rows = vec![vec![Value::Null, json!("9007199254740997")]];
+        let prepared = prepare_data_grid_save(options.clone());
+        assert_eq!(prepared.validation_error, None);
+        assert_eq!(prepared.statements, vec!["CREATE (n:`Person` {`value`: toInteger('9007199254740997')});"]);
+        assert!(prepared.rollback_statements.is_empty());
+        options.new_rows.clear();
+        options.deleted_rows = vec![0];
+        let prepared = prepare_data_grid_save(options);
+        assert_eq!(prepared.statements, vec!["MATCH (n:`Person`) WHERE elementId(n) = 'sample-id' DETACH DELETE n;"]);
+        assert!(prepared.rollback_statements.is_empty());
+    }
+
+    fn neo4j_property_save_options(kind: &str, value: Value) -> DataGridSaveStatementOptions {
+        DataGridSaveStatementOptions {
+            database_type: Some(DatabaseType::Neo4j),
+            identifier_quote: None,
+            server_version: Some("Neo4j/5.26.0".to_string()),
+            table_meta: DataGridTableMeta {
+                catalog: None,
+                database: None,
+                schema: None,
+                table_name: "Person".to_string(),
+                primary_keys: vec![DBX_NEO4J_ELEMENT_ID_COLUMN.to_string()],
+                columns: Some(vec![column("value", kind, true, None)]),
+            },
+            columns: vec![DBX_NEO4J_ELEMENT_ID_COLUMN.to_string(), "value".to_string()],
+            source_columns: None,
+            rows: vec![vec![json!("sample-id"), value.clone()]],
+            dirty_rows: vec![(0, vec![(1, value)])],
+            deleted_rows: vec![],
+            new_rows: vec![],
+            include_database_name: false,
+        }
+    }
+
+    #[test]
+    fn neo4j_counts_use_cypher_and_keep_the_grid_predicate() {
+        for (where_input, where_clause) in [(None, ""), (Some("WHERE n.`age` > 10"), " WHERE (n.`age` > 10)")] {
+            let options = DataGridCountSqlOptions {
+                database_type: Some(DatabaseType::Neo4j),
+                identifier_quote: None,
+                catalog: None,
+                database: Some("neo4j".to_string()),
+                schema: Some("neo4j".to_string()),
+                table_name: "P`erson".to_string(),
+                where_input: where_input.map(str::to_string),
+                count_hint: None,
+            };
+            assert_eq!(
+                build_data_grid_count_sql(options),
+                format!("MATCH (n:`P``erson`){where_clause} RETURN count(n) AS cnt")
+            );
+        }
+    }
+
+    #[test]
     fn iris_cache_data_grid_save_uses_unquoted_ordinary_identifiers() {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Iris),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -4216,6 +4457,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Iris),
             identifier_quote: Some("\"".to_string()),
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -4259,6 +4501,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Postgres),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -4296,6 +4539,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Postgres),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -6350,6 +6594,7 @@ mod tests {
     fn builds_hive_table_properties_sql() {
         assert_eq!(
             build_hive_table_properties_sql(HiveTablePropertiesSqlOptions {
+                database_type: None,
                 schema: Some("default".to_string()),
                 table_name: "events".to_string(),
                 property_name: "transactional".to_string(),
@@ -6363,6 +6608,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Hive),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -6403,6 +6649,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Hive),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -6442,6 +6689,7 @@ mod tests {
         let hive_options = DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Hive),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -6464,6 +6712,7 @@ mod tests {
         let postgres_options = DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Postgres),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -6481,6 +6730,53 @@ mod tests {
             include_database_name: false,
         };
         assert_eq!(effective_columns(&postgres_options), vec![Some("events.id".to_string())]);
+    }
+
+    #[test]
+    fn transwarp_grid_insert_and_restore_use_select_syntax() {
+        let options = DataGridSaveStatementOptions {
+            database_type: Some(DatabaseType::Transwarp),
+            identifier_quote: None,
+            server_version: None,
+            table_meta: DataGridTableMeta {
+                catalog: None,
+                database: None,
+                schema: Some("default".to_string()),
+                table_name: "events".to_string(),
+                primary_keys: vec![],
+                columns: Some(vec![column("id", "int", true, None), column("name", "string", true, None)]),
+            },
+            columns: vec!["id".to_string(), "name".to_string()],
+            source_columns: None,
+            rows: vec![vec![json!(1), json!("before")]],
+            dirty_rows: vec![],
+            deleted_rows: vec![0],
+            new_rows: vec![vec![json!(2), json!("after")]],
+            include_database_name: false,
+        };
+        let result = prepare_data_grid_save(options);
+        assert!(result
+            .statements
+            .iter()
+            .any(|sql| sql.contains("INSERT INTO `default`.`events` (`id`, `name`) SELECT 2, 'after'")));
+        assert!(result
+            .rollback_statements
+            .iter()
+            .any(|sql| sql.contains("INSERT INTO `default`.`events` (`id`, `name`) SELECT 1, 'before'")));
+    }
+
+    #[test]
+    fn transwarp_transactional_property_uses_system_table() {
+        let sql = build_hive_table_properties_sql(HiveTablePropertiesSqlOptions {
+            database_type: Some(DatabaseType::Transwarp),
+            schema: Some("analytics".to_string()),
+            table_name: "events".to_string(),
+            property_name: "transactional".to_string(),
+        });
+        assert_eq!(
+            sql,
+            "SELECT transactional FROM system.tables_v WHERE database_name = 'analytics' AND table_name = 'events'"
+        );
     }
 
     #[test]
@@ -6647,6 +6943,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Oracle),
             identifier_quote: Some("\"".to_string()),
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -6714,6 +7011,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Oracle),
             identifier_quote: Some("\"".to_string()),
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -6749,6 +7047,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::SqlServer),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -6775,6 +7074,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::SqlServer),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: Some("BarDB".to_string()),
                 database: Some("BarDB".to_string()),
@@ -6805,6 +7105,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Kingbase),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -6843,6 +7144,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Kingbase),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -6878,6 +7180,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Kingbase),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -6913,6 +7216,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Mysql),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -6943,6 +7247,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Mysql),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7020,6 +7325,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Vastbase),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7051,6 +7357,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Vastbase),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7094,6 +7401,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Goldendb),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7126,6 +7434,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Goldendb),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7166,6 +7475,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Goldendb),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7193,6 +7503,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Goldendb),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7220,6 +7531,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Postgres),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7256,6 +7568,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Kingbase),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7287,6 +7600,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Kingbase),
             identifier_quote: Some("`".to_string()),
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7320,6 +7634,7 @@ mod tests {
         let googlesql = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Spanner),
             identifier_quote: Some("`".to_string()),
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7344,6 +7659,7 @@ mod tests {
         let postgres_dialect = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Spanner),
             identifier_quote: Some("\"".to_string()),
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7375,6 +7691,7 @@ mod tests {
         let no_reported_quote = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Spanner),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7453,6 +7770,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Vastbase),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: Some("smes_dev".to_string()),
@@ -7487,6 +7805,7 @@ mod tests {
             DataGridSaveStatementOptions {
                 database_type: Some(DatabaseType::Informix),
                 identifier_quote: Some(String::new()),
+                server_version: None,
                 table_meta: DataGridTableMeta {
                     catalog: None,
                     database: Some("webcenter".to_string()),
@@ -7531,6 +7850,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Informix),
             identifier_quote: Some(String::new()),
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: Some("dbx_test".to_string()),
@@ -7566,6 +7886,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Gaussdb),
             identifier_quote: Some("\"".to_string()),
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7592,6 +7913,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Postgres),
             identifier_quote: Some("`".to_string()),
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7621,6 +7943,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Postgres),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7659,6 +7982,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Mysql),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7695,6 +8019,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Oracle),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7729,6 +8054,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Oracle),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7763,6 +8089,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Oracle),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7804,6 +8131,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::OceanbaseOracle),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7851,6 +8179,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::OceanbaseOracle),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7882,6 +8211,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::OceanbaseOracle),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -7915,6 +8245,7 @@ mod tests {
         DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Dameng),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -8054,6 +8385,7 @@ mod tests {
         DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Sqlite),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -8213,6 +8545,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::OceanbaseOracle),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -8365,6 +8698,7 @@ mod tests {
         let options = DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Mysql),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -8420,6 +8754,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Mysql),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -8516,6 +8851,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Kingbase),
             identifier_quote: Some("`".to_string()),
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -8608,6 +8944,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Dameng),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -8644,6 +8981,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Oracle),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -8694,6 +9032,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::SqlServer),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -8762,6 +9101,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::SqlServer),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -8796,6 +9136,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Mysql),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -8828,6 +9169,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Mysql),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -8875,6 +9217,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Mysql),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -8905,6 +9248,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Mysql),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -8935,6 +9279,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::SqlServer),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -8967,6 +9312,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Tdengine),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9000,6 +9346,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Tdengine),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9042,6 +9389,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Tdengine),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9075,6 +9423,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Tdengine),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9112,6 +9461,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Tdengine),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9152,6 +9502,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Tdengine),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9199,6 +9550,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Tdengine),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9244,6 +9596,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Tdengine),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9274,6 +9627,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Tdengine),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9303,6 +9657,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Tdengine),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9337,6 +9692,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Tdengine),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9368,6 +9724,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Databend),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9402,6 +9759,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::ClickHouse),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9438,6 +9796,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::ClickHouse),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9472,6 +9831,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::ClickHouse),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9502,6 +9862,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::ClickHouse),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9601,6 +9962,7 @@ mod tests {
         let save = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Doris),
             identifier_quote: None,
+            server_version: None,
             table_meta,
             columns: vec!["id".to_string(), "status".to_string()],
             source_columns: None,
@@ -9626,6 +9988,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Databend),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9657,6 +10020,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Oscar),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9688,6 +10052,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Postgres),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9724,6 +10089,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Mysql),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9778,6 +10144,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Mysql),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9806,6 +10173,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Mysql),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9840,6 +10208,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::ManticoreSearch),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9873,6 +10242,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Postgres),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9913,6 +10283,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Oracle),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9949,6 +10320,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Xugu),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -9986,6 +10358,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Sqlite),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -10015,6 +10388,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Sqlite),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -10047,6 +10421,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Mysql),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -10076,6 +10451,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Mysql),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -10107,6 +10483,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Mysql),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -10137,6 +10514,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Mysql),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -10168,6 +10546,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Mysql),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -10197,6 +10576,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Kingbase),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -10226,6 +10606,7 @@ mod tests {
         let result = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Sqlite),
             identifier_quote: None,
+            server_version: None,
             table_meta: DataGridTableMeta {
                 catalog: None,
                 database: None,
@@ -10266,6 +10647,7 @@ mod tests {
         let save = prepare_data_grid_save(DataGridSaveStatementOptions {
             database_type: Some(DatabaseType::Doris),
             identifier_quote: None,
+            server_version: None,
             table_meta: table_meta.clone(),
             columns: vec!["name".to_string(), "v2".to_string()],
             source_columns: None,

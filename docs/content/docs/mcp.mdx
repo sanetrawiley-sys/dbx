@@ -32,6 +32,8 @@ The installer verifies the download, installs `dbx-mcp` into `~/.dbx/bin`, and p
 
 Rerun the same install command to upgrade. A matching version reports `already up to date`. Version probing uses `dbx-mcp --version`, falling back to `~/.dbx/bin/.dbx-mcp-version` for older binaries. Offline installation fails without replacing an existing binary. Download sources are tried in order: npmjs, npmmirror, then GitHub Releases; an integrity mismatch stops installation.
 
+On macOS, the shell installer also verifies the official Developer ID signature and stable `com.dbx.app.mcp` designated requirement before replacing the binary. Unsigned, ad-hoc, unexpected-signer or hash-bound artifacts are rejected, leaving the installed binary and version marker unchanged. This check applies to the shell installer; Homebrew and npm retain their own installation flows.
+
 Homebrew is also available on macOS and Linux:
 
 ```bash
@@ -151,6 +153,20 @@ DBX MCP provides the following tools (availability depends on build features and
 - `max_rows`: 1–1000, defaults to 100. Out-of-range values are clamped, not rejected. It applies to SQL connections only — MongoDB shell commands always return at most 100 rows, and multi-statement scripts routed to the batch executor return at most 100 rows per statement.
 
 Connection-scoped sessions hide connection-mutating and desktop UI tools.
+
+## Plugin tools
+
+DBX plugins whose sidecar implements the `mcp/tools` bridge can be served by the `dbx` MCP server and merged into `tools/list` — no per-plugin `--mcp` process configuration in your client. Exposure is author opt-in: a plugin's tools appear only when its manifest declares an `mcp` contribution with `external_tools: true` (SSH, Files, Kafka, LDAP, ... any plugin can do it):
+
+- Tools are exposed as `dbx_<prefix>__<tool>`, with the prefix derived from the plugin id's last segment: `io.dbx.ssh` → `dbx_ssh__sftp_list_dir`, `io.dbx.kafka` → `dbx_kafka__kafka_topics_list`.
+- Connections stay host-bound: the plugin schema's `connectionId` / `connectionName` are removed and replaced by an optional `dbx_connection` argument that selects among the plugin's **saved connections allowed by the DBX MCP settings**. With exactly one allowed connection you can omit it. The host generates the lifecycle payload (credentials, runtime endpoint) from the saved connection — credentials never reach the model or client.
+- Scoped sessions (`DBX_MCP_SCOPE_*`), the global tool allowlist, and the connection allowlist constrain plugin tools exactly like the `dbx_*` tools.
+- The tool allowlist matches exact names: after enabling plugin tools, add each `dbx_<prefix>__<tool>` you want exposed (or clear the allowlist to allow everything).
+- The Web / Docker backend does not serve plugin tools.
+
+### Lazy discovery (`DBX_MCP_PLUGIN_TOOLS`)
+
+With many plugins, one flat `tools/list` spends a lot of context on argument schemas. Set `DBX_MCP_PLUGIN_TOOLS=lazy` to expose only three meta tools — `dbx_plugin_list` (filterable plugin catalog), `dbx_plugin_tools` (one plugin's tools and schemas), and `dbx_plugin_call` (call by **plugin id** + tool) — so schemas enter the context on demand. `both` advertises the flat tools and the meta tools at once. The default stays `flat`.
 
 ## Resources
 
@@ -378,6 +394,18 @@ Updated servers do not let `DBX_MCP_ALLOW_WRITES` or `DBX_MCP_ALLOW_DANGEROUS_SQ
 | `DBX_MCP_DEBUG_SQL` | Include SQL in temporary diagnostics |
 
 ## Troubleshooting
+
+### Credential access after an upgrade
+
+Standalone macOS MCP runs without Keychain dialogs. If the existing encryption key is locked or denied, startup fails with `KEYRING_ACCESS_FAILED` (possibly inside `SECRET_KEY_UNAVAILABLE`) instead of repeatedly asking for a password. Unlock your login keychain first. For an older hash-bound authorization, run the **same official executable used by your MCP client** once in a terminal:
+
+```bash
+"$HOME/.dbx/bin/dbx-mcp" --authorize-keychain
+```
+
+Replace that path for a Homebrew or npm installation. The command verifies the running program's official signature and stable designated requirement before reading the existing DBX Keychain item. It does not open the database, start an MCP transport, create or replace a key, export key material, or rewrite an ACL itself. macOS may ask for confirmation once; choose **Always Allow** for the verified DBX executable, then restart your MCP client. An already-authorized executable should not prompt. Stable signing keeps that authorization valid across normal signed upgrades, not across a changed signing team or a revoked permission.
+
+Do not put `--authorize-keychain` in your MCP client's arguments: it is a one-time recovery command and exits immediately. Missing keys still require the Desktop data-security setup; this command cannot recreate a lost key. Windows and Linux do not use this macOS command. On those platforms, restore access to the credential store for the same OS user (or the configured headless key file) and restart MCP; denied or corrupt providers must not cause a replacement encryption key to be generated.
 
 <Accordions>
   <Accordion title="The optional platform package was not installed">Reinstall without `--no-optional`, then verify the platform with `node -p 'process.platform + "-" + process.arch'`. The current platform must appear in the supported platform table.</Accordion>

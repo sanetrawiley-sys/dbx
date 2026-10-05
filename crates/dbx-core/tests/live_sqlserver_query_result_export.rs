@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connection::ConnectionConfig {
     dbx_core::models::connection::ConnectionConfig {
+        oracle_oci_nls_lang: None,
+        oracle_oci_tns_admin: None,
         docs_notes_path: None,
         id: id.to_string(),
         name: id.to_string(),
@@ -129,6 +131,7 @@ async fn live_sqlserver_xlsx_export_can_outlive_query_timeout_while_rows_keep_ar
         execution_id: Some(format!("live-sqlserver-xlsx-{suffix}")),
         date_time_format: None,
         csv_quote_mode: Default::default(),
+        null_literal: String::new(),
         export_table_name: None,
         export_column_types: None,
         selected_columns: None,

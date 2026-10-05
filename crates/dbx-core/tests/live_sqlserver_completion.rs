@@ -18,6 +18,8 @@ use tokio_util::sync::CancellationToken;
 
 fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connection::ConnectionConfig {
     dbx_core::models::connection::ConnectionConfig {
+        oracle_oci_nls_lang: None,
+        oracle_oci_tns_admin: None,
         docs_notes_path: None,
         id: id.to_string(),
         name: id.to_string(),
@@ -525,6 +527,7 @@ async fn live_sqlserver_bulk_imports_zero_fraction_xlsx_numbers_into_bigint() {
         column_comments: Vec::new(),
         rows: vec![vec![serde_json::json!(1.0), serde_json::json!("xlsx")]],
         numeric_column_right_align: false,
+        auto_filter: None,
     })
     .expect("build SQL Server XLSX integer fixture");
     let path = dir.join("zero-fraction-integer.xlsx");
@@ -1017,6 +1020,7 @@ async fn live_sqlserver_table_structure_default_changes_drop_existing_constraint
         table_comment: None,
         original_table_comment: None,
         mysql_engine: None,
+        transwarp_create: None,
         partitioned: false,
         is_gaussdb_m_mode: false,
         table_collation: None,
@@ -1215,6 +1219,7 @@ async fn live_sqlserver_query_result_export_streams_cte_query_to_csv() {
         execution_id: Some(format!("live-sqlserver-export-{suffix}")),
         date_time_format: None,
         csv_quote_mode: Default::default(),
+        null_literal: String::new(),
         export_table_name: None,
         export_column_types: None,
         selected_columns: None,
@@ -1300,6 +1305,7 @@ async fn live_sqlserver_sql_file_import_executes_go_batches() {
         execution_id: format!("live-sqlserver-file-{suffix}"),
         connection_id: connection_id.to_string(),
         database: database.clone(),
+        schema: None,
         file_path: "fixture.sql".to_string(),
         continue_on_error: false,
         selected_tables: None,

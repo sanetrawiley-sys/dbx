@@ -68,6 +68,8 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       NPM_CONFIG_LOGLEVEL: error
+      # Cold vue-tsc runs exceed 4 GiB; public Linux runners provide 16 GiB RAM.
+      NODE_OPTIONS: --max-old-space-size=8192
     steps:
       - uses: actions/checkout@v7
 
@@ -132,14 +134,10 @@ jobs:
       - frontend-checks
       - frontend-typecheck
       - frontend-test
-    if: always()
+    if: always() && !cancelled()
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 22.13.0
       - name: Check selected frontend jobs
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
@@ -355,10 +353,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/win7-aws-lc-install
-          # Key covers the workspace Cargo.lock too: a main-workspace aws-lc-sys
-          # bump must rebuild the prebuilt artifacts instead of reusing the
-          # cached headers/lib for a stale version.
-          key: win7-aws-lc-v3-${{ runner.os }}-${{ env.WIN7_NIGHTLY_TOOLCHAIN }}-${{ hashFiles('Cargo.lock', '.github/fixtures/win7-aws-lc-cache/Cargo.lock') }}
+          # The fixture manifest and lockfile define the prebuilt AWS-LC artifact.
+          key: win7-aws-lc-v3-${{ runner.os }}-${{ env.WIN7_NIGHTLY_TOOLCHAIN }}-${{ hashFiles('.github/fixtures/win7-aws-lc-cache/Cargo.toml', '.github/fixtures/win7-aws-lc-cache/Cargo.lock') }}
 
       - name: Build Win7 AWS-LC cache
         if: steps.aws-lc-cache.outputs.cache-hit != 'true'
@@ -453,7 +449,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/win7-openssl-install
-          key: win7-openssl-v1-${{ runner.os }}-${{ env.WIN7_NIGHTLY_TOOLCHAIN }}-${{ hashFiles('Cargo.lock', '.github/fixtures/win7-openssl-cache/Cargo.lock') }}
+          key: win7-openssl-v1-${{ runner.os }}-${{ env.WIN7_NIGHTLY_TOOLCHAIN }}-${{ hashFiles('.github/fixtures/win7-openssl-cache/Cargo.toml', '.github/fixtures/win7-openssl-cache/Cargo.lock') }}
 
       - name: Build Win7 OpenSSL cache
         if: steps.openssl-cache.outputs.cache-hit != 'true'
@@ -523,7 +519,10 @@ jobs:
         shell: pwsh
         run: |
           $env:TAURI_CONFIG = Get-Content src-tauri/tauri.webview2-win7-fixed.conf.json -Raw
-          cargo build --locked --package dbx --release --features custom-protocol --target x86_64-win7-windows-msvc -Z build-std=std,panic_abort --timings
+          cargo -Z host-config -Z target-applies-to-host -Z build-std=std,panic_abort `
+            --config .github/fixtures/win7-host-repro-config.toml `
+            build --locked --package dbx --release --features custom-protocol `
+            --target x86_64-win7-windows-msvc --timings
 
       - name: Upload Windows 7 Cargo timings
         if: always()
@@ -542,11 +541,13 @@ jobs:
         shell: pwsh
         run: ./.github/scripts/assert-webview2-win7-loader.ps1 -BinaryPath target/x86_64-win7-windows-msvc/release/dbx.exe
 
-      - name: Bundle Windows 7 fixed-runtime installer
+      - name: Bundle Windows 7 fixed-runtime test installer with zlib
         shell: pwsh
         run: |
           $bundleDir = "target/x86_64-win7-windows-msvc/release/bundle/nsis"
-          pnpm tauri bundle --bundles nsis --target x86_64-win7-windows-msvc --config src-tauri/tauri.webview2-win7-fixed.conf.json
+          pnpm tauri bundle --bundles nsis --target x86_64-win7-windows-msvc `
+            --config src-tauri/tauri.webview2-win7-fixed.conf.json `
+            --config .github/fixtures/win7-nsis-zlib-config.json
           $installer = Get-ChildItem $bundleDir -Filter "*.exe" |
             Sort-Object LastWriteTimeUtc -Descending |
             Select-Object -First 1
@@ -936,14 +937,10 @@ jobs:
       - fast-checks
       - rust-fmt-clippy
       - rust-test
-    if: always()
+    if: always() && !cancelled()
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 22.13.0
       - name: Check selected rust jobs
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
@@ -1044,6 +1041,9 @@ jobs:
       duckdb_windows: ${{ steps.filter.outputs.duckdb_windows == 'true' || steps.plan.outputs.duckdb_windows == 'true' }}
       nix: ${{ steps.filter.outputs.nix }}
       windows_win7_bundle: ${{ steps.filter.outputs.windows_win7_bundle }}
+      windows_win7_candidate: ${{ steps.plan.outputs.windows_win7_candidate }}
+      windows_win7_affected_packages: ${{ steps.plan.outputs.windows_win7_affected_packages }}
+      windows_win7_reasons: ${{ steps.plan.outputs.windows_win7_reasons }}
       github_scripts: ${{ steps.filter.outputs.github_scripts }}
       fast: ${{ steps.plan.outputs.fast }}
       rust_matrix: ${{ steps.plan.outputs.rust_matrix }}
@@ -1059,12 +1059,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0
+          fetch-depth: 1
+
+      - name: Fetch change base
+        id: change-base
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
+            exit 0
+          fi
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          echo "sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Detect changed areas
         uses: dorny/paths-filter@v4
         id: filter
         with:
+          base: ${{ steps.change-base.outputs.sha }}
           filters: |
             frontend:
               - 'apps/desktop/**'
@@ -1182,14 +1194,13 @@ jobs:
               - '.github/workflows/ci.yml'
               - 'apps/desktop/src/types/database.ts'
               - 'crates/dbx-core/assets/database-drivers.manifest.json'
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
       - name: Plan dependency-aware CI jobs
         id: plan
         env:
-          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          BASE_SHA: ${{ steps.change-base.outputs.sha }}
           RUST_CHANGED: ${{ steps.filter.outputs.rust }}
           AGENTS_CHANGED: ${{ steps.filter.outputs.agents }}
+          WIN7_CURRENT: ${{ steps.filter.outputs.windows_win7_bundle }}
         run: node .github/scripts/ci-plan.mjs
 
   agents:
@@ -1201,14 +1212,10 @@ jobs:
       - agent-rust
       - agent-go
       - agent-integration
-    if: always()
+    if: always() && !cancelled()
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 22.13.0
       - name: Check selected agents jobs
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
@@ -1484,14 +1491,10 @@ jobs:
       - jdbc
       - offline-jdbc-release
       - nix-packaging
-    if: always()
+    if: always() && !cancelled()
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 22.13.0
       - name: Check selected all jobs
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}

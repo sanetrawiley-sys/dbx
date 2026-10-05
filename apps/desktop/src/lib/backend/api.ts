@@ -75,6 +75,8 @@ export const sessionCredentialStatus = forward("sessionCredentialStatus");
 export const forgetSessionCredential = forward("forgetSessionCredential");
 export const replaceNacosSessionCredential = forward("replaceNacosSessionCredential");
 export const checkConnectionHealth = forward("checkConnectionHealth");
+export const connectionIsOpen = forward("connectionIsOpen");
+export const subscribeConnectionLiveness = forward("subscribeConnectionLiveness");
 export const prewarmConnection = forward("prewarmConnection");
 export const connectionIdentifierQuote = forward("connectionIdentifierQuote");
 export const closeDatabaseConnection = forward("closeDatabaseConnection");
@@ -420,6 +422,11 @@ export const forgetWebdavSavedPassword = forward("forgetWebdavSavedPassword");
 export const webdavSyncSecretsStatus = forward("webdavSyncSecretsStatus");
 export const saveWebdavSyncSecretsPreference = forward("saveWebdavSyncSecretsPreference");
 export const forgetWebdavSyncSecretsPassphrase = forward("forgetWebdavSyncSecretsPassphrase");
+export const cloudSyncLocalCatalog = forward("cloudSyncLocalCatalog");
+export const localBackupExport = forward("localBackupExport");
+export const localBackupInspect = forward("localBackupInspect");
+export const localBackupImport = forward("localBackupImport");
+export const webdavSyncInspect = forward("webdavSyncInspect");
 export const webdavSyncUpload = forward("webdavSyncUpload");
 export const webdavSyncDownload = forward("webdavSyncDownload");
 export const snippetSyncTest = forward("snippetSyncTest");
@@ -427,6 +434,7 @@ export const snippetTokenStatus = forward("snippetTokenStatus");
 export const saveSnippetSavedToken = forward("saveSnippetSavedToken");
 export const forgetSnippetSavedToken = forward("forgetSnippetSavedToken");
 export const snippetSyncSettings = forward("snippetSyncSettings");
+export const snippetSyncInspect = forward("snippetSyncInspect");
 export const saveSnippetSyncId = forward("saveSnippetSyncId");
 export const retrySnippetLegacyCleanup = forward("retrySnippetLegacyCleanup");
 export const snippetSyncUpload = forward("snippetSyncUpload");
@@ -570,6 +578,8 @@ export const startTableExport = forward("startTableExport");
 export const cancelTableExport = forward("cancelTableExport");
 export const startQueryResultExport = forward("startQueryResultExport");
 export const cancelQueryResultExport = forward("cancelQueryResultExport");
+export const openQueryResultTempFile = forward("openQueryResultTempFile");
+export const createQueryResultTempFile = forward("createQueryResultTempFile");
 
 // Redis
 export const redisListDatabases = forward("redisListDatabases");
@@ -577,6 +587,7 @@ export const redisScanKeys = forward("redisScanKeys");
 export const redisScanKeysBatch = forward("redisScanKeysBatch");
 export const redisScanValues = forward("redisScanValues");
 export const redisGetValue = forward("redisGetValue");
+export const redisGetRawValue = forward("redisGetRawValue");
 export const redisGetTtl = forward("redisGetTtl");
 export const redisGetStreamEntries = forward("redisGetStreamEntries");
 export const redisGetStreamGroups = forward("redisGetStreamGroups");
@@ -996,6 +1007,10 @@ export type {
   WebDavConfig,
   WebDavPasswordStatus,
   WebDavSyncSummary,
+  SyncCatalogItem,
+  PluginUiStorageItemRef,
+  SyncSelection,
+  SyncSnapshotCatalog,
   WebDavDownloadResult,
   SnippetProvider,
   SnippetSyncConfig,

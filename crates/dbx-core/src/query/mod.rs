@@ -1429,7 +1429,7 @@ fn options_for_sequential_statements(
     statement_options
 }
 
-fn should_discard_pool_after_query_timeout(db_type: Option<DatabaseType>) -> bool {
+pub(crate) fn should_discard_pool_after_query_timeout(db_type: Option<DatabaseType>) -> bool {
     let Some(db_type) = db_type else {
         return false;
     };
@@ -2056,6 +2056,19 @@ async fn do_execute_typed(
             // cursorMark 分页只服务文档浏览器；REST 查询是一次性请求，不需要 session 游标。
             let result =
                 wait_for_query_opt(cancel_token, query_timeout, db::solr_driver::execute_rest_query(&client, &sql))
+                    .await
+                    .map(|result| truncate_result_with_max_rows(result, max_rows));
+            if matches!(result.as_ref(), Err(err) if should_discard_pool_after_error(pool_db_type, err)) {
+                state.remove_pool_by_key(pool_key).await;
+            }
+            result
+        }
+        PoolKind::CouchDb(client) => {
+            let client = client.clone();
+            let sql = sql.to_string();
+            let max_rows = options.max_rows;
+            let result =
+                wait_for_query_opt(cancel_token, query_timeout, db::couchdb_driver::execute_rest_query(&client, &sql))
                     .await
                     .map(|result| truncate_result_with_max_rows(result, max_rows));
             if matches!(result.as_ref(), Err(err) if should_discard_pool_after_error(pool_db_type, err)) {
@@ -2899,7 +2912,7 @@ async fn execute_sql_statement_with_options_typed_inner(
         || crate::sql::has_executable_sql(sql),
         |db_type| crate::sql::has_executable_sql_for_database(sql, db_type),
     );
-    if !has_executable_sql {
+    if !has_executable_sql && options.result_session_id.is_none() {
         return Ok(empty_query_result(0));
     }
 
@@ -3123,6 +3136,11 @@ pub async fn close_query_session(
         PoolKind::Solr(client) => {
             let client = client.clone();
             db::solr_driver::close_cursor(&client, session_id).await?;
+            Ok(true)
+        }
+        PoolKind::CouchDb(client) => {
+            let client = client.clone();
+            db::couchdb_driver::close_cursor(&client, session_id).await?;
             Ok(true)
         }
         _ => Ok(false),
@@ -4735,6 +4753,7 @@ fn pool_kind_has_transactional_path(pool: &PoolKind) -> bool {
         | PoolKind::Elasticsearch(_)
         | PoolKind::Easysearch(_)
         | PoolKind::Solr(_)
+        | PoolKind::CouchDb(_)
         | PoolKind::Meilisearch(_)
         | PoolKind::Salesforce(_)
         | PoolKind::VectorDb(_)
@@ -5140,6 +5159,7 @@ fn batch_transaction_path(pool: &PoolKind) -> BatchTransactionPath {
         | PoolKind::Elasticsearch(_)
         | PoolKind::Easysearch(_)
         | PoolKind::Solr(_)
+        | PoolKind::CouchDb(_)
         | PoolKind::Meilisearch(_)
         | PoolKind::Salesforce(_)
         | PoolKind::VectorDb(_)
@@ -5720,6 +5740,12 @@ fn mysql_error_is_syntax_error(error: &mysql_async::Error) -> bool {
         mysql_async::Error::Server(server_error) if server_error.code == 1105 => {
             let message = server_error.message.to_ascii_lowercase();
             message.contains("syntax error") && (message.contains("encountered:") || message.contains("expected"))
+        }
+        // PolarDB-X exposes parser failures such as PXC-4500 / ERR_PARSER
+        // through the generic MySQL protocol ERR_HANDLE_DATA code (3009).
+        mysql_async::Error::Server(server_error) if server_error.code == 3009 => {
+            let message = server_error.message.to_ascii_lowercase();
+            message.contains("[err_parser]") || message.contains("syntax error") || message.contains("语法错误")
         }
         _ => false,
     }
@@ -8041,6 +8067,8 @@ for line in sys.stdin:
 
     fn test_connection_config(db_type: DatabaseType) -> ConnectionConfig {
         ConnectionConfig {
+            oracle_oci_nls_lang: None,
+            oracle_oci_tns_admin: None,
             docs_notes_path: None,
             id: "conn-1".to_string(),
             name: "Connection".to_string(),
@@ -8987,7 +9015,13 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn gaussdb_on_error_stop_overrides_continue_on_error() {
+    async fn postgres_family_on_error_stop_overrides_continue_on_error() {
+        for db_type in [DatabaseType::Postgres, DatabaseType::OpenGauss, DatabaseType::Gaussdb] {
+            assert_psql_on_error_stop_overrides_continue_on_error(db_type).await;
+        }
+    }
+
+    async fn assert_psql_on_error_stop_overrides_continue_on_error(db_type: DatabaseType) {
         let dir = std::env::temp_dir().join(format!("dbx-query-gaussdb-on-error-stop-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
@@ -8999,7 +9033,7 @@ for line in sys.stdin:
                 connections.insert(connection_id.to_string(), PoolKind::Sqlite(sqlite));
             })
             .await;
-        state.configs.write().await.insert(connection_id.to_string(), test_connection_config(DatabaseType::Gaussdb));
+        state.configs.write().await.insert(connection_id.to_string(), test_connection_config(db_type));
 
         let results = execute_multi_core_with_options(
             &state,
@@ -10180,7 +10214,7 @@ for line in sys.stdin:
         assert_eq!(cells.len(), 1);
         assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 4);
 
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -10365,7 +10399,7 @@ for line in sys.stdin:
         assert_eq!(result.rows, vec![vec![serde_json::json!(42)]]);
         assert_eq!(std::fs::read_to_string(&calls).unwrap(), "executeQueryPage\nexecuteQuery\n");
 
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -10429,7 +10463,7 @@ for line in sys.stdin:
         assert_eq!(error, "Incorrect syntax near SELECT");
         assert_eq!(std::fs::read_to_string(&calls).unwrap(), "request\n");
 
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -10883,6 +10917,8 @@ for line in sys.stdin:
     #[test]
     fn external_driver_query_params_include_database_and_schema_context() {
         let config = ConnectionConfig {
+            oracle_oci_nls_lang: None,
+            oracle_oci_tns_admin: None,
             docs_notes_path: None,
             id: "jdbc-1".to_string(),
             name: "JDBC".to_string(),
@@ -11427,7 +11463,11 @@ for line in sys.stdin:
     request = json.loads(line)
     method = request.get("method")
     if method == "execute_query":
-        sql = request.get("params", {{}}).get("sql", "")
+        params = request.get("params", {{}})
+        sql = params.get("sql", "")
+        if "REQUIRE_APP_SCHEMA" in sql and params.get("schema") != "APP":
+            print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "error": {{"code": -32000, "message": "schema was not forwarded"}}}}), flush=True)
+            continue
         if "RAISE_FILE_ERROR" in sql:
             print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "error": {{"code": -32000, "message": "file statement rejected"}}}}), flush=True)
             continue
@@ -11491,7 +11531,7 @@ for line in sys.stdin:
                 snapshot_rotation_safe: true,
                 connection_id: "agent-conn".to_string(),
                 database: "ORCL".to_string(),
-                schema: None,
+                schema: Some("APP".to_string()),
             },
         );
         (state, txn_session_id, dir)
@@ -11503,6 +11543,7 @@ for line in sys.stdin:
             execution_id: "manual-file-test".to_string(),
             connection_id: "agent-conn".to_string(),
             database: "ORCL".to_string(),
+            schema: Some("APP".to_string()),
             file_path: String::new(),
             continue_on_error: false,
             selected_tables: None,
@@ -11521,7 +11562,7 @@ for line in sys.stdin:
         crate::data::sql_file_import::execute_sql_file_content(
             &state,
             &request,
-            "UPDATE T SET V = 1; UPDATE T SET V = 2;",
+            "SELECT REQUIRE_APP_SCHEMA; UPDATE T SET V = 2;",
             CancellationToken::new(),
             std::time::Instant::now(),
             |event| events.push(event),
@@ -11637,6 +11678,23 @@ for line in sys.stdin:
             assert!(events.is_empty());
             assert!(state.transaction_sessions.read().await.contains_key(&session_id));
         }
+        let mut request = manual_sql_file_request(&session_id);
+        request.schema = Some("OTHER".to_string());
+        let mut events = Vec::new();
+        let error = crate::data::sql_file_import::execute_sql_file_content(
+            &state,
+            &request,
+            "UPDATE T SET V = 1;",
+            CancellationToken::new(),
+            std::time::Instant::now(),
+            |event| events.push(event),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("target does not match"));
+        assert!(events.is_empty());
+        assert!(state.transaction_sessions.read().await.contains_key(&session_id));
+
         rollback_manual_transaction(&state, &session_id).await.unwrap();
         let error = crate::data::sql_file_import::execute_sql_file_content(
             &state,
@@ -12293,5 +12351,27 @@ for line in sys.stdin:
 
         assert!(mysql_error_is_syntax_error(&doris_syntax_error));
         assert!(!mysql_error_is_syntax_error(&generic_unknown_error));
+    }
+
+    #[test]
+    fn mysql_backup_transaction_falls_back_for_polardbx_parser_errors() {
+        for message in [
+            "[PXC-4500][ERR_PARSER] syntax error, expect EOF, actual COMMA after WITH CONSISTENT SNAPSHOT",
+            "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY 语法错误",
+        ] {
+            let polardbx_parser_error = mysql_async::Error::Server(mysql_async::ServerError {
+                code: 3009,
+                message: message.to_string(),
+                state: "HY000".to_string(),
+            });
+            assert!(mysql_error_is_syntax_error(&polardbx_parser_error));
+        }
+        let polardbx_non_parser_error = mysql_async::Error::Server(mysql_async::ServerError {
+            code: 3009,
+            message: "Failed to handle data".to_string(),
+            state: "HY000".to_string(),
+        });
+
+        assert!(!mysql_error_is_syntax_error(&polardbx_non_parser_error));
     }
 }
