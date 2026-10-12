@@ -69,12 +69,12 @@ import { executableStatementRangeAtCursor, executableStatementRangeCacheForDoc, 
 
 import { looksLikeDmlStatement } from "@/lib/sql/dmlChangePreview";
 
-import { canFormatSqlForDatabaseType, formatSqlForEditing, compressSqlText } from "@/lib/sql/sqlFormatter";
+import { canFormatSqlForDatabaseType, formatSqlText, compressSqlText } from "@/lib/sql/sqlFormatter";
 import { detectAndFormatStructured } from "@/lib/sql/autoFormat";
 import { restoreSqlFromSourcePaste } from "@/lib/sql/sqlSourcePaste";
 import { enabledSqlParameterSyntaxes, resolveSqlVariableSyntaxToggles } from "@/lib/sql/sqlVariableSyntax";
 
-import { createQueryEditorExecutionViewportOwnership, isQueryEditorPositionVisible } from "@/lib/editor/queryEditorExecutionViewport";
+import { createQueryEditorExecutionViewportOwnership, isQueryEditorPositionVisible, locateCursorForGutterExecution } from "@/lib/editor/queryEditorExecutionViewport";
 import { mapQueryEditorFormatSelection } from "@/lib/editor/queryEditorFormatSelection";
 import { joinQueryEditorLines } from "@/lib/editor/queryEditorJoinLines";
 
@@ -131,6 +131,7 @@ import { computePasteCaretResyncTarget } from "@/lib/editor/queryEditorPasteCare
 import { extendQueryEditorSelection, runQueryEditorAltExtendSelection } from "@/lib/editor/queryEditorExtendSelection";
 import { addNextQueryEditorSelectionOccurrence, selectAllQueryEditorSelectionOccurrences } from "@/lib/editor/queryEditorOccurrenceSelection";
 import { selectLineEnds } from "@/lib/editor/selectLineEnds";
+import { scrollEditorLine } from "@/lib/editor/scrollEditorLine";
 import { createQueryEditorStringMouseSelection } from "@/lib/editor/queryEditorStringMouseSelection";
 import { createQueryEditorCompletionShortcutBindings } from "@/lib/editor/queryEditorCompletionShortcut";
 import { createQueryEditorSelectionCaseShortcutBindings } from "@/lib/editor/queryEditorSelectionCaseShortcut";
@@ -349,6 +350,7 @@ async function loadStructurePeekColumns(panelId: string, requestId: number, targ
   try {
     const objectMetadataRequest = {
       connectionId: props.connectionId,
+      queryTimeoutSecs: connectionStore.getConfig(props.connectionId)?.query_timeout_secs,
       database,
       schema,
       tableName: target.name,
@@ -1177,13 +1179,9 @@ function executeSqlStatementFromGutter(currentView: EditorViewType, line: { from
   // selection overlapping that statement is more specific, so preserve it; a
   // selection elsewhere in the document must not hijack the click.
   const editorViewportRequestId = executionViewportOwnership.beginRequest();
-  const selection = currentView.state.selection.main;
-  const hasSelectedSql = !selection.empty && currentView.state.sliceDoc(selection.from, selection.to).trim().length > 0;
-  const selectionOverlapsStatement = hasSelectedSql && selection.from < statementRange.to && statementRange.from < selection.to;
+  const { selectionOverlapsStatement } = locateCursorForGutterExecution(currentView, statementRange, settingsStore.editorSettings.locateCursorOnGutterExecute);
   const executionSnapshot = selectionOverlapsStatement ? sqlExecutionSnapshotFromView(currentView) : sqlExecutionSnapshotForRange(currentView, statementRange);
   emitExecutionRequest({ ...executionSnapshot, editorViewportRequestId });
-  // 不主动聚焦编辑器，否则 CodeMirror 会把屏幕滚回之前的光标位置。
-  // currentView.focus();
   return true;
 }
 
@@ -1197,6 +1195,28 @@ function selectSqlLineFromGutter(currentView: EditorViewType, line: { from: numb
   });
   currentView.focus();
   return true;
+}
+
+/**
+ * 选中光标所在的当前可执行语句（与「执行当前语句」共用同一套范围计算，
+ * 边界行为保持一致）；属于纯选区操作，不改文档，因此只读编辑器同样可用。
+ */
+function selectCurrentStatementFromView(currentView: EditorViewType): boolean {
+  const range = executableStatementRangeAtPosition(currentView, currentView.state.selection.main.head);
+  if (!range || range.from === range.to) return false;
+  currentView.dispatch({
+    selection: { anchor: range.from, head: range.to },
+    scrollIntoView: true,
+    userEvent: "select.keyboard",
+  });
+  currentView.focus();
+  return true;
+}
+
+function selectCurrentStatementFromContextMenu(): void {
+  const currentView = view.value;
+  if (!currentView) return;
+  selectCurrentStatementFromView(currentView);
 }
 
 const contextMenuActions: QueryEditorContextMenuActions = {
@@ -1221,6 +1241,7 @@ const contextMenuActions: QueryEditorContextMenuActions = {
   selectAllSelectionOccurrencesFromContextMenu,
   openFindReplaceFromContextMenu,
   deleteEmptyLines,
+  selectCurrentStatementFromContextMenu,
   selectAllSqlFromContextMenu,
   emitContextObjectAction,
   openCodeSnapshot,
@@ -1388,11 +1409,14 @@ function runKeymapExtension(codeMirrorKeymap: (typeof import("@codemirror/view")
         ...binding(shortcuts.deleteLine, (view) => codeMirrorRuntime.codeMirrorDeleteLine?.(view) ?? false),
         ...binding(shortcuts.moveLineUp, (view) => codeMirrorRuntime.codeMirrorMoveLineUp?.(view) ?? false),
         ...binding(shortcuts.moveLineDown, (view) => codeMirrorRuntime.codeMirrorMoveLineDown?.(view) ?? false),
+        ...binding(shortcuts.scrollLineUp, (view) => scrollEditorLine(view, "up")),
+        ...binding(shortcuts.scrollLineDown, (view) => scrollEditorLine(view, "down")),
         ...binding(shortcuts.copyLineUp, (view) => codeMirrorRuntime.codeMirrorCopyLineUp?.(view) ?? false),
         ...binding(shortcuts.copyLineDown, (view) => codeMirrorRuntime.codeMirrorCopyLineDown?.(view) ?? false),
         ...binding(shortcuts.undo, (view) => codeMirrorRuntime.codeMirrorUndo?.(view) ?? false),
         ...binding(shortcuts.redo, (view) => codeMirrorRuntime.codeMirrorRedo?.(view) ?? false),
         ...binding(shortcuts.selectAll, (view) => codeMirrorRuntime.codeMirrorSelectAll?.(view) ?? false),
+        ...binding(shortcuts.selectCurrentStatement, selectCurrentStatementFromView),
         ...binding(shortcuts.extendSelection, extendQueryEditorSelectionForView),
         ...binding(shortcuts.addNextSelectionOccurrence, addNextQueryEditorSelectionOccurrence),
         ...binding(shortcuts.selectAllSelectionOccurrences, selectAllQueryEditorSelectionOccurrences),
@@ -1712,7 +1736,12 @@ async function formatCurrentSql() {
           return;
         } else {
           formattedAsSql = true;
-          formatted = await formatSqlForEditing(source, formatDialect, settingsStore.editorSettings.sqlFormatter);
+          // The explicit Format command has to say why it did nothing:
+          // `formatSqlForEditing` returns unparseable input unchanged (the right
+          // contract for format-on-save, which must never fail), which turned
+          // this command into a silent no-op. A thrown error reaches the
+          // `formatError` toast below.
+          formatted = await formatSqlText(source, formatDialect, settingsStore.editorSettings.sqlFormatter);
         }
       }
     }
@@ -2388,12 +2417,9 @@ watch(
   },
 );
 
-watch(
-  () => props.executionError,
-  () => {
-    reconfigureDiagnostics();
-  },
-);
+watch([() => props.executionError, () => props.executionErrorSql, () => props.executionErrorResult], () => {
+  reconfigureDiagnostics();
+});
 
 watch(
   () => props.statementExecutionMarkers ?? [],
@@ -2681,7 +2707,9 @@ function resumeQueryEditorBackgroundWork() {
   // the first Run does not pay pool creation or external-driver startup.
   warmActiveTabConnection();
   if (view.value) schedulePreviewContextRefresh(view.value);
-  restoreEditorSelection(undefined, !props.initialViewport);
+  if (props.initialSelection !== undefined) {
+    restoreEditorSelection(props.initialSelection, !props.initialViewport);
+  }
   restoreEditorFocus();
   restoreEditorViewport();
 }
@@ -2754,7 +2782,12 @@ function scrollCursorIntoView() {
 }
 
 function beginExecutionViewportTracking() {
-  executionViewportOwnership.beginExecution();
+  // Snapshot visibility while the viewport still has its pre-execution size:
+  // once the results pane opens it shrinks the editor, and a cursor that was
+  // visible before execution must not be scrolled away by the shrink (#10480).
+  const currentView = view.value;
+  const cursorVisible = currentView ? isQueryEditorPositionVisible(currentView.state.selection.main.head, currentView.visibleRanges, currentView.viewport) : false;
+  executionViewportOwnership.beginExecution(cursorVisible);
 }
 
 function recordExecutionViewportInteraction() {

@@ -19,7 +19,7 @@ export function transferStrategyOptions(strategy: TransferStrategy): Pick<Transf
 const REBUILD_TARGET_TYPES = new Set<DatabaseType>(["mysql", "postgres", "sqlserver", "kingbase", "gaussdb", "opengauss", "kwdb", "goldendb", "sqlite", "duckdb", "cloudflare-d1"]);
 
 export function supportsTransferUpsert(targetType: DatabaseType | undefined): boolean {
-  return targetType !== "db2" && targetType !== "iris";
+  return targetType !== "db2" && targetType !== "iris" && targetType !== "xugu";
 }
 
 export function rebuildUnavailableReason(content: TransferContent, targetType: DatabaseType | undefined): "dataOnly" | "unsupported" | undefined {
@@ -58,6 +58,11 @@ export function transferPreviewSql(preview: TransferOwnershipPreview): string {
   const sections = [preview.rebuild?.backupSql, preview.structure?.sql, preview.rebuild?.cleanupSql].filter((section): section is string => Boolean(section));
   if (sections.length > 0) return sections.join("\n\n");
   return preview.rebuild?.sql ?? "";
+}
+
+/** Production review keeps the human-readable plan ahead of the exact SQL preview. */
+export function transferPlanReviewText(strategy: string, summary: string, preview: TransferOwnershipPreview): string {
+  return [strategy, summary, transferPreviewSql(preview)].filter(Boolean).join("\n\n");
 }
 
 /** Whether this preview has SQL the user must review in a read-only confirmation. */

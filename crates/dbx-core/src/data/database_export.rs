@@ -12,6 +12,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 
 use crate::connection::task_client_session_id;
+use crate::data_grid_sql::{extra_is_auto_generated, DataGridPrimaryKeyMode};
 use crate::models::connection::DatabaseType;
 use crate::mysql_ddl_normalize::DdlNormalizeOptions;
 use crate::object_source_sql::build_export_object_source_sql;
@@ -28,7 +29,7 @@ use crate::types::{ObjectSourceKind, SpatialColumn, SqlExportColumnSelection};
 static EXPORT_CANCELLED: std::sync::LazyLock<RwLock<HashSet<String>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
 
-const EXPORT_CANCELLED_ERROR: &str = "Export cancelled";
+pub const EXPORT_CANCELLED_ERROR: &str = "Export cancelled";
 const EXPORT_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// MySQL scripts written by the exporter are always UTF-8: values are decoded off the
@@ -261,6 +262,21 @@ fn exports_schema_wide_objects(request: &DatabaseExportRequest) -> bool {
 /// stays unchanged.
 fn exports_mysql_trigger_objects(db_type: DatabaseType) -> bool {
     matches!(db_type, DatabaseType::Mysql)
+}
+
+/// Oracle writes each table's triggers into its table DDL (see `loadTableTriggerDDLs` in
+/// `agents/drivers/oracle-go`), so a trigger that reads `seq.NEXTVAL` reaches the script
+/// whenever structure is exported. The standalone sequences it depends on are written
+/// before the tables of a whole-schema structure export so the script replays (#11673).
+fn exports_oracle_sequence_objects(request: &DatabaseExportRequest, db_type: DatabaseType) -> bool {
+    matches!(db_type, DatabaseType::Oracle) && request.include_structure && request.selected_tables.is_empty()
+}
+
+/// Oracle backs every identity column with a system-named `ISEQ$$_<object id>` sequence.
+/// The identity clause in the table DDL recreates it, so exporting it would only add an
+/// orphan sequence to the target schema.
+fn is_oracle_identity_sequence(name: &str) -> bool {
+    name.starts_with("ISEQ$$_")
 }
 
 fn database_export_total_objects(request: &DatabaseExportRequest, counts: &DatabaseExportObjectCounts) -> usize {
@@ -812,6 +828,30 @@ fn is_sqlserver_binary_export_column(database_type: Option<DatabaseType>, column
         let normalized = column_type.trim().to_ascii_lowercase();
         let base = normalized.split(['(', ' ', '\t', '\n']).next().unwrap_or("").trim();
         matches!(base, "binary" | "varbinary" | "image" | "timestamp" | "rowversion")
+    })
+}
+
+/// SQL Server columns that can never take an explicit `INSERT` value:
+/// `timestamp`/`rowversion` counters and computed columns both reject supplied
+/// values ("Cannot insert an explicit value into a timestamp column" / "Cannot
+/// insert a value into the computed column"), so INSERT scripts (grid copy, SQL
+/// export) must omit them, the same way tsvector columns are omitted for
+/// PostgreSQL (issue #10764).
+fn is_sqlserver_non_insertable_export_column(
+    database_type: Option<DatabaseType>,
+    column_type: Option<&str>,
+    column_extra: Option<&str>,
+) -> bool {
+    if database_type != Some(DatabaseType::SqlServer) {
+        return false;
+    }
+    if column_extra.is_some_and(|extra| extra.trim().eq_ignore_ascii_case("computed")) {
+        return true;
+    }
+    column_type.is_some_and(|column_type| {
+        let normalized = column_type.trim().to_ascii_lowercase();
+        let base = normalized.split(['(', ' ', '\t', '\n']).next().unwrap_or("").trim();
+        matches!(base, "timestamp" | "rowversion")
     })
 }
 
@@ -1421,8 +1461,7 @@ pub(crate) fn build_export_insert_statements_excluding_with_dialect(
     if options.columns.is_empty() || options.rows.is_empty() {
         return Ok(Vec::new());
     }
-    let excluded_names: HashSet<String> =
-        exclude_columns.iter().map(|column| column.trim().to_ascii_uppercase()).collect();
+    let excluded_names: HashSet<&str> = exclude_columns.iter().map(|column| column.trim()).collect();
     let table = export_qualified_table_name(
         options.database_type,
         options.schema.as_deref(),
@@ -1439,7 +1478,19 @@ pub(crate) fn build_export_insert_statements_excluding_with_dialect(
         .enumerate()
         .filter_map(|(index, column)| {
             let column_type = export_column_type(&options.column_types, index, options.database_type, &spatial_columns);
-            let excluded = excluded_names.contains(&column.trim().to_ascii_uppercase());
+            let column_name = column.trim();
+            let excluded = excluded_names.contains(column_name)
+                || (exclude_columns
+                    .iter()
+                    .filter(|excluded| excluded.trim().eq_ignore_ascii_case(column_name))
+                    .count()
+                    == 1
+                    && options
+                        .columns
+                        .iter()
+                        .filter(|candidate| candidate.trim().eq_ignore_ascii_case(column_name))
+                        .count()
+                        == 1);
             (is_export_insert_column(
                 options.database_type,
                 column,
@@ -1638,6 +1689,43 @@ fn export_sql_statement_bytes(database_type: Option<DatabaseType>, text: &str) -
     }
 }
 
+pub(crate) fn sql_export_excluded_primary_keys(
+    database_type: Option<DatabaseType>,
+    mode: DataGridPrimaryKeyMode,
+    primary_keys: &[String],
+    columns: &[String],
+    column_extras: &[Option<String>],
+) -> Vec<String> {
+    match mode {
+        DataGridPrimaryKeyMode::Include => Vec::new(),
+        DataGridPrimaryKeyMode::ExcludeAll | DataGridPrimaryKeyMode::ExcludeGenerated => primary_keys
+            .iter()
+            .filter_map(|key| sql_export_column_index(database_type, key, columns))
+            .filter(|index| {
+                mode == DataGridPrimaryKeyMode::ExcludeAll
+                    || column_extras.get(*index).and_then(|extra| extra.as_deref()).is_some_and(extra_is_auto_generated)
+            })
+            .map(|index| columns[index].clone())
+            .collect(),
+    }
+}
+
+pub(crate) fn sql_export_column_index(
+    database_type: Option<DatabaseType>,
+    name: &str,
+    columns: &[String],
+) -> Option<usize> {
+    if let Some(index) = columns.iter().position(|column| column == name) {
+        return Some(index);
+    }
+    if matches!(database_type, Some(DatabaseType::Postgres | DatabaseType::Redshift)) {
+        return None;
+    }
+    let mut matches = columns.iter().enumerate().filter(|(_, column)| column.eq_ignore_ascii_case(name));
+    let index = matches.next()?.0;
+    matches.next().is_none().then_some(index)
+}
+
 pub(crate) fn is_internal_export_column(database_type: Option<DatabaseType>, column: &str) -> bool {
     // Synthetic ROWID is injected only to identify editable rows. It is not a
     // physical table column and must never propagate into exports.
@@ -1688,6 +1776,15 @@ impl SqlExportProjection {
 
     pub(crate) fn project_request<T: Clone + Default>(&self, values: &[T]) -> Vec<T> {
         self.entries.iter().map(|(_, request_index)| values.get(*request_index).cloned().unwrap_or_default()).collect()
+    }
+
+    pub(crate) fn project_excluded_columns(&self, columns: &[String], exclude_columns: &[String]) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter_map(|(index, _)| columns.get(*index))
+            .filter(|column| exclude_columns.contains(column))
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn project_owned<T: Default>(&self, mut values: Vec<T>) -> Vec<T> {
@@ -1822,6 +1919,7 @@ fn is_export_insert_column(
 ) -> bool {
     !is_internal_export_column(database_type, column)
         && !is_postgres_tsvector_export_column(database_type, column_type)
+        && !is_sqlserver_non_insertable_export_column(database_type, column_type, column_extra)
         && (database_type != Some(DatabaseType::Mysql) || !is_mysql_generated_column_extra(column_extra))
 }
 
@@ -2200,6 +2298,7 @@ async fn list_postgres_export_enums(
         }
     };
     let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = crate::db::postgres::PostgresTextClient::new(&client);
     let rows = client.query(POSTGRES_EXPORT_ENUMS_SQL, &[&schema]).await.map_err(|e| e.to_string())?;
     rows.into_iter()
         .map(|row| {
@@ -2293,7 +2392,8 @@ async fn postgres_export_sequence_parameters_legacy(
     client: &deadpool_postgres::Client,
     schema: &str,
     sequence: &str,
-) -> Result<Option<PostgresExportSequenceParameters>, tokio_postgres::Error> {
+) -> Result<Option<PostgresExportSequenceParameters>, crate::db::postgres::PostgresQueryError> {
+    let client = crate::db::postgres::PostgresTextClient::new(client);
     let qualified = format!(
         "{}.{}",
         quote_identifier(schema, &DatabaseType::Postgres),
@@ -2335,6 +2435,7 @@ async fn list_postgres_export_sequences(
         }
     };
     let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = crate::db::postgres::PostgresTextClient::new(&client);
     // PostgreSQL 10+ keeps sequence parameters in `pg_sequence`; older servers
     // have neither that catalog nor `pg_sequence_last_value()`, so the compat
     // tier lists sequences (and owners) without it and reads each sequence
@@ -3922,8 +4023,11 @@ async fn export_database_sql_core_inner(
     let mut functions: Vec<crate::types::ObjectInfo> = Vec::new();
     let mut triggers: Vec<crate::types::ObjectInfo> = Vec::new();
     let mut events: Vec<crate::types::ObjectInfo> = Vec::new();
+    let mut oracle_sequences: Vec<crate::types::ObjectInfo> = Vec::new();
+    let collects_schema_wide_objects = exports_schema_wide_objects(request);
+    let collects_oracle_sequences = exports_oracle_sequence_objects(request, db_type);
 
-    if exports_schema_wide_objects(request) {
+    if collects_schema_wide_objects || collects_oracle_sequences {
         match crate::schema::list_objects_core(
             state,
             &request.connection_id,
@@ -3941,6 +4045,15 @@ async fn export_database_sql_core_inner(
                 for obj in &objects {
                     let ot = obj.object_type.to_uppercase();
                     if is_postgres_extension_member_routine(obj, &postgres_extension_members) {
+                        continue;
+                    }
+                    if ot == "SEQUENCE" {
+                        if collects_oracle_sequences && !is_oracle_identity_sequence(&obj.name) {
+                            oracle_sequences.push(obj.clone());
+                        }
+                        continue;
+                    }
+                    if !collects_schema_wide_objects {
                         continue;
                     }
                     if ot.contains("PROCEDURE") {
@@ -3966,7 +4079,8 @@ async fn export_database_sql_core_inner(
         &DatabaseExportObjectCounts {
             tables: tables.len(),
             views: views.len(),
-            sequences: postgres_sequences.iter().filter(|sequence| !sequence.created_by_table).count(),
+            sequences: postgres_sequences.iter().filter(|sequence| !sequence.created_by_table).count()
+                + oracle_sequences.len(),
             extensions: postgres_extensions.len(),
             enums: postgres_enums.len(),
             procedures: procedures.len(),
@@ -4168,6 +4282,57 @@ async fn export_database_sql_core_inner(
 
         writeln!(file, "{};\n", generate_postgres_sequence_create_ddl(sequence, &request.schema))
             .map_err(|e| format!("Failed to write file: {e}"))?;
+        object_index += 1;
+    }
+
+    for sequence in &oracle_sequences {
+        if is_export_cancelled(&request.export_id).await {
+            return Err("Export cancelled".to_string());
+        }
+
+        emit_database_export_running(
+            &on_progress,
+            &request.export_id,
+            sequence.name.clone(),
+            object_index,
+            total_objects,
+            total_rows_exported,
+            false,
+        );
+
+        match crate::schema::get_object_source_core(
+            state,
+            &request.connection_id,
+            &request.database,
+            &request.schema,
+            &sequence.name,
+            crate::db::ObjectSourceKind::Sequence,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(obj_source) => {
+                let source = build_database_export_object_source_sql(
+                    db_type,
+                    &ObjectSourceKind::Sequence,
+                    &sequence.name,
+                    &obj_source.source,
+                    request.drop_table_if_exists,
+                );
+                if !source.is_empty() {
+                    writeln!(file, "{source}\n").map_err(|e| format!("Failed to write file: {e}"))?;
+                }
+            }
+            Err(e) => {
+                record_export_error(
+                    &mut file,
+                    request.fail_on_error,
+                    format!("exporting sequence {}: {e}", sequence.name),
+                    &mut lenient_errors,
+                )?;
+            }
+        }
         object_index += 1;
     }
 
@@ -5239,6 +5404,32 @@ mod tests {
         let request = export_request(true, true, true, vec!["users".to_string(), "active_users".to_string()]);
 
         assert_eq!(database_export_total_objects(&request, &counts), 5);
+    }
+
+    #[test]
+    fn oracle_sequences_are_exported_with_whole_schema_structure() {
+        use super::{exports_oracle_sequence_objects, is_oracle_identity_sequence};
+
+        let cases = [
+            ("structure", DatabaseType::Oracle, export_request(true, false, false, Vec::new()), true),
+            ("all", DatabaseType::Oracle, export_request(true, true, true, Vec::new()), true),
+            ("data only", DatabaseType::Oracle, export_request(false, true, true, Vec::new()), false),
+            (
+                "selected tables",
+                DatabaseType::Oracle,
+                export_request(true, true, true, vec!["ORDERS".to_string()]),
+                false,
+            ),
+            ("postgres", DatabaseType::Postgres, export_request(true, true, true, Vec::new()), false),
+            ("oceanbase oracle", DatabaseType::OceanbaseOracle, export_request(true, true, true, Vec::new()), false),
+        ];
+        for (name, db_type, request, expected) in cases {
+            assert_eq!(exports_oracle_sequence_objects(&request, db_type), expected, "{name}");
+        }
+
+        assert!(is_oracle_identity_sequence("ISEQ$$_115126"));
+        assert!(!is_oracle_identity_sequence("ORDER_SEQ"));
+        assert!(!is_oracle_identity_sequence("iseq$$_custom"));
     }
 
     #[test]
@@ -7037,7 +7228,80 @@ mod tests {
     }
 
     #[test]
-    fn sqlserver_rowversion_timestamp_type_is_not_treated_as_datetime() {
+    fn sqlserver_insert_scripts_omit_non_insertable_timestamp_and_computed_columns() {
+        // `timestamp`/`rowversion` counters and computed columns can never take
+        // an explicit INSERT value ("Cannot insert an explicit value into a
+        // timestamp column" / "Cannot insert a value into the computed column"),
+        // so generated INSERT scripts (grid copy, SQL export) must omit them
+        // (issue #10764).
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::SqlServer),
+            identifier_quote: None,
+            schema: Some("dbo".to_string()),
+            table_name: Some("sync_state".to_string()),
+            qualified_table_name: None,
+            columns: vec![
+                "id".to_string(),
+                "note".to_string(),
+                "row_version".to_string(),
+                "stamp_alias".to_string(),
+                "total".to_string(),
+            ],
+            column_types: vec![
+                Some("int".to_string()),
+                Some("nvarchar(50)".to_string()),
+                Some("timestamp".to_string()),
+                Some("rowversion".to_string()),
+                Some("int".to_string()),
+            ],
+            column_extras: vec![None, None, None, None, Some("computed".to_string())],
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
+            rows: vec![vec![
+                json!(7),
+                json!("ok"),
+                json!("0x00000000000007D1"),
+                json!("0x00000000000007D2"),
+                json!(42),
+            ]],
+            batch_size: Some(10),
+            preserve_original_language: false,
+        })
+        .unwrap();
+
+        assert_eq!(statements, vec!["INSERT INTO [dbo].[sync_state] ([id], [note]) VALUES (7, N'ok');"]);
+    }
+
+    #[test]
+    fn mysql_insert_scripts_keep_timestamp_columns() {
+        // MySQL `timestamp` is an ordinary datetime column and must stay insertable.
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Mysql),
+            identifier_quote: None,
+            schema: None,
+            table_name: Some("events".to_string()),
+            qualified_table_name: None,
+            columns: vec!["id".to_string(), "created_at".to_string()],
+            column_types: vec![Some("int".to_string()), Some("timestamp".to_string())],
+            column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
+            rows: vec![vec![json!(1), json!("2026-09-30 10:00:00")]],
+            batch_size: Some(10),
+            preserve_original_language: false,
+        })
+        .unwrap();
+
+        assert_eq!(statements.len(), 1);
+        assert!(statements[0].contains("`created_at`"), "statements: {statements:?}");
+    }
+
+    #[test]
+    fn sqlserver_rowversion_timestamp_columns_are_omitted_from_insert_export() {
+        // `timestamp`/`rowversion` is a server-generated counter on SQL Server,
+        // not a datetime: a replayed INSERT with an explicit value is rejected
+        // ("Cannot insert an explicit value into a timestamp column"), so the
+        // column is omitted while `datetime2` keeps its literal (issue #10764).
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::SqlServer),
             identifier_quote: None,
@@ -7055,12 +7319,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(
-            statements,
-            vec![
-                "INSERT INTO [dbo].[events] ([row_version], [created_at]) VALUES ('2026-06-12T10:11:12Z', '2026-06-12 10:11:12.123');"
-            ]
-        );
+        assert_eq!(statements, vec!["INSERT INTO [dbo].[events] ([created_at]) VALUES ('2026-06-12 10:11:12.123');"]);
     }
 
     #[test]
@@ -7111,6 +7370,31 @@ mod tests {
             statements,
             vec!["INSERT INTO \"public\".\"users\" (\"name\", \"email\") VALUES ('Ada', 'ada@example.com');"]
         );
+    }
+
+    #[test]
+    fn sql_insert_export_excludes_only_the_exact_case_sensitive_column() {
+        let statements = build_export_insert_statements_excluding(
+            BuildExportInsertStatementsOptions {
+                database_type: Some(DatabaseType::Postgres),
+                identifier_quote: None,
+                schema: Some("public".to_string()),
+                table_name: Some("users".to_string()),
+                qualified_table_name: None,
+                columns: vec!["ID".to_string(), "id".to_string(), "name".to_string()],
+                column_types: vec![Some("integer".to_string()), Some("integer".to_string()), Some("text".to_string())],
+                column_extras: Vec::new(),
+                spatial_columns: Vec::new(),
+                spatial_values: Vec::new(),
+                rows: vec![vec![json!(1), json!(2), json!("Ada")]],
+                batch_size: Some(10),
+                preserve_original_language: false,
+            },
+            &["id".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(statements, vec!["INSERT INTO \"public\".\"users\" (\"ID\", \"name\") VALUES (1, 'Ada');"]);
     }
 
     #[test]
@@ -7383,6 +7667,32 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(path).unwrap(),
             "INSERT INTO `users` (`id`, `name`) VALUES (1, 'Ada');\n\nINSERT INTO `users` (`id`, `name`) VALUES (2, 'Linus');\n\n"
+        );
+    }
+
+    #[test]
+    fn database_row_writer_omits_sqlserver_timestamp_columns_from_export_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sync_state.sql");
+        let mut file = std::fs::File::create(&path).unwrap();
+
+        write_database_export_rows(
+            &mut file,
+            &[vec![json!(7), json!("0x00000000000007D1")]],
+            &["id".to_string(), "row_version".to_string()],
+            &[Some("int".to_string()), Some("timestamp".to_string())],
+            &[None, None],
+            "sync_state",
+            "dbo",
+            &DatabaseType::SqlServer,
+            SqlInsertDialect::Standard,
+        )
+        .unwrap();
+        drop(file);
+
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "INSERT INTO \"dbo\".\"sync_state\" (\"id\") VALUES (7);\n\n"
         );
     }
 

@@ -164,7 +164,7 @@ export function useSqlExecution(deps: {
   activeConnection: ComputedRef<ConnectionConfig | undefined>;
   executableSql: ComputedRef<string>;
   resolveExecutableSql?: (snapshot?: SqlExecutionSnapshot, tab?: QueryTab) => Promise<string>;
-  activeOutputView: Ref<"result" | "summary" | "explain" | "chart" | "messages" | "profile">;
+  activeOutputView: Ref<"result" | "graph" | "summary" | "explain" | "chart" | "messages" | "profile">;
   blockDangerousRedisCommands?: Ref<boolean>;
   onMissingDatabase?: (tabId?: string) => void;
   requestDangerConfirmation?: (request: SqlExecutionDangerRequest) => Promise<boolean>;
@@ -465,7 +465,7 @@ export function useSqlExecution(deps: {
         deps.activeOutputView.value = "messages";
       }
     } else if (tab.result && !tab.result.columns.length && !tab.results?.some((result) => result.columns.length > 0)) {
-      if (executionTabStillActive) {
+      if (executionTabStillActive && deps.activeOutputView.value !== "messages") {
         deps.activeOutputView.value = statementCount === 1 ? defaultViewForResult(tab.result) : "summary";
       }
     }

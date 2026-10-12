@@ -263,6 +263,13 @@ enum ConnectionDatabaseInfoSource {
 
 /// Held connection for a manual transaction session
 pub enum TxnConnection {
+    /// Isolated native SQL Server client, discarded after an interrupted stream.
+    SqlServer {
+        client: Option<Arc<Mutex<db::sqlserver::SqlServerClient>>>,
+        client_session_id: String,
+        database: Option<String>,
+        cleanup_guard: ClientSessionPoolCleanupGuard,
+    },
     Postgres(Box<deadpool_postgres::Object>),
     /// A dedicated MySQL connection. Cancellation may consume and discard this
     /// connection instead of trying to reuse it after an interrupted result set.
@@ -286,6 +293,7 @@ pub enum TxnConnection {
 }
 
 pub struct TransactionSession {
+    pub sqlserver: Option<crate::query::sqlserver_manual_transaction::SessionMetadata>,
     pub connection: Arc<Mutex<TxnConnection>>,
     pub pool_key: String,
     pub last_activity: std::time::Instant,
@@ -423,6 +431,7 @@ pub struct AppState {
     /// exists.
     mysql_preserved_transactions: Arc<RwLock<HashSet<String>>>,
     pub transaction_sessions: Arc<RwLock<HashMap<String, TransactionSession>>>,
+    pub sqlserver_transaction_ends: Arc<std::sync::Mutex<crate::query::sqlserver_manual_transaction::EndedSessions>>,
     /// `save_password=false` 连接本次运行期的临时密码（内存，进程退出即丢，
     /// 绝不落盘）。键为 `(owner_scope, connection_id)`：桌面端 owner 为空串，
     /// Web 端 owner 为已认证会话 token，不同登录会话互不可见。建池/池重建/
@@ -1464,6 +1473,22 @@ impl AppState {
         self.connection_liveness.subscribe()
     }
 
+    /// A locator belongs to its original workload session; never recreate it during lookup.
+    pub(crate) async fn existing_workload_pool_for_session(
+        &self,
+        connection_id: &str,
+        database: Option<&str>,
+        client_session_id: Option<&str>,
+    ) -> Option<(String, PoolKind)> {
+        let config = self.configs.read().await.get(connection_id).cloned()?;
+        let base_key = base_pool_key_for_config(Some(&config), connection_id, database, None, false);
+        let key = pool_key_for_session_role(Some(&config), base_key, client_session_id, AgentSessionRole::Workload);
+        if self.pool_credential_owner_mismatch(&config, &key).await {
+            return None;
+        }
+        self.pool_handle(&key).await.map(|pool| (key, pool))
+    }
+
     /// Find an already-registered metadata/workload pool for a metadata read.
     /// Unlike `get_or_create_metadata_pool_for_session`, this is a pure lookup:
     /// it never validates credentials, starts an agent, or opens a transport.
@@ -1699,6 +1724,7 @@ impl AppState {
             postgres_cancel_contexts: Arc::new(RwLock::new(HashMap::new())),
             mysql_preserved_transactions: Arc::new(RwLock::new(HashSet::new())),
             transaction_sessions: Arc::new(RwLock::new(HashMap::new())),
+            sqlserver_transaction_ends: Arc::new(std::sync::Mutex::new(Default::default())),
             session_credentials: SessionCredentialStore::new(),
             write_unlock_windows: crate::write_unlock::WriteUnlockWindows::default(),
             metadata_gates: Arc::new(Mutex::new(HashMap::new())),
@@ -2070,6 +2096,7 @@ impl AppState {
         pool: PoolKind,
         config: &ConnectionConfig,
         wait_for_drain: bool,
+        keep_existing: bool,
     ) -> Result<(), String> {
         if wait_for_drain {
             self.wait_for_pool_drain(&pool_key).await;
@@ -2083,6 +2110,14 @@ impl AppState {
         let routing = self.pool_routing_control();
         let previous = loop {
             let mut connections = self.connections.write().await;
+            if keep_existing && connections.get(&pool_key).is_some_and(PoolKind::is_available_for_routing) {
+                // A concurrent request published this key while our candidate was connecting.
+                // Replacing it would close a pool other requests may already be using.
+                drop(connections);
+                routing.close_pool_with_timeout(pool_key.clone(), pool).await;
+                self.touch_pool_activity(&pool_key).await;
+                return Ok(());
+            }
             if !pool.is_available_for_routing() {
                 break Err(pool);
             }
@@ -2151,7 +2186,21 @@ impl AppState {
         pool: PoolKind,
         config: &ConnectionConfig,
     ) -> Result<(), String> {
-        self.insert_connection_pool_inner(pool_key, pool, config, true).await
+        self.insert_connection_pool_inner(pool_key, pool, config, true, false).await
+    }
+
+    /// Publishes a pool created on demand, keeping the existing pool when a concurrent request
+    /// published the same key first.
+    async fn publish_created_pool(
+        &self,
+        pool_key: String,
+        pool: PoolKind,
+        config: &ConnectionConfig,
+    ) -> Result<(), String> {
+        // A no-save pool records its credential owner only after publication, so an existing
+        // pool cannot be proven to belong to the current session here. Keep replacing it.
+        let keep_existing = config.save_password;
+        self.insert_connection_pool_inner(pool_key, pool, config, true, keep_existing).await
     }
 
     pub async fn begin_connection_attempt(&self, connection_id: &str) -> u64 {
@@ -2432,7 +2481,9 @@ impl AppState {
     pub async fn shutdown(&self, deadline: Duration) {
         self.invalidate_all_connection_lifecycles();
         self.running_queries.cancel_all();
-        let removed_pools = self.drain_all_connection_pools().await;
+        let mut removed_pools = self.drain_all_connection_pools().await;
+        #[cfg(feature = "mq-admin")]
+        self.persist_removed_mqtt_history(&mut removed_pools).await;
         self.transaction_sessions.write().await.clear();
 
         let shutdown = async {
@@ -3415,7 +3466,7 @@ impl AppState {
             self.discard_stale_connection_attempt_pool(connection_id, pool_key.clone(), pool, &db_config).await;
             return Err(err);
         }
-        self.insert_connection_pool(pool_key.clone(), pool, &db_config).await?;
+        self.publish_created_pool(pool_key.clone(), pool, &db_config).await?;
         Ok(pool_key)
     }
 
@@ -5128,7 +5179,7 @@ impl AppState {
             config_for_pool_key(pool_key, &configs).cloned()
         };
         if let Some(config) = config {
-            let _ = self.insert_connection_pool_inner(pool_key.to_string(), pool, &config, false).await;
+            let _ = self.insert_connection_pool_inner(pool_key.to_string(), pool, &config, false, false).await;
         } else {
             self.pool_activity.write().await.insert(pool_key.to_string(), PoolActivity::now());
             self.connections.write().await.insert(pool_key.to_string(), pool);
@@ -5904,8 +5955,10 @@ impl AppState {
     pub async fn remove_connection_pools(&self, connection_id: &str) {
         self.invalidate_connection_lifecycle(connection_id);
         self.rollback_manual_transaction_sessions(connection_id).await;
-        let removed = self.drain_connection_pools(connection_id).await;
+        let mut removed = self.drain_connection_pools(connection_id).await;
         self.clear_metadata_gates_for_connection(connection_id).await;
+        #[cfg(feature = "mq-admin")]
+        self.persist_removed_mqtt_history(&mut removed).await;
         self.pool_routing_control().close_removed(removed).await;
     }
 
@@ -5928,9 +5981,30 @@ impl AppState {
     pub async fn remove_connection_pools_detached(&self, connection_id: &str) {
         self.invalidate_connection_lifecycle(connection_id);
         self.rollback_manual_transaction_sessions(connection_id).await;
-        let removed = self.drain_connection_pools(connection_id).await;
+        let mut removed = self.drain_connection_pools(connection_id).await;
         self.clear_metadata_gates_for_connection(connection_id).await;
+        #[cfg(feature = "mq-admin")]
+        self.persist_removed_mqtt_history(&mut removed).await;
         self.pool_routing_control().close_removed_in_background(removed);
+    }
+
+    #[cfg(feature = "mq-admin")]
+    async fn persist_removed_mqtt_history(&self, removed: &mut Vec<(String, PoolKind)>) {
+        let mut remaining = Vec::with_capacity(removed.len());
+        for (pool_key, pool) in std::mem::take(removed) {
+            match pool {
+                PoolKind::Mqtt(client) => {
+                    let _history_guard = client.lock_message_history().await;
+                    client.disconnect().await;
+                    let messages = client.get_messages(None, usize::MAX).await;
+                    if let Err(error) = self.storage.reconcile_mqtt_message_history(&pool_key, &messages).await {
+                        log::warn!("Failed to persist MQTT history while closing '{pool_key}': {error}");
+                    }
+                }
+                pool => remaining.push((pool_key, pool)),
+            }
+        }
+        *removed = remaining;
     }
 
     /// Close and roll back every manual-transaction session of a connection
@@ -5951,6 +6025,10 @@ impl AppState {
             keys.into_iter().filter_map(|id| map.remove(&id).map(|session| (id, session))).collect()
         };
         for (session_id, session) in sessions {
+            if session.sqlserver.is_some() {
+                crate::query::sqlserver_manual_transaction::disconnect(self, &session_id, session).await;
+                continue;
+            }
             let mut conn = session.connection.lock().await;
             let outcome = crate::query::rollback_manual_txn_connection(&mut conn).await;
             if let Err(error) = outcome {
@@ -6706,6 +6784,9 @@ pub fn connection_configs_pool_equivalent(a: &ConnectionConfig, b: &ConnectionCo
     // established database session.
     a.sidebar_auto_load_all_tables = false;
     b.sidebar_auto_load_all_tables = false;
+    // A default browser filter does not change the established Redis session.
+    a.redis_key_filter = None;
+    b.redis_key_filter = None;
     if !a.save_password && !b.save_password {
         a.password.clear();
         b.password.clear();
@@ -6737,6 +6818,7 @@ pub fn connection_configs_session_credentials_compatible(a: &ConnectionConfig, b
         config.query_timeout_secs = 0;
         config.idle_timeout_secs = 0;
         config.keepalive_interval_secs = 0;
+        config.redis_key_filter = None;
         config.redis_key_separator.clear();
         config.redis_scan_page_size = None;
         config.redis_database_aliases.clear();
@@ -7354,6 +7436,7 @@ mod tests {
             visible_schemas: None,
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
+            show_database_links: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -7380,6 +7463,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_filter: None,
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
@@ -8278,6 +8362,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(feature = "mq-admin")]
+    #[tokio::test]
+    async fn mqtt_history_is_persisted_at_every_connection_teardown_boundary() {
+        use crate::mqtt::client::MqttClient;
+        use crate::mqtt::types::{MqttMessage, MqttMessageDirection};
+
+        async fn install_client(state: &AppState, connection_id: &str, timestamp: u64) {
+            let message = MqttMessage {
+                topic: format!("devices/{connection_id}"),
+                payload_base64: "dGFpbA==".to_string(),
+                payload_text: Some("tail".to_string()),
+                qos: 1,
+                retain: false,
+                received_at_ms: timestamp,
+                direction: MqttMessageDirection::Received,
+            };
+            let client = MqttClient::test_client_with_messages(vec![message]).await;
+            state
+                .update_connection_pools(|connections| {
+                    connections.insert(connection_id.to_string(), PoolKind::Mqtt(client));
+                })
+                .await;
+        }
+
+        let (removed_state, removed_dir) = test_app_state().await;
+        install_client(&removed_state, "removed", 1).await;
+        removed_state.remove_connection_pools("removed").await;
+        let removed_history = removed_state.storage.load_mqtt_message_history("removed").await.unwrap();
+        assert_eq!(removed_history.len(), 1);
+        assert_eq!(removed_history[0].topic, "devices/removed");
+
+        let (detached_state, detached_dir) = test_app_state().await;
+        install_client(&detached_state, "detached", 2).await;
+        detached_state.remove_connection_pools_detached("detached").await;
+        let detached_history = detached_state.storage.load_mqtt_message_history("detached").await.unwrap();
+        assert_eq!(detached_history.len(), 1);
+        assert_eq!(detached_history[0].topic, "devices/detached");
+
+        let (shutdown_state, shutdown_dir) = test_app_state().await;
+        install_client(&shutdown_state, "shutdown", 3).await;
+        shutdown_state.shutdown(Duration::from_millis(100)).await;
+        let shutdown_history = shutdown_state.storage.load_mqtt_message_history("shutdown").await.unwrap();
+        assert_eq!(shutdown_history.len(), 1);
+        assert_eq!(shutdown_history[0].topic, "devices/shutdown");
+
+        let _ = std::fs::remove_dir_all(removed_dir);
+        let _ = std::fs::remove_dir_all(detached_dir);
+        let _ = std::fs::remove_dir_all(shutdown_dir);
+    }
+
     #[tokio::test]
     async fn named_resource_budget_is_shared_across_app_state_views() {
         let (state, dir) = test_app_state().await;
@@ -8601,6 +8735,37 @@ mod tests {
         assert!(state.test_tunnel_profile(&ssh).await.is_err());
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    async fn publish_two_created_sqlite_pools(save_password: bool) -> bool {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.db_type = DatabaseType::Sqlite;
+        config.save_password = save_password;
+        let first = db::sqlite::connect_path_create_if_missing(&dir.join("first.db").to_string_lossy()).await.unwrap();
+        let second =
+            db::sqlite::connect_path_create_if_missing(&dir.join("second.db").to_string_lossy()).await.unwrap();
+
+        state.publish_created_pool("conn".to_string(), PoolKind::Sqlite(first), &config).await.unwrap();
+        let published = state.pool_publication_snapshot("conn").await.unwrap().publication;
+        state.publish_created_pool("conn".to_string(), PoolKind::Sqlite(second), &config).await.unwrap();
+        let current = state.pool_publication_snapshot("conn").await.unwrap().publication;
+
+        assert_eq!(state.connections.read().await.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+        current.is_same(&published)
+    }
+
+    // Issue #11579: concurrent first requests for one database each create a pool. A late
+    // creator used to replace and close the pool that earlier requests were already using.
+    #[tokio::test]
+    async fn concurrently_created_pool_keeps_the_first_published_pool() {
+        assert!(publish_two_created_sqlite_pools(true).await);
+    }
+
+    #[tokio::test]
+    async fn concurrently_created_no_save_pool_still_replaces_the_existing_pool() {
+        assert!(!publish_two_created_sqlite_pools(false).await);
     }
 
     #[tokio::test]
@@ -9851,6 +10016,7 @@ sleep 30
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_filter: None,
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
@@ -9869,6 +10035,7 @@ sleep 30
             production_databases: vec![],
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
+            show_database_links: None,
             database_info: None,
         }
     }

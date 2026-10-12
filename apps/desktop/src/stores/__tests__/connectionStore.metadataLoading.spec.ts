@@ -91,6 +91,19 @@ function xuguConnection(): ConnectionConfig {
   } as ConnectionConfig;
 }
 
+function sundbConnection(): ConnectionConfig {
+  return {
+    id: "sundb-1",
+    name: "SUNDB",
+    db_type: "sundb",
+    host: "10.156.156.86",
+    port: 22581,
+    username: "app_user",
+    password: "",
+    database: "vpnccw",
+  } as ConnectionConfig;
+}
+
 function genericJdbcConnection(): ConnectionConfig {
   return {
     id: "jdbc-1",
@@ -641,6 +654,51 @@ describe("connectionStore metadata loading", () => {
       ["schema", "reporting", "reporting"],
       ["saved-sql-root", "tree.queries", undefined],
     ]);
+  });
+
+  it("loads SunDB tables under the discovered schema instead of the catalog name", async () => {
+    // SUNDB's database is a catalog, and the driver matches getTables' schemaPattern
+    // literally, so sending the catalog name returned zero rows and the sidebar showed
+    // an empty "表 0" node (issue #11360). The database node must discover schemas and
+    // every table request must carry that schema.
+    const listSchemaInfos = vi.fn().mockResolvedValue([{ name: "APP", comment: null }]);
+    const listTables = vi.fn().mockResolvedValue([{ name: "ITEMS", table_type: "TABLE", comment: null }]);
+    const listObjects = vi.fn().mockResolvedValue([]);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      listSchemaInfos,
+      listTables,
+      listObjects,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    useSettingsStore().editorSettings.sidebarObjectDisplay = "simple";
+    const store = useConnectionStore();
+    const connection = sundbConnection();
+    const databaseNode: TreeNode = { id: "sundb-1:vpnccw", label: "vpnccw", type: "database", connectionId: connection.id, database: "vpnccw", isExpanded: false, children: [] };
+    store.connections = [connection];
+    store.connectedIds.add(connection.id);
+    store.treeNodes = [{ id: connection.id, label: connection.name, type: "connection", connectionId: connection.id, isExpanded: true, children: [databaseNode] }];
+
+    await store.loadTreeNodeChildren(databaseNode, { force: true });
+
+    expect(listSchemaInfos).toHaveBeenCalledWith(connection.id, "vpnccw");
+    expect(listTables).not.toHaveBeenCalled();
+    const schemaNode = databaseNode.children!.find((node) => node.type === "schema")!;
+    expect([schemaNode.label, schemaNode.schema]).toEqual(["APP", "APP"]);
+
+    await store.loadTreeNodeChildren(schemaNode, { force: true });
+
+    const firstTableRequest = listTables.mock.calls[0] as unknown[];
+    expect(firstTableRequest.slice(0, 3)).toEqual([connection.id, "vpnccw", "APP"]);
   });
 
   it.each(["simple", "grouped"] as const)("isolates discovered JDBC schemas, pages and cached objects in %s mode", async (mode) => {
@@ -4634,5 +4692,110 @@ describe("connectionStore metadata loading", () => {
     expect(typeNode.hasMembers).toBe(true);
     expect(typeNode.children?.map((child) => child.label)).toEqual(["published"]);
     expect(store.isTreeNodeChildrenLoaded(typeNode.id)).toBe(true);
+  });
+
+  it("loads more object group children for catalogless databases with empty database string", async () => {
+    const firstPageTables = Array.from({ length: 201 }, (_, i) => ({
+      name: `t_${String(i + 1).padStart(4, "0")}`,
+      table_type: "BASE TABLE",
+      comment: null,
+    }));
+    const secondPageTables = [
+      {
+        name: "t_0201",
+        table_type: "BASE TABLE",
+        comment: null,
+      },
+    ];
+    const listTables = vi.fn(async (...args: unknown[]) => {
+      const offset = args[5] as number;
+      if (offset === 0) return firstPageTables;
+      return secondPageTables;
+    });
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      listTables,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useConnectionStore();
+    const settingsStore = useSettingsStore();
+    settingsStore.editorSettings.sidebarObjectDisplay = "grouped";
+    settingsStore.desktopSettings.sidebar_table_page_size = 200;
+
+    const connection: ConnectionConfig = {
+      id: "hana-1",
+      name: "SAP HANA",
+      db_type: "saphana",
+      host: "127.0.0.1",
+      port: 39015,
+      username: "SYSTEM",
+      password: "",
+      database: "",
+    } as ConnectionConfig;
+
+    const tablesGroup: TreeNode = {
+      id: "hana-1:::APP:__tables",
+      label: "tree.tables",
+      type: "group-tables",
+      connectionId: connection.id,
+      database: "",
+      schema: "APP",
+      isExpanded: false,
+      children: [],
+    };
+    const schemaNode: TreeNode = {
+      id: "hana-1:::APP",
+      label: "APP",
+      type: "schema",
+      connectionId: connection.id,
+      database: "",
+      schema: "APP",
+      isExpanded: true,
+      children: [tablesGroup],
+    };
+    const databaseNode: TreeNode = {
+      id: "hana-1::",
+      label: "tree.defaultDatabase",
+      type: "database",
+      connectionId: connection.id,
+      database: "",
+      isExpanded: true,
+      children: [schemaNode],
+    };
+
+    store.connections = [connection];
+    store.connectedIds.add(connection.id);
+    store.treeNodes = [
+      {
+        id: connection.id,
+        label: connection.name,
+        type: "connection",
+        connectionId: connection.id,
+        isExpanded: true,
+        children: [databaseNode],
+      },
+    ];
+
+    await store.loadObjectGroupChildren(tablesGroup);
+    const loadMoreNode = tablesGroup.children?.at(-1);
+    expect(loadMoreNode?.type).toBe("load-more");
+
+    await store.loadMoreObjectGroupChildren(loadMoreNode!);
+
+    expect(listTables).toHaveBeenCalledTimes(2);
+    expect(listTables.mock.calls[1][1]).toBe("");
+    expect(listTables.mock.calls[1][2]).toBe("APP");
+    expect(listTables.mock.calls[1][5]).toBe(200);
+    const labels = (tablesGroup.children ?? []).filter((child) => child.type === "table").map((child) => child.label);
+    expect(labels).toContain("t_0201");
   });
 });

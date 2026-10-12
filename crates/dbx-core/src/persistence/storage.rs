@@ -16,6 +16,9 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[cfg(feature = "mq-admin")]
+use dbx_types::mqtt::{MqttMessage, MqttMessageDirection};
+
 use crate::ai::{
     AiChatMessage, AiChatSelectionState, AiConfig, AiConfigItem, AiConversation, AiProvider, AiRun, AiRunFifoCategory,
     AiRunStatus,
@@ -36,6 +39,12 @@ use crate::history::{
 use crate::models::connection::{ConnectionConfig, DatabaseConnectionInfo, DatabaseType, TransportLayerConfig};
 use crate::persistence::secret_codec::{
     key_file_candidates, SecretCodec, SecretKeyPolicy, SecretKeyResolution, SecretKeySource,
+};
+use crate::persistence::task_history::{
+    RowCountState, TaskEndpointSnapshot, TaskHistoryStorageError, TaskItemKind, TaskItemStatus, TaskLifecycleOwner,
+    TaskRun, TaskRunCursor, TaskRunDetail, TaskRunItem, TaskRunItemsPage, TaskRunItemsQuery, TaskRunListQuery,
+    TaskRunPage, TaskRunStatus, TaskType, TransferObjectSelectionMode, TransferRunContent, TransferRunDetails,
+    TransferRunMode, TransferRunOwnershipPolicy, TransferRunTargetTableNameCase,
 };
 use crate::prompt_template::PromptTemplate;
 use crate::saved_sql::{SavedSqlFile, SavedSqlFolder, SavedSqlLibrary};
@@ -77,12 +86,34 @@ const PLUGIN_DATA_GRANTS_KEY: &str = "plugin_data_grants";
 const MAX_PLUGIN_DATA_GRANTS_PER_PLUGIN: usize = 512;
 const APP_STATE_AI_GLOBAL_INSTRUCTIONS_KEY: &str = "ai_global_custom_instructions";
 const APP_STATE_AI_CHAT_SELECTION_KEY: &str = "ai_chat_selection_v1";
+// Keep the existing key so previously persisted publish records remain readable.
+const MQTT_MESSAGE_HISTORY_STATE_KEY_PREFIX: &str = "mqtt.sent_history.";
+#[cfg(feature = "mq-admin")]
+const MQTT_MESSAGE_HISTORY_MAX_MESSAGES: usize = 200;
+#[cfg(feature = "mq-admin")]
+const MQTT_MESSAGE_HISTORY_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+#[cfg(feature = "mq-admin")]
+fn mqtt_history_message_identity(message: &MqttMessage) -> (String, String, Option<String>, u8, bool, bool, u64) {
+    (
+        message.topic.clone(),
+        message.payload_base64.clone(),
+        message.payload_text.clone(),
+        message.qos,
+        message.retain,
+        message.direction == MqttMessageDirection::Sent,
+        message.received_at_ms,
+    )
+}
 const SNIPPET_SYNC_IDS_KEY: &str = "snippet_sync_ids";
 const SNIPPET_PENDING_CLEANUPS_KEY: &str = "snippet_pending_legacy_cleanups";
 const USER_DATA_TABLES: &[&str] = &[
     "connections",
     "connection_secrets",
     "history",
+    "task_runs",
+    "transfer_run_details",
+    "task_run_items",
     "ai_config",
     "ai_provider_configs",
     "ai_conversations",
@@ -445,6 +476,13 @@ pub struct DesktopSettings {
     pub custom_ai_skill_root_enabled: bool,
     #[serde(default)]
     pub custom_ai_skill_root: Option<String>,
+    /// "Allow the AI to use skills automatically" (prd 09-30 Req 5). When on,
+    /// the built-in AI receives the skill listing even with nothing selected, so
+    /// the model can pick a skill up on its own. Off by default: a listing costs
+    /// prompt tokens on every request, and the user's selection stays the
+    /// explicit gate.
+    #[serde(default)]
+    pub custom_ai_skill_auto_enabled: bool,
     #[serde(default = "default_sidebar_table_page_size")]
     pub sidebar_table_page_size: usize,
 }
@@ -496,6 +534,10 @@ pub struct McpGlobalPolicy {
     pub read_only: bool,
     #[serde(default)]
     pub allow_dangerous_sql: bool,
+    /// Ask the desktop user before high-risk SQL when the effective mode is safe-write.
+    /// This never relaxes read-only, connection, database-scope or production protections.
+    #[serde(default)]
+    pub prompt_high_risk_sql: bool,
     pub allowed_connection_ids: Option<Vec<String>>,
     /// Stable sidebar group ids whose current descendant connections are
     /// exposed when an explicit connection scope is configured.
@@ -671,6 +713,8 @@ pub struct McpGlobalPolicyState {
     pub configured: bool,
     pub read_only: bool,
     pub allow_dangerous_sql: bool,
+    #[serde(default)]
+    pub prompt_high_risk_sql: bool,
     pub allowed_connection_ids: Option<Vec<String>>,
     #[serde(default)]
     pub allowed_group_ids: Vec<String>,
@@ -689,6 +733,7 @@ impl McpGlobalPolicyState {
         McpGlobalPolicy {
             read_only: self.read_only,
             allow_dangerous_sql: self.allow_dangerous_sql,
+            prompt_high_risk_sql: self.prompt_high_risk_sql,
             allowed_connection_ids: self.allowed_connection_ids.clone(),
             allowed_group_ids: self.allowed_group_ids.clone(),
             allowed_tool_names: self.allowed_tool_names.clone(),
@@ -830,6 +875,7 @@ impl McpGlobalPolicy {
         Self {
             read_only: self.read_only,
             allow_dangerous_sql: !self.read_only && self.allow_dangerous_sql,
+            prompt_high_risk_sql: !self.read_only && self.prompt_high_risk_sql,
             allowed_connection_ids,
             allowed_group_ids,
             allowed_tool_names,
@@ -970,6 +1016,7 @@ impl Default for DesktopSettings {
             agent_store_dir: None,
             custom_ai_skill_root_enabled: false,
             custom_ai_skill_root: None,
+            custom_ai_skill_auto_enabled: false,
             sidebar_table_page_size: default_sidebar_table_page_size(),
         }
     }
@@ -1036,6 +1083,62 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         ,mcp_response_json TEXT
         ,mcp_session_id TEXT
     )",
+    "CREATE TABLE IF NOT EXISTS task_runs (
+        run_id TEXT PRIMARY KEY NOT NULL,
+        task_type TEXT NOT NULL,
+        lifecycle_owner TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        owner_instance_id TEXT NOT NULL,
+        error_code TEXT,
+        safe_error_summary TEXT,
+        history_complete INTEGER NOT NULL DEFAULT 0,
+        source_connection_id TEXT NOT NULL,
+        source_database_type TEXT NOT NULL,
+        source_database TEXT NOT NULL,
+        source_schema TEXT NOT NULL,
+        source_catalog TEXT,
+        target_connection_id TEXT NOT NULL,
+        target_database_type TEXT NOT NULL,
+        target_database TEXT NOT NULL,
+        target_schema TEXT NOT NULL,
+        target_catalog TEXT
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_task_runs_created ON task_runs(created_at DESC, run_id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_task_runs_type_status_created ON task_runs(task_type, status, created_at DESC, run_id DESC)",
+    "CREATE TABLE IF NOT EXISTS transfer_run_details (
+        run_id TEXT PRIMARY KEY NOT NULL,
+        content TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        batch_size INTEGER NOT NULL,
+        create_table INTEGER NOT NULL,
+        drop_target_before_create INTEGER NOT NULL,
+        target_table_name_case TEXT NOT NULL,
+        quote_target_column_names INTEGER NOT NULL,
+        ownership_policy TEXT NOT NULL,
+        filtered_table_count INTEGER NOT NULL,
+        table_total INTEGER NOT NULL,
+        object_selection_mode TEXT NOT NULL,
+        selected_object_count INTEGER
+    )",
+    "CREATE TABLE IF NOT EXISTS task_run_items (
+        run_id TEXT NOT NULL,
+        item_index INTEGER NOT NULL,
+        item_kind TEXT NOT NULL,
+        source_object TEXT NOT NULL,
+        target_object TEXT NOT NULL,
+        status TEXT NOT NULL,
+        source_row_count INTEGER,
+        moved_row_count INTEGER,
+        target_row_count INTEGER,
+        row_count_state TEXT NOT NULL,
+        has_table_filter INTEGER NOT NULL DEFAULT 0,
+        safe_error_summary TEXT,
+        PRIMARY KEY (run_id, item_index)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_task_run_items_run_status ON task_run_items(run_id, status, item_index)",
     "CREATE TABLE IF NOT EXISTS ai_config (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         config_json TEXT NOT NULL
@@ -3828,6 +3931,475 @@ impl Storage {
     }
 }
 
+impl Storage {
+    pub async fn create_task_run(
+        &self,
+        run: &TaskRun,
+        details: &TransferRunDetails,
+        items: &[TaskRunItem],
+    ) -> Result<(), TaskHistoryStorageError> {
+        let run = run.clone();
+        let details = details.clone();
+        let items = items.to_vec();
+        let inserted = self
+            .with_conn(move |conn| {
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|error| error.to_string())?;
+                let exists = tx
+                    .query_row("SELECT 1 FROM task_runs WHERE run_id = ?1", [&run.run_id], |row| row.get::<_, i64>(0))
+                    .optional()
+                    .map_err(|error| error.to_string())?
+                    .is_some();
+                if exists {
+                    return Ok(false);
+                }
+                tx.execute(
+                    "INSERT INTO task_runs (
+                        run_id, task_type, lifecycle_owner, status, created_at, started_at, finished_at,
+                        owner_instance_id, error_code, safe_error_summary, history_complete,
+                        source_connection_id, source_database_type, source_database, source_schema, source_catalog,
+                        target_connection_id, target_database_type, target_database, target_schema, target_catalog
+                    ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                        ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+                    )",
+                    params![
+                        run.run_id,
+                        run.task_type.as_storage_str(),
+                        run.lifecycle_owner.as_storage_str(),
+                        run.status.as_storage_str(),
+                        run.created_at,
+                        run.started_at,
+                        run.finished_at,
+                        run.owner_instance_id,
+                        run.error_code,
+                        run.safe_error_summary,
+                        run.history_complete,
+                        run.source.connection_id,
+                        run.source.database_type,
+                        run.source.database,
+                        run.source.schema,
+                        run.source.catalog,
+                        run.target.connection_id,
+                        run.target.database_type,
+                        run.target.database,
+                        run.target.schema,
+                        run.target.catalog,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+                tx.execute(
+                    "INSERT INTO transfer_run_details (
+                        run_id, content, mode, batch_size, create_table, drop_target_before_create,
+                        target_table_name_case, quote_target_column_names, ownership_policy,
+                        filtered_table_count, table_total, object_selection_mode, selected_object_count
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![
+                        details.run_id,
+                        details.content.as_storage_str(),
+                        details.mode.as_storage_str(),
+                        details.batch_size,
+                        details.create_table,
+                        details.drop_target_before_create,
+                        details.target_table_name_case.as_storage_str(),
+                        details.quote_target_column_names,
+                        details.ownership_policy.as_storage_str(),
+                        details.filtered_table_count,
+                        details.table_total,
+                        details.object_selection_mode.as_storage_str(),
+                        details.selected_object_count,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+                for item in items {
+                    insert_task_run_item(&tx, &item)?;
+                }
+                tx.commit().map_err(|error| error.to_string())?;
+                Ok(true)
+            })
+            .await
+            .map_err(|_| TaskHistoryStorageError::StorageUnavailable)?;
+        if inserted {
+            Ok(())
+        } else {
+            Err(TaskHistoryStorageError::RunIdConflict)
+        }
+    }
+
+    pub async fn save_task_run_item(&self, item: &TaskRunItem) -> Result<bool, TaskHistoryStorageError> {
+        let item = item.clone();
+        self.with_conn(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| error.to_string())?;
+            let run_status = tx
+                .query_row("SELECT status FROM task_runs WHERE run_id = ?1", [&item.run_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if run_status.as_deref() != Some("running") {
+                return Ok(false);
+            }
+            let changed = tx
+                .execute(
+                    "INSERT INTO task_run_items (
+                        run_id, item_index, item_kind, source_object, target_object, status,
+                        source_row_count, moved_row_count, target_row_count, row_count_state,
+                        has_table_filter, safe_error_summary
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                    ON CONFLICT(run_id, item_index) DO UPDATE SET
+                        item_kind = excluded.item_kind,
+                        source_object = excluded.source_object,
+                        target_object = excluded.target_object,
+                        status = excluded.status,
+                        source_row_count = excluded.source_row_count,
+                        moved_row_count = excluded.moved_row_count,
+                        target_row_count = excluded.target_row_count,
+                        row_count_state = excluded.row_count_state,
+                        has_table_filter = excluded.has_table_filter,
+                        safe_error_summary = excluded.safe_error_summary
+                    WHERE task_run_items.status NOT IN ('succeeded', 'skipped', 'failed', 'cancelled', 'not_started', 'incomplete')",
+                    params![
+                        item.run_id,
+                        item.item_index,
+                        item.item_kind.as_storage_str(),
+                        item.source_object,
+                        item.target_object,
+                        item.status.as_storage_str(),
+                        item.source_row_count,
+                        item.moved_row_count,
+                        item.target_row_count,
+                        item.row_count_state.as_storage_str(),
+                        item.has_table_filter,
+                        item.safe_error_summary,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+            Ok(changed > 0)
+        })
+        .await
+        .map_err(|_| TaskHistoryStorageError::StorageUnavailable)
+    }
+
+    pub async fn finish_task_run(
+        &self,
+        run_id: &str,
+        status: TaskRunStatus,
+        error_code: Option<&str>,
+        safe_error_summary: Option<&str>,
+        history_complete: bool,
+    ) -> Result<bool, TaskHistoryStorageError> {
+        let run_id = run_id.to_string();
+        let error_code = error_code.map(str::to_string);
+        let safe_error_summary = safe_error_summary.map(str::to_string);
+        self.with_conn(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| error.to_string())?;
+            let current = tx
+                .query_row("SELECT status FROM task_runs WHERE run_id = ?1", [&run_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some(current) = current else {
+                return Err("Task run does not exist".to_string());
+            };
+            if current != "running" {
+                return Ok(false);
+            }
+            if !status.is_terminal() {
+                return Err("A task run cannot be finished with a running status".to_string());
+            }
+            let finished_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let changed = tx
+                .execute(
+                    "UPDATE task_runs SET status = ?2, finished_at = ?3, error_code = ?4,
+                     safe_error_summary = ?5, history_complete = ?6 WHERE run_id = ?1 AND status = 'running'",
+                    params![run_id, status.as_storage_str(), finished_at, error_code, safe_error_summary, history_complete],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            tx.execute(
+                "UPDATE task_run_items SET status = 'not_started'
+                 WHERE run_id = ?1 AND status = 'pending'",
+                [&run_id],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.execute(
+                "UPDATE task_run_items SET status = 'incomplete',
+                    row_count_state = CASE WHEN row_count_state = 'not_applicable' THEN row_count_state ELSE 'incomplete' END,
+                    safe_error_summary = COALESCE(safe_error_summary, ?2)
+                 WHERE run_id = ?1 AND status = 'running'",
+                params![run_id, "Transfer item did not complete."],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+            Ok(true)
+        })
+        .await
+        .map_err(|_| TaskHistoryStorageError::StorageUnavailable)
+    }
+
+    pub async fn get_task_run_detail(&self, run_id: &str) -> Result<Option<TaskRunDetail>, TaskHistoryStorageError> {
+        let run_id = run_id.to_string();
+        self.with_conn(move |conn| {
+            let run = conn
+                .query_row(
+                    "SELECT run_id, task_type, lifecycle_owner, status, created_at, started_at, finished_at,
+                        owner_instance_id, error_code, safe_error_summary, history_complete,
+                        source_connection_id, source_database_type, source_database, source_schema, source_catalog,
+                        target_connection_id, target_database_type, target_database, target_schema, target_catalog
+                     FROM task_runs WHERE run_id = ?1",
+                    [&run_id],
+                    map_task_run_row,
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some(run) = run else {
+                return Ok(None);
+            };
+            let transfer = conn
+                .query_row(
+                    "SELECT run_id, content, mode, batch_size, create_table, drop_target_before_create,
+                        target_table_name_case, quote_target_column_names, ownership_policy,
+                        filtered_table_count, table_total, object_selection_mode, selected_object_count
+                     FROM transfer_run_details WHERE run_id = ?1",
+                    [&run_id],
+                    map_transfer_run_details_row,
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            Ok(Some(TaskRunDetail { run, transfer }))
+        })
+        .await
+        .map_err(|_| TaskHistoryStorageError::StorageUnavailable)
+    }
+
+    pub async fn list_task_runs(&self, query: TaskRunListQuery) -> Result<TaskRunPage, TaskHistoryStorageError> {
+        self.with_conn(move |conn| {
+            let limit = query.limit.filter(|limit| *limit > 0).unwrap_or(50).clamp(1, 100);
+            let mut predicates = Vec::new();
+            let mut values = Vec::<Value>::new();
+            if let Some(task_type) = query.task_type {
+                predicates.push("task_type = ?".to_string());
+                values.push(Value::Text(task_type.as_storage_str().to_string()));
+            }
+            if let Some(status) = query.status {
+                predicates.push("status = ?".to_string());
+                values.push(Value::Text(status.as_storage_str().to_string()));
+            }
+            if let Some(cursor) = query.cursor {
+                predicates.push("(created_at < ? OR (created_at = ? AND run_id < ?))".to_string());
+                values.push(Value::Text(cursor.created_at.clone()));
+                values.push(Value::Text(cursor.created_at));
+                values.push(Value::Text(cursor.run_id));
+            }
+            let where_clause =
+                if predicates.is_empty() { String::new() } else { format!(" WHERE {}", predicates.join(" AND ")) };
+            let sql = format!(
+                "SELECT run_id, task_type, lifecycle_owner, status, created_at, started_at, finished_at,
+                    owner_instance_id, error_code, safe_error_summary, history_complete,
+                    source_connection_id, source_database_type, source_database, source_schema, source_catalog,
+                    target_connection_id, target_database_type, target_database, target_schema, target_catalog
+                 FROM task_runs{where_clause} ORDER BY created_at DESC, run_id DESC LIMIT ?"
+            );
+            values.push(Value::Integer((limit + 1) as i64));
+            let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+            let rows =
+                stmt.query_map(params_from_iter(values.iter()), map_task_run_row).map_err(|error| error.to_string())?;
+            let mut items = rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            let next_cursor = if has_more {
+                items.last().map(|run| TaskRunCursor { created_at: run.created_at.clone(), run_id: run.run_id.clone() })
+            } else {
+                None
+            };
+            Ok(TaskRunPage { items, next_cursor })
+        })
+        .await
+        .map_err(|_| TaskHistoryStorageError::StorageUnavailable)
+    }
+
+    pub async fn list_task_run_items(
+        &self,
+        run_id: &str,
+        query: TaskRunItemsQuery,
+    ) -> Result<TaskRunItemsPage, TaskHistoryStorageError> {
+        let run_id = run_id.to_string();
+        self.with_conn(move |conn| {
+            let limit = query.limit.filter(|limit| *limit > 0).unwrap_or(100).clamp(1, 200);
+            let after = query.after_item_index.unwrap_or(-1);
+            let mut stmt = conn
+                .prepare(
+                    "SELECT run_id, item_index, item_kind, source_object, target_object, status,
+                        source_row_count, moved_row_count, target_row_count, row_count_state,
+                        has_table_filter, safe_error_summary
+                     FROM task_run_items WHERE run_id = ?1 AND item_index > ?2
+                     ORDER BY item_index ASC LIMIT ?3",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map(params![run_id, after, (limit + 1) as i64], map_task_run_item_row)
+                .map_err(|error| error.to_string())?;
+            let mut items = rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            let next_after_item_index = if has_more { items.last().map(|item| item.item_index) } else { None };
+            Ok(TaskRunItemsPage { items, next_after_item_index })
+        })
+        .await
+        .map_err(|_| TaskHistoryStorageError::StorageUnavailable)
+    }
+
+    pub async fn delete_task_run(&self, run_id: &str) -> Result<bool, TaskHistoryStorageError> {
+        const RUNNING_SENTINEL: &str = "TASK_RUN_STILL_RUNNING";
+        let run_id = run_id.to_string();
+        let result = self
+            .with_conn(move |conn| {
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|error| error.to_string())?;
+                let current = tx
+                    .query_row("SELECT status FROM task_runs WHERE run_id = ?1", [&run_id], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                let Some(current) = current else {
+                    return Ok(false);
+                };
+                if TaskRunStatus::from_storage(&current).is_none_or(|status| !status.is_terminal()) {
+                    return Err(RUNNING_SENTINEL.to_string());
+                }
+                tx.execute("DELETE FROM task_run_items WHERE run_id = ?1", [&run_id])
+                    .map_err(|error| error.to_string())?;
+                tx.execute("DELETE FROM transfer_run_details WHERE run_id = ?1", [&run_id])
+                    .map_err(|error| error.to_string())?;
+                tx.execute("DELETE FROM task_runs WHERE run_id = ?1", [&run_id]).map_err(|error| error.to_string())?;
+                tx.commit().map_err(|error| error.to_string())?;
+                Ok(true)
+            })
+            .await;
+        match result {
+            Ok(deleted) => Ok(deleted),
+            Err(error) if error == RUNNING_SENTINEL => Err(TaskHistoryStorageError::RunStillRunning),
+            Err(_) => Err(TaskHistoryStorageError::StorageUnavailable),
+        }
+    }
+}
+
+fn insert_task_run_item(tx: &rusqlite::Transaction<'_>, item: &TaskRunItem) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO task_run_items (
+            run_id, item_index, item_kind, source_object, target_object, status,
+            source_row_count, moved_row_count, target_row_count, row_count_state,
+            has_table_filter, safe_error_summary
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            item.run_id,
+            item.item_index,
+            item.item_kind.as_storage_str(),
+            item.source_object,
+            item.target_object,
+            item.status.as_storage_str(),
+            item.source_row_count,
+            item.moved_row_count,
+            item.target_row_count,
+            item.row_count_state.as_storage_str(),
+            item.has_table_filter,
+            item.safe_error_summary,
+        ],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn map_task_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRun> {
+    let task_type: String = row.get(1)?;
+    let lifecycle_owner: String = row.get(2)?;
+    let status: String = row.get(3)?;
+    Ok(TaskRun {
+        run_id: row.get(0)?,
+        task_type: TaskType::from_storage(&task_type).ok_or(rusqlite::Error::InvalidQuery)?,
+        lifecycle_owner: TaskLifecycleOwner::from_storage(&lifecycle_owner).ok_or(rusqlite::Error::InvalidQuery)?,
+        status: TaskRunStatus::from_storage(&status).ok_or(rusqlite::Error::InvalidQuery)?,
+        created_at: row.get(4)?,
+        started_at: row.get(5)?,
+        finished_at: row.get(6)?,
+        owner_instance_id: row.get(7)?,
+        error_code: row.get(8)?,
+        safe_error_summary: row.get(9)?,
+        history_complete: row.get(10)?,
+        source: TaskEndpointSnapshot {
+            connection_id: row.get(11)?,
+            database_type: row.get(12)?,
+            database: row.get(13)?,
+            schema: row.get(14)?,
+            catalog: row.get(15)?,
+        },
+        target: TaskEndpointSnapshot {
+            connection_id: row.get(16)?,
+            database_type: row.get(17)?,
+            database: row.get(18)?,
+            schema: row.get(19)?,
+            catalog: row.get(20)?,
+        },
+    })
+}
+
+fn map_transfer_run_details_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransferRunDetails> {
+    let content: String = row.get(1)?;
+    let mode: String = row.get(2)?;
+    let table_name_case: String = row.get(6)?;
+    let ownership_policy: String = row.get(8)?;
+    let selection_mode: String = row.get(11)?;
+    Ok(TransferRunDetails {
+        run_id: row.get(0)?,
+        content: TransferRunContent::from_storage(&content).ok_or(rusqlite::Error::InvalidQuery)?,
+        mode: TransferRunMode::from_storage(&mode).ok_or(rusqlite::Error::InvalidQuery)?,
+        batch_size: row.get(3)?,
+        create_table: row.get(4)?,
+        drop_target_before_create: row.get(5)?,
+        target_table_name_case: TransferRunTargetTableNameCase::from_storage(&table_name_case)
+            .ok_or(rusqlite::Error::InvalidQuery)?,
+        quote_target_column_names: row.get(7)?,
+        ownership_policy: TransferRunOwnershipPolicy::from_storage(&ownership_policy)
+            .ok_or(rusqlite::Error::InvalidQuery)?,
+        filtered_table_count: row.get(9)?,
+        table_total: row.get(10)?,
+        object_selection_mode: TransferObjectSelectionMode::from_storage(&selection_mode)
+            .ok_or(rusqlite::Error::InvalidQuery)?,
+        selected_object_count: row.get(12)?,
+    })
+}
+
+fn map_task_run_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRunItem> {
+    let item_kind: String = row.get(2)?;
+    let status: String = row.get(5)?;
+    let row_count_state: String = row.get(9)?;
+    Ok(TaskRunItem {
+        run_id: row.get(0)?,
+        item_index: row.get(1)?,
+        item_kind: TaskItemKind::from_storage(&item_kind).ok_or(rusqlite::Error::InvalidQuery)?,
+        source_object: row.get(3)?,
+        target_object: row.get(4)?,
+        status: TaskItemStatus::from_storage(&status).ok_or(rusqlite::Error::InvalidQuery)?,
+        source_row_count: row.get(6)?,
+        moved_row_count: row.get(7)?,
+        target_row_count: row.get(8)?,
+        row_count_state: RowCountState::from_storage(&row_count_state).ok_or(rusqlite::Error::InvalidQuery)?,
+        has_table_filter: row.get(10)?,
+        safe_error_summary: row.get(11)?,
+    })
+}
+
 // AI Config
 
 fn ai_provider_key(provider: &AiProvider) -> String {
@@ -4500,6 +5072,7 @@ impl Storage {
                         configured: false,
                         read_only: policy.read_only,
                         allow_dangerous_sql: policy.allow_dangerous_sql,
+                        prompt_high_risk_sql: policy.prompt_high_risk_sql,
                         allowed_connection_ids: policy.allowed_connection_ids,
                         allowed_group_ids: policy.allowed_group_ids,
                         allowed_tool_names: policy.allowed_tool_names,
@@ -4516,6 +5089,7 @@ impl Storage {
                         configured: false,
                         read_only: policy.read_only,
                         allow_dangerous_sql: policy.allow_dangerous_sql,
+                        prompt_high_risk_sql: policy.prompt_high_risk_sql,
                         allowed_connection_ids: policy.allowed_connection_ids,
                         allowed_group_ids: policy.allowed_group_ids,
                         allowed_tool_names: policy.allowed_tool_names,
@@ -4531,6 +5105,7 @@ impl Storage {
                     configured: true,
                     read_only: policy.read_only,
                     allow_dangerous_sql: policy.allow_dangerous_sql,
+                    prompt_high_risk_sql: policy.prompt_high_risk_sql,
                     allowed_connection_ids: policy.allowed_connection_ids,
                     allowed_group_ids: policy.allowed_group_ids,
                     allowed_tool_names: policy.allowed_tool_names,
@@ -4835,6 +5410,10 @@ impl Storage {
             }
         }
         settings.insert(
+            "custom_ai_skill_auto_enabled".to_string(),
+            serde_json::Value::Bool(desktop_settings.custom_ai_skill_auto_enabled),
+        );
+        settings.insert(
             "sidebar_table_page_size".to_string(),
             serde_json::Value::Number(serde_json::Number::from(desktop_settings.sidebar_table_page_size)),
         );
@@ -4912,6 +5491,10 @@ impl Storage {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string),
+            custom_ai_skill_auto_enabled: settings
+                .get("custom_ai_skill_auto_enabled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or_else(|| DesktopSettings::default().custom_ai_skill_auto_enabled),
             sidebar_table_page_size: settings
                 .get("sidebar_table_page_size")
                 .and_then(|value| value.as_u64())
@@ -6391,6 +6974,8 @@ impl Storage {
                 tx.execute("DELETE FROM connections WHERE id = ?1", [id]).map_err(|e| e.to_string())?;
                 tx.execute("DELETE FROM connection_secrets WHERE connection_id = ?1", [id])
                     .map_err(|e| e.to_string())?;
+                let mqtt_history_key = format!("{MQTT_MESSAGE_HISTORY_STATE_KEY_PREFIX}{id}");
+                tx.execute("DELETE FROM state_store WHERE key = ?1", [mqtt_history_key]).map_err(|e| e.to_string())?;
             }
             tx.commit().map_err(|e| e.to_string())
         })
@@ -6499,6 +7084,8 @@ impl Storage {
             if removed {
                 tx.execute("DELETE FROM connection_secrets WHERE connection_id = ?1", [&connection_id])
                     .map_err(|e| e.to_string())?;
+                let mqtt_history_key = format!("{MQTT_MESSAGE_HISTORY_STATE_KEY_PREFIX}{connection_id}");
+                tx.execute("DELETE FROM state_store WHERE key = ?1", [mqtt_history_key]).map_err(|e| e.to_string())?;
             }
             tx.commit().map_err(|e| e.to_string())?;
             Ok(removed)
@@ -6603,6 +7190,125 @@ impl Storage {
                 .map_err(|error| error.to_string())?
         })
         .await
+    }
+
+    /// Append one successfully published message to a connection's bounded
+    /// local history. The read-modify-write runs in one SQLite transaction so
+    /// concurrent publishes do not overwrite each other's records.
+    #[cfg(feature = "mq-admin")]
+    pub async fn append_mqtt_sent_message(&self, connection_id: &str, message: &MqttMessage) -> Result<(), String> {
+        if message.direction != MqttMessageDirection::Sent {
+            return Err("MQTT sent history accepts outgoing messages only".to_string());
+        }
+        self.append_mqtt_history_messages(connection_id, std::slice::from_ref(message), false).await
+    }
+
+    /// Reconcile live MQTT messages with persisted history without re-adding
+    /// entries already stored by an earlier publish or console poll.
+    #[cfg(feature = "mq-admin")]
+    pub async fn reconcile_mqtt_message_history(
+        &self,
+        connection_id: &str,
+        messages: &[MqttMessage],
+    ) -> Result<(), String> {
+        self.append_mqtt_history_messages(connection_id, messages, true).await
+    }
+
+    #[cfg(feature = "mq-admin")]
+    async fn append_mqtt_history_messages(
+        &self,
+        connection_id: &str,
+        incoming_messages: &[MqttMessage],
+        skip_existing: bool,
+    ) -> Result<(), String> {
+        if incoming_messages.is_empty() {
+            return Ok(());
+        }
+        let key = format!("{MQTT_MESSAGE_HISTORY_STATE_KEY_PREFIX}{connection_id}");
+        let incoming_messages = incoming_messages.to_vec();
+        self.with_conn(move |conn| {
+            let tx =
+                conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
+            let current: Option<Vec<u8>> = tx
+                .query_row("SELECT value FROM state_store WHERE key = ?1", [&key], |row| row.get(0))
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let mut stored_messages: Vec<MqttMessage> = current
+                .map(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
+                .transpose()?
+                .unwrap_or_default();
+            let mut message_counts = HashMap::<(String, String, Option<String>, u8, bool, bool, u64), usize>::new();
+            for message in &stored_messages {
+                *message_counts.entry(mqtt_history_message_identity(message)).or_default() += 1;
+            }
+            let mut changed = false;
+            for message in incoming_messages {
+                let identity = mqtt_history_message_identity(&message);
+                if skip_existing {
+                    if let Some(count) = message_counts.get_mut(&identity) {
+                        if *count > 0 {
+                            *count -= 1;
+                            continue;
+                        }
+                    }
+                    *message_counts.entry(identity).or_default() += 1;
+                }
+                stored_messages.push(message);
+                changed = true;
+            }
+            if !changed {
+                tx.commit().map_err(|error| error.to_string())?;
+                return Ok(());
+            }
+            stored_messages.sort_by_key(|entry| entry.received_at_ms);
+            if stored_messages.len() > MQTT_MESSAGE_HISTORY_MAX_MESSAGES {
+                stored_messages.drain(..stored_messages.len() - MQTT_MESSAGE_HISTORY_MAX_MESSAGES);
+            }
+
+            let bytes = loop {
+                let bytes = serde_json::to_vec(&stored_messages).map_err(|error| error.to_string())?;
+                if bytes.len() <= MQTT_MESSAGE_HISTORY_MAX_BYTES {
+                    break bytes;
+                }
+                if stored_messages.len() <= 1 {
+                    // Keep the previous history if one message alone is too large.
+                    tx.commit().map_err(|error| error.to_string())?;
+                    return Ok(());
+                }
+                stored_messages.remove(0);
+            };
+            tx.execute(
+                "INSERT INTO state_store (key, value, content_type, version, payload) \
+                 VALUES (?1, ?2, 'application/json', 1, x'') \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, content_type = excluded.content_type, \
+                 version = version + 1, payload = excluded.payload",
+                params![key, bytes],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Load the bounded MQTT message history for one connection.
+    #[cfg(feature = "mq-admin")]
+    pub async fn load_mqtt_message_history(&self, connection_id: &str) -> Result<Vec<MqttMessage>, String> {
+        let key = format!("{MQTT_MESSAGE_HISTORY_STATE_KEY_PREFIX}{connection_id}");
+        let Some((bytes, _)) = self.load_state(&key).await? else {
+            return Ok(Vec::new());
+        };
+        let mut messages: Vec<MqttMessage> = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        if messages.len() > MQTT_MESSAGE_HISTORY_MAX_MESSAGES {
+            messages.drain(..messages.len() - MQTT_MESSAGE_HISTORY_MAX_MESSAGES);
+        }
+        Ok(messages)
+    }
+
+    /// Remove MQTT message history when the user clears the console messages.
+    #[cfg(feature = "mq-admin")]
+    pub async fn clear_mqtt_message_history(&self, connection_id: &str) -> Result<(), String> {
+        let key = format!("{MQTT_MESSAGE_HISTORY_STATE_KEY_PREFIX}{connection_id}");
+        self.delete_state(&key).await
     }
 
     /// Update only the persisted driver identity for an existing connection.
@@ -9072,6 +9778,52 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    #[cfg(feature = "mq-admin")]
+    #[tokio::test]
+    async fn mqtt_history_reconciliation_recovers_sent_message_after_initial_append_failure() {
+        use crate::mqtt::types::{MqttMessage, MqttMessageDirection};
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::persistence::test_storage::open(&directory.path().join("storage.db")).await.unwrap();
+        storage
+            .with_conn(|connection| {
+                connection
+                    .execute_batch(
+                        "CREATE TRIGGER fail_mqtt_history_insert \
+                         BEFORE INSERT ON state_store \
+                         WHEN NEW.key = 'mqtt.sent_history.retry' \
+                         BEGIN SELECT RAISE(FAIL, 'injected mqtt history failure'); END;",
+                    )
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap();
+        let message = MqttMessage {
+            topic: "devices/retry".to_string(),
+            payload_base64: "cmV0cnk=".to_string(),
+            payload_text: Some("retry".to_string()),
+            qos: 1,
+            retain: false,
+            received_at_ms: 42,
+            direction: MqttMessageDirection::Sent,
+        };
+
+        assert!(storage.append_mqtt_sent_message("retry", &message).await.is_err());
+        storage
+            .with_conn(|connection| {
+                connection.execute_batch("DROP TRIGGER fail_mqtt_history_insert").map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap();
+
+        storage.reconcile_mqtt_message_history("retry", std::slice::from_ref(&message)).await.unwrap();
+        storage.reconcile_mqtt_message_history("retry", std::slice::from_ref(&message)).await.unwrap();
+
+        let history = storage.load_mqtt_message_history("retry").await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(super::mqtt_history_message_identity(&history[0]), super::mqtt_history_message_identity(&message));
+    }
+
     #[tokio::test]
     async fn migration_scan_cache_recovers_legacy_success_with_stale_counts() {
         let dir = temp_data_dir("migration-stale-cache");
@@ -9794,6 +10546,7 @@ mod tests {
                 covered_messages: None,
                 source_binding: None,
                 selections_omitted: None,
+                loaded_skill_ids: None,
             }],
             queued_input: None,
             created_at: updated_at.to_string(),
@@ -10133,6 +10886,36 @@ mod tests {
 
         let legacy: AiChatMessage = serde_json::from_str(r#"{"role":"user","content":"old turn"}"#).unwrap();
         assert!(legacy.selections_omitted.is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    // prd 09-30 Req 13: a conversation keeps the FACT that skills were loaded so
+    // the panel can light its chips after a restart. The body itself is
+    // deliberately not part of the record — see the field comment in
+    // `dbx-ai-provider`. This pins both halves: the ids round-trip, and a record
+    // written before the field existed still loads.
+    #[tokio::test]
+    async fn ai_conversation_roundtrips_loaded_skill_ids() {
+        let path = temp_db_path("ai-conversation-loaded-skills");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+
+        let mut conversation = ai_conversation("skills-conv", "0000");
+        conversation.messages[0].loaded_skill_ids = Some(vec!["d-abc".to_string(), "c-def".to_string()]);
+        storage.save_ai_conversation(&conversation).await.unwrap();
+
+        let loaded = storage.load_ai_conversations().await.unwrap();
+        assert_eq!(
+            loaded[0].messages[0].loaded_skill_ids.as_deref(),
+            Some(["d-abc".to_string(), "c-def".to_string()].as_slice())
+        );
+        // No body: the stored message is exactly the id list.
+        let stored = serde_json::to_value(&loaded[0].messages[0]).unwrap();
+        assert!(stored.get("loadedSkillIds").and_then(|value| value.as_array()).is_some());
+        assert!(stored.get("toolCalls").is_none());
+
+        let legacy: AiChatMessage = serde_json::from_str(r#"{"role":"assistant","content":"old turn"}"#).unwrap();
+        assert!(legacy.loaded_skill_ids.is_none());
 
         let _ = std::fs::remove_file(path);
     }
@@ -10951,6 +11734,7 @@ mod tests {
             visible_schemas: None,
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
+            show_database_links: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -10977,6 +11761,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_filter: None,
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
@@ -11028,6 +11813,7 @@ mod tests {
             visible_schemas: None,
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
+            show_database_links: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -11054,6 +11840,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_filter: None,
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
@@ -11886,6 +12673,7 @@ mod tests {
                 configured: false,
                 read_only: false,
                 allow_dangerous_sql: false,
+                prompt_high_risk_sql: false,
                 allowed_connection_ids: None,
                 allowed_group_ids: Vec::new(),
                 allowed_tool_names: None,
@@ -11913,6 +12701,7 @@ mod tests {
                 configured: true,
                 read_only: true,
                 allow_dangerous_sql: false,
+                prompt_high_risk_sql: false,
                 allowed_connection_ids: Some(vec!["conn-1".to_string(), "conn-2".to_string()]),
                 allowed_group_ids: Vec::new(),
                 allowed_tool_names: None,
@@ -11931,6 +12720,15 @@ mod tests {
 
         storage.save_desktop_settings(&DesktopSettings::default()).await.unwrap();
         assert!(storage.load_mcp_global_policy().await.unwrap().read_only);
+    }
+
+    #[test]
+    fn legacy_mcp_policy_does_not_enable_high_risk_prompts() {
+        let policy: McpGlobalPolicy =
+            serde_json::from_str(r#"{"readOnly":false,"allowDangerousSql":false,"allowedConnectionIds":null}"#)
+                .unwrap();
+        assert!(!policy.prompt_high_risk_sql);
+        assert!(!policy.normalized().prompt_high_risk_sql);
     }
 
     #[tokio::test]
@@ -12292,6 +13090,7 @@ mod tests {
                 agent_store_dir: Some("/tmp/dbx-agents".to_string()),
                 custom_ai_skill_root_enabled: DesktopSettings::default().custom_ai_skill_root_enabled,
                 custom_ai_skill_root: None,
+                custom_ai_skill_auto_enabled: DesktopSettings::default().custom_ai_skill_auto_enabled,
                 sidebar_table_page_size: DesktopSettings::default().sidebar_table_page_size,
             })
             .await
@@ -12315,6 +13114,7 @@ mod tests {
                 agent_store_dir: Some("/tmp/dbx-agents".to_string()),
                 custom_ai_skill_root_enabled: DesktopSettings::default().custom_ai_skill_root_enabled,
                 custom_ai_skill_root: None,
+                custom_ai_skill_auto_enabled: DesktopSettings::default().custom_ai_skill_auto_enabled,
                 sidebar_table_page_size: DesktopSettings::default().sidebar_table_page_size,
             }
         );
@@ -12358,6 +13158,42 @@ mod tests {
         let raw = storage.load_app_settings_json().await.unwrap();
         assert_eq!(raw.get("custom_ai_skill_root_enabled").and_then(|value| value.as_bool()), Some(false));
         assert_eq!(raw.get("custom_ai_skill_root"), None);
+    }
+
+    /// Req 5's toggle defaults off, so a database written before it existed (the
+    /// key absent) must load as off rather than as "unset means on".
+    #[tokio::test]
+    async fn desktop_settings_roundtrip_custom_ai_skill_auto_enabled() {
+        let path = temp_db_path("desktop-settings-custom-ai-skill-auto");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+
+        assert!(!storage.load_desktop_settings().await.unwrap().custom_ai_skill_auto_enabled);
+
+        storage
+            .save_desktop_settings(&DesktopSettings {
+                custom_ai_skill_auto_enabled: true,
+                ..DesktopSettings::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(storage.load_desktop_settings().await.unwrap().custom_ai_skill_auto_enabled);
+        let raw = storage.load_app_settings_json().await.unwrap();
+        assert_eq!(raw.get("custom_ai_skill_auto_enabled").and_then(|value| value.as_bool()), Some(true));
+
+        storage
+            .save_desktop_settings(&DesktopSettings {
+                custom_ai_skill_auto_enabled: false,
+                ..DesktopSettings::default()
+            })
+            .await
+            .unwrap();
+        assert!(!storage.load_desktop_settings().await.unwrap().custom_ai_skill_auto_enabled);
+
+        // An explicit `false` is written through (not removed), which is what
+        // keeps a synced record distinguishable from "never configured".
+        let raw = storage.load_app_settings_json().await.unwrap();
+        assert_eq!(raw.get("custom_ai_skill_auto_enabled").and_then(|value| value.as_bool()), Some(false));
     }
 
     #[tokio::test]
@@ -14155,5 +14991,134 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(storage.stored_connection_count().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn task_run_storage_is_idempotent_paginated_and_deletes_only_terminal_runs() {
+        use crate::persistence::task_history::{
+            RowCountState, TaskEndpointSnapshot, TaskHistoryStorageError, TaskItemKind, TaskItemStatus,
+            TaskLifecycleOwner, TaskRun, TaskRunItem, TaskRunItemsQuery, TaskRunListQuery, TaskRunStatus, TaskType,
+            TransferObjectSelectionMode, TransferRunContent, TransferRunDetails, TransferRunMode,
+            TransferRunOwnershipPolicy, TransferRunTargetTableNameCase,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dbx.db");
+        let storage = crate::persistence::test_storage::open_unmigrated(&path).await.unwrap();
+        let run = TaskRun {
+            run_id: "history-storage-run".to_string(),
+            task_type: TaskType::Transfer,
+            lifecycle_owner: TaskLifecycleOwner::Web,
+            status: TaskRunStatus::Running,
+            created_at: "2025-01-01T00:00:00.000Z".to_string(),
+            started_at: "2025-01-01T00:00:00.000Z".to_string(),
+            finished_at: None,
+            owner_instance_id: "test-instance".to_string(),
+            error_code: None,
+            safe_error_summary: None,
+            history_complete: false,
+            source: TaskEndpointSnapshot {
+                connection_id: "source-id".to_string(),
+                database_type: "sqlite".to_string(),
+                database: "source-db".to_string(),
+                schema: "main".to_string(),
+                catalog: None,
+            },
+            target: TaskEndpointSnapshot {
+                connection_id: "target-id".to_string(),
+                database_type: "sqlite".to_string(),
+                database: "target-db".to_string(),
+                schema: "main".to_string(),
+                catalog: None,
+            },
+        };
+        let details = TransferRunDetails {
+            run_id: run.run_id.clone(),
+            content: TransferRunContent::DataOnly,
+            mode: TransferRunMode::Append,
+            batch_size: 500,
+            create_table: false,
+            drop_target_before_create: false,
+            target_table_name_case: TransferRunTargetTableNameCase::Preserve,
+            quote_target_column_names: true,
+            ownership_policy: TransferRunOwnershipPolicy::Preserve,
+            filtered_table_count: 0,
+            table_total: 1,
+            object_selection_mode: TransferObjectSelectionMode::Explicit,
+            selected_object_count: Some(0),
+        };
+        let item = TaskRunItem {
+            run_id: run.run_id.clone(),
+            item_index: 0,
+            item_kind: TaskItemKind::Table,
+            source_object: "orders".to_string(),
+            target_object: "orders".to_string(),
+            status: TaskItemStatus::Pending,
+            source_row_count: None,
+            moved_row_count: None,
+            target_row_count: None,
+            row_count_state: RowCountState::Unknown,
+            has_table_filter: false,
+            safe_error_summary: None,
+        };
+
+        storage.create_task_run(&run, &details, std::slice::from_ref(&item)).await.unwrap();
+        assert_eq!(
+            storage.create_task_run(&run, &details, std::slice::from_ref(&item)).await,
+            Err(TaskHistoryStorageError::RunIdConflict)
+        );
+        assert_eq!(storage.delete_task_run(&run.run_id).await, Err(TaskHistoryStorageError::RunStillRunning));
+
+        let completed_item = TaskRunItem {
+            status: TaskItemStatus::Succeeded,
+            source_row_count: Some(0),
+            moved_row_count: Some(0),
+            row_count_state: RowCountState::Known,
+            ..item
+        };
+        assert!(storage.save_task_run_item(&completed_item).await.unwrap());
+        assert!(storage.finish_task_run(&run.run_id, TaskRunStatus::Succeeded, None, None, true).await.unwrap());
+        assert!(!storage
+            .finish_task_run(&run.run_id, TaskRunStatus::Failed, Some("late"), Some("late"), true)
+            .await
+            .unwrap());
+
+        let older_run = TaskRun {
+            run_id: "history-storage-run-older".to_string(),
+            created_at: "2024-12-31T00:00:00.000Z".to_string(),
+            started_at: "2024-12-31T00:00:00.000Z".to_string(),
+            ..run.clone()
+        };
+        let older_details = TransferRunDetails { run_id: older_run.run_id.clone(), ..details.clone() };
+        storage.create_task_run(&older_run, &older_details, &[]).await.unwrap();
+        assert!(storage.finish_task_run(&older_run.run_id, TaskRunStatus::Succeeded, None, None, true).await.unwrap());
+
+        let page = storage.list_task_runs(TaskRunListQuery { limit: Some(1), ..Default::default() }).await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].run_id, run.run_id);
+        let cursor = page.next_cursor.clone().expect("older run must be available on the next page");
+        let next_page = storage
+            .list_task_runs(TaskRunListQuery { limit: Some(1), cursor: Some(cursor), ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(next_page.items.len(), 1);
+        assert_eq!(next_page.items[0].run_id, older_run.run_id);
+        assert!(next_page.next_cursor.is_none());
+        let item_page = storage
+            .list_task_run_items(&run.run_id, TaskRunItemsQuery { limit: Some(1), ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(item_page.items[0].source_row_count, Some(0));
+        assert_eq!(item_page.items[0].moved_row_count, Some(0));
+        assert_eq!(item_page.items[0].target_row_count, None);
+
+        drop(storage);
+        let reopened = crate::persistence::test_storage::open_unmigrated(&path).await.unwrap();
+        let detail = reopened.get_task_run_detail(&run.run_id).await.unwrap().unwrap();
+        assert_eq!(detail.run.status, TaskRunStatus::Succeeded);
+        assert!(detail.run.history_complete);
+        assert_eq!(detail.transfer.unwrap().selected_object_count, Some(0));
+        assert!(reopened.delete_task_run(&run.run_id).await.unwrap());
+        assert!(reopened.get_task_run_detail(&run.run_id).await.unwrap().is_none());
     }
 }

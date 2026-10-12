@@ -12,9 +12,10 @@ import type { DataGridStructuredFilterRule } from "@/composables/useDataGridFilt
 import type { DataGridStructuredSortRule } from "@/composables/useDataGridSortBuilder";
 import type { DataGridConditionHistoryScope } from "@/lib/dataGrid/dataGridConditionHistory";
 import type { DataGridContextFilterMode } from "@/lib/dataGrid/dataGridSql";
-import type { DataGridDistinctValueSuggestionState, DataGridDistinctValueSuggestionTarget } from "@/lib/dataGrid/dataGridDistinctValueSuggestions";
+import type { DataGridDistinctValueSource, DataGridDistinctValueSuggestionState, DataGridDistinctValueSuggestionTarget } from "@/lib/dataGrid/dataGridDistinctValueSuggestions";
 import type { DataGridLocalFilterOption } from "@/lib/dataGrid/dataGridLocalColumnFilterState";
 import type { DataGridFilterEditorView } from "@/stores/settingsStore";
+import type { DatabaseType } from "@/types/database";
 import { clampSearchSplitWidth } from "@/lib/dataGrid/dataGridSearchSplit";
 
 type LocalFilterSummary = {
@@ -31,6 +32,7 @@ const props = defineProps<{
   commentByColumn?: ReadonlyMap<string, string>;
   conditionColumns: readonly DataGridConditionColumnOption[];
   identifierQuote?: string;
+  databaseType?: DatabaseType;
   historyScope: DataGridConditionHistoryScope;
   canUseWhereSearch: boolean;
   compact: boolean;
@@ -78,6 +80,7 @@ const emit = defineEmits<{
   openValueSuggestions: [id: string, target: DataGridDistinctValueSuggestionTarget];
   closeValueSuggestions: [];
   updateValueSuggestionSearch: [value: string];
+  updateValueSuggestionSource: [source: DataGridDistinctValueSource];
   selectValueSuggestion: [option: DataGridLocalFilterOption];
   toggleValueSuggestion: [option: DataGridLocalFilterOption];
   toggleAllValueSuggestions: [];
@@ -278,6 +281,7 @@ onUnmounted(onResizeEnd);
               @open-value-suggestions="(id, target) => emit('openValueSuggestions', id, target)"
               @close-value-suggestions="emit('closeValueSuggestions')"
               @update-value-suggestion-search="emit('updateValueSuggestionSearch', $event)"
+              @update-value-suggestion-source="emit('updateValueSuggestionSource', $event)"
               @select-value-suggestion="emit('selectValueSuggestion', $event)"
               @toggle-value-suggestion="emit('toggleValueSuggestion', $event)"
               @toggle-all-value-suggestions="emit('toggleAllValueSuggestions')"
@@ -305,6 +309,7 @@ onUnmounted(onResizeEnd);
         kind="where"
         :columns="conditionColumns"
         :identifier-quote="identifierQuote"
+        :database-type="databaseType"
         :history-scope="historyScope"
         placeholder="WHERE"
         :history-empty-text="t('grid.conditionHistoryEmpty')"
@@ -377,6 +382,7 @@ onUnmounted(onResizeEnd);
         kind="orderBy"
         :columns="conditionColumns"
         :identifier-quote="identifierQuote"
+        :database-type="databaseType"
         :history-scope="historyScope"
         placeholder="ORDER BY"
         :history-empty-text="t('grid.conditionHistoryEmpty')"

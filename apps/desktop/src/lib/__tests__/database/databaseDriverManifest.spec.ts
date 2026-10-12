@@ -13,18 +13,17 @@ describe("databaseDriverManifest", () => {
       tableDataEdit: true,
       tableStructureEdit: true,
       tableImport: true,
-      dataTransfer: false,
+      dataTransfer: true,
       sqlFileExecution: true,
       databaseCreate: false,
-      fieldLineage: false,
-      sqlExplain: false,
+      fieldLineage: true,
+      sqlExplain: true,
       userAdmin: true,
       driverManagement: true,
     });
-    for (const capability of ["objectSource", "tableDataEdit", "userAdmin"] as const) {
+    for (const capability of ["objectSource", "tableDataEdit", "userAdmin", "sqlExplain"] as const) {
       expect(supportsDatabaseFeature("xugu", capability), capability).toBe(true);
     }
-    expect(supportsDatabaseFeature("xugu", "sqlExplain")).toBe(false);
   });
 
   it("uses agent cursor only for agent or external runtimes", () => {
@@ -72,5 +71,9 @@ describe("databaseDriverManifest", () => {
     expect(databaseConnectionFormKind("mq")).toBe("mq");
     expect(databaseConnectionFormKind("mqtt")).toBe("mqtt");
     expect(databaseConnectionFormKind("nacos")).toBe("nacos");
+  });
+
+  it("advertises tableDataEdit capability for InterSystems IRIS / Caché (#11808)", () => {
+    expect(supportsDatabaseFeature("iris", "tableDataEdit")).toBe(true);
   });
 });

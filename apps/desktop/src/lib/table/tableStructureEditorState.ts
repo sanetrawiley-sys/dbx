@@ -815,6 +815,32 @@ export function supportsTableStructureExtendedProperties(databaseType?: Database
   );
 }
 
+/**
+ * Extracts a MySQL generated-column definition from a raw `extra` string such
+ * as `GENERATED ALWAYS AS (`price` * `quantity`) STORED`. Returns undefined
+ * for plain columns and identity columns (`GENERATED ... AS IDENTITY`, no
+ * parenthesized expression). MariaDB `PERSISTENT` is normalized to `STORED`,
+ * matching the MySQL driver's introspection output.
+ */
+export function parseMysqlGeneratedColumnExtra(extra: string): { expression: string; storage: "VIRTUAL" | "STORED" } | undefined {
+  const marker = "generated always as";
+  const lower = extra.toLowerCase();
+  const index = lower.indexOf(marker);
+  if (index < 0) return undefined;
+  const rest = extra.slice(index + marker.length).trimStart();
+  if (!rest.startsWith("(")) return undefined;
+  const close = rest.lastIndexOf(")");
+  if (close <= 0) return undefined;
+  const expression = rest.slice(1, close).trim();
+  if (!expression) return undefined;
+  const tail = rest
+    .slice(close + 1)
+    .trim()
+    .toUpperCase();
+  const storage = tail.startsWith("STORED") || tail.startsWith("PERSISTENT") ? "STORED" : "VIRTUAL";
+  return { expression, storage };
+}
+
 export function parseExtraToColumnExtra(extra: string | null | undefined, databaseType?: DatabaseType): ColumnExtra {
   const result: ColumnExtra = {};
   if (!extra) return result;
@@ -827,6 +853,10 @@ export function parseExtraToColumnExtra(extra: string | null | undefined, databa
     }
     if (databaseType === "mysql" && lower.includes("on update current_timestamp")) {
       result.onUpdateCurrentTimestamp = true;
+    }
+    if (databaseType === "mysql") {
+      const generated = parseMysqlGeneratedColumnExtra(extra);
+      if (generated) result.generated = generated;
     }
   } else if (databaseType === "postgres" || databaseType === "gaussdb" || databaseType === "kwdb" || databaseType === "questdb" || databaseType === "highgo" || databaseType === "uxdb" || databaseType === "vastbase" || databaseType === "kingbase") {
     const identityMatch = lower.match(/generated\s+(by\s+default|always)\s+as\s+identity/i);
@@ -1187,6 +1217,29 @@ export function filterStructureIndexColumnOptions(availableColumns: readonly str
   return query ? options.filter((column) => column.toLowerCase().includes(query)) : options;
 }
 
+const indexColumnNameCollator = typeof Intl !== "undefined" && typeof Intl.Collator === "function" ? new Intl.Collator(undefined, { sensitivity: "base", numeric: true }) : null;
+
+/**
+ * Order index-column picker rows: picked columns first in their index order,
+ * then unpicked columns alphabetically (case-insensitive, numeric-aware) so a
+ * long field list is scannable (#11747).
+ */
+export function sortStructureIndexColumnOptions<T extends { name: string }>(options: readonly T[], selectedPositions: ReadonlyMap<string, number>): T[] {
+  if (options.length <= 1) return [...options];
+  const picked: T[] = [];
+  const unpicked: T[] = [];
+  for (const option of options) {
+    if (selectedPositions.has(option.name)) {
+      picked.push(option);
+    } else {
+      unpicked.push(option);
+    }
+  }
+  picked.sort((left, right) => (selectedPositions.get(left.name) ?? 0) - (selectedPositions.get(right.name) ?? 0));
+  unpicked.sort((left, right) => (indexColumnNameCollator ? indexColumnNameCollator.compare(left.name, right.name) : left.name.localeCompare(right.name, undefined, { sensitivity: "base", numeric: true })));
+  return [...picked, ...unpicked];
+}
+
 export function createIndexDrafts(indexes: IndexInfo[]): EditableStructureIndex[] {
   return indexes.map((index) => ({
     id: `existing:${index.name}`,
@@ -1268,6 +1321,12 @@ export function structureIndexKind(index: IndexNamingOptions): StructureIndexKin
 }
 
 export type SpecialIndexColumnIssue = "specialIndexUnique" | "fulltextIndexColumns" | "spatialIndexColumn" | "spatialIndexNullable";
+
+export function canIndexTypeHaveSpecialIssue(dialect: string, indexType?: string | null): boolean {
+  if (!indexType) return false;
+  const type = indexType.trim().toUpperCase();
+  return (dialect === "mysql" && type === "FULLTEXT") || ((dialect === "mysql" || dialect === "sqlserver") && type === "SPATIAL");
+}
 
 export function specialIndexColumnIssue(dialect: string, indexType: string, columns: readonly Pick<EditableStructureColumn, "dataType" | "isNullable">[], isUnique = false): SpecialIndexColumnIssue | null {
   const type = indexType.trim().toUpperCase();
@@ -1441,7 +1500,7 @@ function normalizedDataTypeName(rawDataType: string): string {
 }
 
 export function getDataTypeLengthUnitOptions(dbType: DatabaseType | undefined, rawDataType: string): readonly DataTypeLengthUnit[] {
-  if (dbType !== "dameng" && dbType !== "oracle") return [];
+  if (dbType !== "dameng" && dbType !== "oracle" && dbType !== "oceanbase-oracle") return [];
   return CHARACTER_LENGTH_UNIT_TYPES.has(normalizedDataTypeName(rawDataType)) ? CHARACTER_LENGTH_UNITS : [];
 }
 

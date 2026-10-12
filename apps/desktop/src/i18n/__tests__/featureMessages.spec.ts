@@ -43,6 +43,7 @@ const under = (namespace: string, keys: string[]) => keys.map((key) => `${namesp
 // leaks the raw key path, and a key missing from a locale silently shows
 // English.
 const FEATURE_MESSAGES: FeatureMessages[] = [
+  { feature: "AstraFlow provider", keys: ["ai.astraflowDescription"], translated: true },
   { feature: "AI HTML preview (#6467)", keys: under("ai", ["htmlPreviewLabel", "htmlExpandPreview", "htmlExpandPreviewHint", "htmlSaveSafe", "htmlSaveFailed", "htmlCopySource", "htmlCopyRiskBody", "htmlCopyRiskAccept", "htmlCopyRiskRemember", "htmlCopyRiskToast"]) },
   { feature: "AI conversation export (#6467)", keys: under("ai", ["exportConversation", "conversationExportMarkdown", "conversationExportHtml", "conversationRoleUser", "conversationRoleAssistant", "conversationFailedMarker", "conversationExportEmpty"]) },
   { feature: "AI conversation management", keys: under("ai", ["renameConversation", "conversationRenameFailed", "clearDatabaseSelection", "searchDatabases", "noDatabasesFound"]) },
@@ -69,6 +70,12 @@ const FEATURE_MESSAGES: FeatureMessages[] = [
   { feature: "plugin batch actions", keys: ["pluginPlatform.batchDuplicateSources", "pluginPlatform.batchRefreshFailed"], locales: EXCEPT_AZ_TR },
   { feature: "plugin marketplace sorting (#10078)", keys: under("pluginPlatform", ["sortBy", "sortByName", "sortByRecentlyUpdated", "sortByRecentlyListed", "sortByUpdatesFirst"]), locales: EXCEPT_AZ_TR, translated: true },
   { feature: "shared refresh action (#8768)", keys: ["common.refresh"] },
+  {
+    feature: "Xugu field lineage scope and coverage",
+    keys: under("lineage", ["xuguScopeNotice", "xuguPartialCoverage"]),
+    locales: ["en", "es", "it", "ja", "ko", "pt-BR", "ru", "zh-CN", "zh-TW"],
+    translated: true,
+  },
   { feature: "transfer bulk select", keys: under("transfer", ["bulkSelectObjects", "bulkSelectTitle", "bulkSelectHint", "bulkSelectPlaceholder", "bulkSelectConfirm", "bulkSelectMatched", "bulkSelectUnmatched", "noMatchingObjects"]), translated: true },
   { feature: "transfer background acknowledgement (#8649)", keys: ["transfer.backgroundStarted"], translated: true },
   { feature: "table info pin", keys: ["grid.pinTableInfo", "grid.unpinTableInfo"], translated: true },
@@ -108,6 +115,7 @@ const FEATURE_MESSAGES: FeatureMessages[] = [
     keys: ["pluginPlatform.dataAccessConsent", "pluginPlatform.dataAccessConsentTitle", "pluginPlatform.aiTools.*", "pluginPlatform.dataAccess.*", "ai.toolApproval.*"],
     translated: true,
   },
+  { feature: "schema diff deploy ignores foreign key checks", keys: under("diff", ["ignoreForeignKeyChecks", "ignoreForeignKeyChecksHint"]), translated: true },
 ];
 
 function lookup(messages: unknown, path: string): unknown {

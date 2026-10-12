@@ -68,6 +68,7 @@ fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connecti
         redis_scan_page_size: None,
         redis_database_aliases: Default::default(),
         redis_key_templates: Vec::new(),
+        redis_key_filter: None,
         redis_key_grouping: None,
         etcd_endpoints: String::new(),
         gbase_server: String::new(),
@@ -87,6 +88,7 @@ fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connecti
         show_system_schemas: false,
         database_info: None,
         sidebar_auto_load_all_tables: false,
+        show_database_links: None,
     }
 }
 
@@ -224,6 +226,7 @@ async fn manual_e2e_sqlserver_default_split_zip_export_then_import_skip_relation
         // constraint bypass runs `ALTER TABLE ... NOCHECK CONSTRAINT ALL`
         // before the import and `WITH NOCHECK CHECK CONSTRAINT ALL` after.
         skip_relational_constraints: true,
+        failure_log_enabled: true,
     };
 
     let file_path_refs: Vec<&std::path::Path> = extracted_paths.iter().map(|path| path.as_path()).collect();

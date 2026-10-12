@@ -4,6 +4,7 @@ import type { SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import type { MultiDbExecutionTarget, MultiDbResultRunExecution } from "@/types/sqlExecution";
 import type { DatabaseType } from "@/types/generated/databaseTypes";
 import type { PluginAiRecommendation } from "@/types/pluginAiRecommendations";
+import type { GraphResult } from "@/lib/graph/graphResult";
 
 export type { DatabaseType } from "@/types/generated/databaseTypes";
 
@@ -82,6 +83,7 @@ export interface CompletionAssistantCandidate {
   comment?: string | null;
   data_type?: string | null;
   signature?: string | null;
+  routine_id?: string | null;
 }
 
 export interface CompletionAssistantResponse {
@@ -157,6 +159,8 @@ export interface ConnectionConfig {
   redis_database_aliases?: Record<string, string>;
   /** Key-search templates for the Redis browser. Non-empty overrides global settings. */
   redis_key_templates?: string[];
+  /** Default Redis glob pattern applied when opening a new key-browser tab. */
+  redis_key_filter?: string;
   redis_key_grouping?: import("@/lib/redis/redisKeyGrouping").RedisKeyGrouping;
   etcd_endpoints?: string;
   gbase_server?: string;
@@ -1133,6 +1137,8 @@ export interface ColumnInfo {
   name: string;
   data_type: string;
   resolved_schema?: string;
+  resolved_table?: string;
+  resolved_object_type?: string;
   is_nullable: boolean;
   column_default: string | null;
   is_primary_key: boolean;
@@ -1214,10 +1220,10 @@ export interface ConstraintInfo {
   match_type?: string | null;
   on_update?: string | null;
   on_delete?: string | null;
-  deferrable: boolean;
-  initially_deferred: boolean;
-  enabled: boolean;
-  valid: boolean;
+  deferrable?: boolean | null;
+  initially_deferred?: boolean | null;
+  enabled?: boolean | null;
+  valid?: boolean | null;
 }
 
 export interface PartitionInfo {
@@ -1304,6 +1310,7 @@ export interface QueryResult {
   columns: string[];
   /** Typed Neo4j node properties; source columns remain unchanged for paging. */
   neo4j_node_cells?: import("@/lib/neo4j/neo4jNodeResult").Neo4jNodeCell[];
+  graph_data?: GraphResult;
   /** One SRID per geometry/geography column (first non-null observed). */
   spatial_columns?: SpatialColumn[];
   /**
@@ -1385,7 +1392,11 @@ export interface QueryResult {
   total_is_exact?: boolean;
   truncated?: boolean;
   /** Variable-length cells represented by bounded previews in `rows`. */
-  large_value_cells?: Array<{ row_index: number; column_index: number; original_bytes: number }>;
+  large_value_cells?: Array<{ row_index: number; column_index: number; original_bytes: number; value_ref?: string }>;
+  /** Frontend-only original result connection, independent of the currently active tab. */
+  large_value_context?: { connectionId: string; database: string; clientSessionId?: string; txnSessionId?: string; catalog?: string };
+  /** Retained result refs also cover cells already hydrated into complete local values. */
+  large_value_refs?: string[];
   session_id?: string | null;
   has_more?: boolean;
   /** For Elasticsearch REST search results parsed into a _source table,
@@ -1574,6 +1585,12 @@ export interface SqlColumnReference {
   scope_id?: number;
 }
 
+export interface SqlGroupByViolation {
+  span: SqlTextSpan;
+  column: string;
+  qualifier?: string | null;
+}
+
 export interface SqlReferenceScope {
   id: number;
   parent_id?: number | null;
@@ -1583,6 +1600,7 @@ export interface SqlReferenceAnalysis {
   tables: SqlTableReference[];
   columns: SqlColumnReference[];
   scopes?: SqlReferenceScope[];
+  group_by_violations?: SqlGroupByViolation[];
 }
 
 export type TreeNodeType =
@@ -1612,6 +1630,7 @@ export type TreeNodeType =
   | "package-body"
   | "group-columns"
   | "group-indexes"
+  | "group-database-indexes"
   | "group-fkeys"
   | "group-triggers"
   | "group-events"
@@ -1625,6 +1644,8 @@ export type TreeNodeType =
   | "group-materialized-views"
   | "group-procedures"
   | "group-functions"
+  | "group-internal-functions"
+  | "group-udf-functions"
   | "group-types"
   | "group-sequences"
   | "group-synonyms"
@@ -1771,6 +1792,9 @@ export interface TreeNode {
     parentId: string;
     offset: number;
     pageSize: number;
+    /** Backend filter and global-search identity for OceanBase metadata pages. */
+    searchFilter?: string;
+    searchQuery?: string;
     /**
      * Identity of the row that was expected to open this page: the peek row the
      * previous page fetched but did not display. Offset paging is not snapshot
@@ -1912,7 +1936,7 @@ export interface QueryPageJumpProgress {
   targetPage: number;
 }
 
-export type TabOutputView = "result" | "summary" | "explain" | "chart" | "messages" | "profile";
+export type TabOutputView = "result" | "graph" | "summary" | "explain" | "chart" | "messages" | "profile";
 
 export type RedisResultViewMode = "grid" | "console";
 
@@ -1928,6 +1952,8 @@ export interface TabUiState {
   page?: Record<string, TabPageUiState>;
 }
 
+export type DatabaseSearchScope = "data" | "structure";
+
 export interface DatabaseSearchResultItem {
   id: string;
   schema?: string;
@@ -1936,6 +1962,11 @@ export interface DatabaseSearchResultItem {
   matchedColumns: string[];
   preview: string;
   whereInput: string;
+  /** Present for structure-scope hits (column name / comment search). */
+  searchScope?: DatabaseSearchScope;
+  columnName?: string;
+  columnComment?: string;
+  structureMatchIn?: Array<"name" | "comment">;
 }
 
 export interface DatabaseSearchTableTask {
@@ -1945,6 +1976,7 @@ export interface DatabaseSearchTableTask {
 
 export interface DatabaseSearchTabState {
   keyword: string;
+  searchScope?: DatabaseSearchScope;
   perTableLimit: number;
   progressDone: number;
   progressTotal: number;
@@ -1973,6 +2005,11 @@ export interface QueryTab {
    */
   titleNumber?: number;
   titleNumberKey?: string;
+  /**
+   * User-chosen suffix shown after the tab title (set from the tab context menu).
+   * It replaces the automatic `titleNumber` for this tab and is persisted with it.
+   */
+  titleSuffix?: string;
   /** Force the editor to word-wrap regardless of the global setting, e.g. for auto-generated single-line templates. */
   forceWordWrap?: boolean;
   connectionId: string;
@@ -1991,6 +2028,7 @@ export interface QueryTab {
   sql: string;
   savedSqlId?: string;
   externalSqlPath?: string;
+  externalSqlEncoding?: "auto" | "utf8" | "utf8Bom" | "utf16le" | "utf16be" | "gbk";
   externalSqlFileVersion?: ExternalSqlFileVersion;
   externalSqlIgnoredFileVersion?: ExternalSqlFileVersion;
   externalSqlFileMissing?: boolean;
@@ -2085,6 +2123,7 @@ export interface QueryTab {
     columnName: string;
   };
   executionId?: string;
+  liveQueryMessages?: QueryMessage[];
   /** Ephemeral result run targeted by the current execution; null means a new run is being produced. */
   executingResultRunId?: string | null;
   isExplaining?: boolean;
@@ -2341,6 +2380,10 @@ export interface QueryTab {
   autoCommit?: boolean;
   /** Session ID for an active manual transaction, set after beginManualTransaction */
   txnSessionId?: string;
+  /** Runtime-only SQL Server transaction lifecycle and last terminal notice. */
+  txnStatus?: "opening" | "active" | "executing" | "ending" | "lost" | "unknown";
+  txnNotice?: string;
+  txnIndependentConnectionExplained?: boolean;
   /** Set to true when a manual transaction was auto-rolled back due to inactivity */
   txnAutoRolledBack?: boolean;
   /** Sticky proven-read-only dialects (Oracle/OceanBase-Oracle/MySQL/PostgreSQL),
@@ -2420,6 +2463,8 @@ export interface TransferTaskConfig {
   targetTableNameCase: TransferTableNameCase;
   quoteTargetColumnNames: boolean;
   batchSize: number;
+  /** Optional per-source-table transfer filter (bare WHERE or a full SELECT). */
+  tableFilters?: Record<string, string>;
   /** Legacy-compatible rebuild flag; true takes precedence over the saved DML mode. */
   dropTargetBeforeCreate?: boolean;
   /** Legacy field only. Saved confirmation is always ignored and reset to false. */
