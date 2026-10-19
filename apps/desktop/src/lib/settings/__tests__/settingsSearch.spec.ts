@@ -75,6 +75,42 @@ describe("settings search", () => {
     expect(searchSettings(entries, "line number", "en").map((entry) => entry.id)).toEqual(["editor-line-numbers"]);
   });
 
+  it("indexes the query editor caret-browsing preference (#11827)", () => {
+    const definition = SETTINGS_SEARCH_DEFINITIONS.find((entry) => entry.id === "editor-caret-browsing");
+    expect(definition).toEqual({
+      id: "editor-caret-browsing",
+      category: "editor",
+      titleKey: "settings.caretBrowsing",
+      descriptionKey: "settings.caretBrowsingDescription",
+      targetId: "editor",
+    });
+
+    const entries = resolveSettingsSearchEntries(
+      [definition!],
+      { isWeb: false, visibleCategories: new Set<SettingsCategory>(["editor"]) },
+      (key) =>
+        ({
+          "settings.caretBrowsing": "光标浏览 (F7)",
+          "settings.caretBrowsingDescription": "允许按 F7 切换浏览器的插入光标浏览模式",
+        })[key] ?? key,
+      categoryLabels,
+    );
+    expect(searchSettings(entries, "光标", "zh-CN")).toEqual([
+      expect.objectContaining({
+        id: "editor-caret-browsing",
+        category: "editor",
+        targetId: "editor",
+      }),
+    ]);
+    expect(searchSettings(entries, "F7", "zh-CN")).toEqual([
+      expect.objectContaining({
+        id: "editor-caret-browsing",
+        category: "editor",
+        targetId: "editor",
+      }),
+    ]);
+  });
+
   it("indexes SQL Server space confirmation when SQL Server exists or an exported setting is enabled", () => {
     const definition = SETTINGS_SEARCH_DEFINITIONS.find((entry) => entry.id === "editor-sqlserver-space-completion");
     expect(definition).toEqual(
@@ -120,6 +156,16 @@ describe("settings search", () => {
       titleKey: "settings.defaultExplainView",
       descriptionKey: "settings.defaultExplainViewDescription",
       targetId: "default-explain-view",
+    });
+  });
+
+  it("indexes the query result export file name source setting (#12092)", () => {
+    expect(SETTINGS_SEARCH_DEFINITIONS).toContainEqual({
+      id: "data-export-file-name-source",
+      category: "data",
+      titleKey: "settings.queryResultExportFileNameSource",
+      descriptionKey: "settings.queryResultExportFileNameSourceDescription",
+      targetId: "data",
     });
   });
 
@@ -315,6 +361,7 @@ describe("settings search", () => {
       { titleKey: "settings.tableCompletionSchemaQualification", category: "editor", targetId: "editor" },
       { titleKey: "settings.autoAliasTables", category: "editor", targetId: "editor" },
       { titleKey: "settings.clickTableNavigationTarget", category: "navigation", targetId: "navigation" },
+      { titleKey: "settings.objectBrowserAutoOpenDetailPanel", category: "navigation", targetId: "navigation" },
       { titleKey: "settings.prefillNewQueryWithSelect", category: "navigation", targetId: "navigation" },
       { titleKey: "settings.generateSqlIncludeDatabaseName", category: "editor", targetId: "editor" },
       { titleKey: "settings.generateSqlQuoteIdentifiers", category: "editor", targetId: "editor" },
@@ -352,6 +399,8 @@ describe("settings search", () => {
       { titleKey: "ai.maxAgentTurns", category: "ai", targetId: "ai" },
       { titleKey: "ai.maxRetriesGlobal", category: "ai", targetId: "ai" },
       { titleKey: "ai.globalInstructions", category: "ai", targetId: "ai" },
+      { titleKey: "settings.aiSqlApplyTarget", category: "editor", targetId: "editor" },
+      { titleKey: "settings.aiSqlApplyTarget", category: "ai", targetId: "ai" },
     ];
 
     for (const expectedControl of expectedControls) {

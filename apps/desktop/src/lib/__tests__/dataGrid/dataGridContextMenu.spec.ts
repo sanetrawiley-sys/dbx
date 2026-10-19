@@ -47,8 +47,9 @@ describe("dataGridContextMenu", () => {
     const filter = createDataGridFilterSubmenu({
       label: "filter",
       icon,
-      labels: { equals: "equals", notEquals: "not equals", like: "like", notLike: "not like", lessThan: "less", greaterThan: "greater", isNull: "null", isNotNull: "not null", clear: "clear" },
+      labels: { equals: "equals", notEquals: "not equals", like: "like", notLike: "not like", lessThan: "less", greaterThan: "greater", custom: "custom", isNull: "null", isNotNull: "not null", clear: "clear" },
       apply: action,
+      applyCustom: action,
       clear: action,
     });
     const items = createDataGridColumnContextMenuItems({
@@ -59,9 +60,9 @@ describe("dataGridContextMenu", () => {
       hasSort: true,
       sortMode: "database",
       databaseSortEnabled: false,
-      labels: { copyName: "copy name", copyNames: "copy names", details: "details", copyAlterSql: "alter", databaseAscending: "db asc", databaseDescending: "db desc", localAscending: "local asc", localDescending: "local desc", clearSort: "clear sort" },
+      labels: { copyName: "copy name", copyComment: "copy comment", copyNames: "copy names", details: "details", copyAlterSql: "alter", databaseAscending: "db asc", databaseDescending: "db desc", localAscending: "local asc", localDescending: "local desc", clearSort: "clear sort" },
       icons: { copy: icon, columnDetails: icon, database: icon, ascending: icon, descending: icon, clearSort: icon },
-      actions: { copyName: action, copyNames: action, details: action, copyAlterSql: action, sort: action },
+      actions: { copyName: action, copyComment: action, copyNames: action, details: action, copyAlterSql: action, sort: action },
       filterSubmenu: filter,
     });
     expect(items.map((item) => item.label)).toEqual(["local asc", "local desc", "clear sort", "", "filter"]);
@@ -98,8 +99,9 @@ describe("dataGridContextMenu", () => {
     const filter = createDataGridFilterSubmenu({
       label: "filter",
       icon,
-      labels: { equals: "equals", notEquals: "not equals", like: "like", notLike: "not like", lessThan: "less", greaterThan: "greater", isNull: "null", isNotNull: "not null", clear: "clear" },
+      labels: { equals: "equals", notEquals: "not equals", like: "like", notLike: "not like", lessThan: "less", greaterThan: "greater", custom: "custom", isNull: "null", isNotNull: "not null", clear: "clear" },
       apply: action,
+      applyCustom: action,
       clear: action,
     });
     const columnItems = createDataGridColumnContextMenuItems({
@@ -109,9 +111,9 @@ describe("dataGridContextMenu", () => {
       canFilter: true,
       hasSort: true,
       sortMode: "database",
-      labels: { copyName: "copy name", copyNames: "copy names", details: "details", copyAlterSql: "alter", databaseAscending: "db asc", databaseDescending: "db desc", localAscending: "local asc", localDescending: "local desc", clearSort: "clear sort" },
+      labels: { copyName: "copy name", copyComment: "copy comment", copyNames: "copy names", details: "details", copyAlterSql: "alter", databaseAscending: "db asc", databaseDescending: "db desc", localAscending: "local asc", localDescending: "local desc", clearSort: "clear sort" },
       icons: { copy: icon, columnDetails: icon, database: icon, ascending: icon, descending: icon, clearSort: icon },
-      actions: { copyName: action, copyNames: action, details: action, copyAlterSql: action, sort: action },
+      actions: { copyName: action, copyComment: action, copyNames: action, details: action, copyAlterSql: action, sort: action },
       filterSubmenu: filter,
     });
     expect(columnItems.map((item) => item.label)).toContain("filter");
@@ -148,19 +150,31 @@ describe("dataGridContextMenu", () => {
     expect(rowItems.find((item) => item.label === "delete")?.variant).toBe("destructive");
   });
 
-  function columnMenuItems(overrides: { headerColumn?: boolean; contextColumn?: boolean; contextVisibleColIdx?: number; hasColumnSelection?: boolean; selectedColumnCount?: number; visibleColumnCount?: number; hiddenColumnCount?: number; canHideIdenticalColumns?: boolean }) {
+  function columnMenuItems(overrides: {
+    headerColumn?: boolean;
+    contextColumn?: boolean;
+    contextVisibleColIdx?: number;
+    hasColumnSelection?: boolean;
+    selectedColumnCount?: number;
+    visibleColumnCount?: number;
+    hiddenColumnCount?: number;
+    canHideIdenticalColumns?: boolean;
+    canCopyComment?: boolean;
+  }) {
     const action = vi.fn();
     const filter = createDataGridFilterSubmenu({
       label: "filter",
       icon,
-      labels: { equals: "equals", notEquals: "not equals", like: "like", notLike: "not like", lessThan: "less", greaterThan: "greater", isNull: "null", isNotNull: "not null", clear: "clear" },
+      labels: { equals: "equals", notEquals: "not equals", like: "like", notLike: "not like", lessThan: "less", greaterThan: "greater", custom: "custom", isNull: "null", isNotNull: "not null", clear: "clear" },
       apply: action,
+      applyCustom: action,
       clear: action,
     });
     return createDataGridColumnContextMenuItems({
       headerColumn: overrides.headerColumn ?? true,
       contextColumn: overrides.contextColumn ?? false,
       canCopyAlterSql: false,
+      canCopyComment: overrides.canCopyComment ?? false,
       canFilter: false,
       hasSort: false,
       sortMode: "database",
@@ -171,6 +185,7 @@ describe("dataGridContextMenu", () => {
       hiddenColumnCount: 0,
       labels: {
         copyName: "copy name",
+        copyComment: "copy comment",
         copyNames: "copy names",
         details: "details",
         copyAlterSql: "alter",
@@ -188,11 +203,32 @@ describe("dataGridContextMenu", () => {
         showAllColumnsMenu: "show all columns",
       },
       icons: { copy: icon, columnDetails: icon, database: icon, ascending: icon, descending: icon, clearSort: icon },
-      actions: { copyName: action, copyNames: action, details: action, copyAlterSql: action, sort: action, freezeToColumn: action, freezeSelectedColumns: action, unfreezeColumns: action, hideColumn: action, hideSelectedColumns: action, hideIdenticalColumns: action, showAllColumnsMenu: action },
+      actions: {
+        copyName: action,
+        copyComment: action,
+        copyNames: action,
+        details: action,
+        copyAlterSql: action,
+        sort: action,
+        freezeToColumn: action,
+        freezeSelectedColumns: action,
+        unfreezeColumns: action,
+        hideColumn: action,
+        hideSelectedColumns: action,
+        hideIdenticalColumns: action,
+        showAllColumnsMenu: action,
+      },
       filterSubmenu: filter,
       ...overrides,
     });
   }
+
+  it("offers copy-column-comment right below copy-column-name only when the column has a comment", () => {
+    expect(columnMenuItems({}).map((item) => item.label)).not.toContain("copy comment");
+
+    const labels = columnMenuItems({ canCopyComment: true }).map((item) => item.label);
+    expect(labels.indexOf("copy comment")).toBe(labels.indexOf("copy name") + 1);
+  });
 
   it("offers hide-this-column on a header and hides the recovery entry until a column is hidden", () => {
     const labels = columnMenuItems({}).map((item) => item.label);
@@ -296,13 +332,33 @@ describe("dataGridContextMenu", () => {
     expect(clear).toHaveBeenCalledTimes(1);
   });
 
+  it("lists the custom filter entry after the value comparison entries", () => {
+    const apply = vi.fn();
+    const applyCustom = vi.fn();
+    const submenu = createDataGridFilterSubmenu({
+      label: "filter",
+      icon,
+      labels: { equals: "equals", notEquals: "not equals", like: "like", notLike: "not like", lessThan: "less", greaterThan: "greater", custom: "custom", isNull: "null", isNotNull: "not null", clear: "clear" },
+      apply,
+      applyCustom,
+      clear: vi.fn(),
+    });
+
+    expect(submenu.children?.map((item) => item.label)).toEqual(["equals", "not equals", "like", "not like", "less", "greater", "custom", "", "null", "not null", "", "clear"]);
+
+    submenu.children?.[6]?.action?.();
+    expect(applyCustom).toHaveBeenCalledTimes(1);
+    expect(apply).not.toHaveBeenCalled();
+  });
+
   it("includes highlight submenu in header and context column items", () => {
     const action = vi.fn();
     const filter = createDataGridFilterSubmenu({
       label: "filter",
       icon,
-      labels: { equals: "equals", notEquals: "not equals", like: "like", notLike: "not like", lessThan: "less", greaterThan: "greater", isNull: "null", isNotNull: "not null", clear: "clear" },
+      labels: { equals: "equals", notEquals: "not equals", like: "like", notLike: "not like", lessThan: "less", greaterThan: "greater", custom: "custom", isNull: "null", isNotNull: "not null", clear: "clear" },
       apply: action,
+      applyCustom: action,
       clear: action,
     });
     const highlightSubmenu = createDataGridHighlightSubmenu({
@@ -323,6 +379,7 @@ describe("dataGridContextMenu", () => {
       sortMode: "database",
       labels: {
         copyName: "copy name",
+        copyComment: "copy comment",
         copyNames: "copy names",
         details: "details",
         copyAlterSql: "alter",
@@ -355,6 +412,7 @@ describe("dataGridContextMenu", () => {
       sortMode: "database",
       labels: {
         copyName: "copy name",
+        copyComment: "copy comment",
         copyNames: "copy names",
         details: "details",
         copyAlterSql: "alter",

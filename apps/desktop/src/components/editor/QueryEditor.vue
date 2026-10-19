@@ -11,6 +11,7 @@
 // (delivery is same-tick), never a pending undelivered one.
 let lastHandledFormatRequestId = 0;
 let lastHandledCompressRequestId = 0;
+let lastHandledKeywordCaseRequestId = 0;
 let vimMappingsApplied = false;
 let vimClipboardConfigured = false;
 </script>
@@ -70,6 +71,7 @@ import { executableStatementRangeAtCursor, executableStatementRangeCacheForDoc, 
 import { looksLikeDmlStatement } from "@/lib/sql/dmlChangePreview";
 
 import { canFormatSqlForDatabaseType, formatSqlText, compressSqlText } from "@/lib/sql/sqlFormatter";
+import { applySqlKeywordCase, loadSqlKeywordSpans } from "@/lib/sql/sqlKeywordCase";
 import { detectAndFormatStructured } from "@/lib/sql/autoFormat";
 import { restoreSqlFromSourcePaste } from "@/lib/sql/sqlSourcePaste";
 import { enabledSqlParameterSyntaxes, resolveSqlVariableSyntaxToggles } from "@/lib/sql/sqlVariableSyntax";
@@ -114,6 +116,7 @@ import { matchesShortcut } from "@/lib/editor/keyboardShortcuts";
 import { trimmedSelectionLayer } from "@/lib/editor/codemirrorTrimmedSelectionLayer";
 import { editorClipboardLineEndingsExtension } from "@/lib/editor/editorClipboardLineEndings";
 import { applyVimConfig, isVimMappingCommand, loadVimConfig } from "@/lib/editor/vimConfig";
+import { createVimImeGuard } from "@/lib/editor/vimImeGuard";
 import { configureVimSystemClipboard } from "@/lib/editor/vimSystemClipboard";
 
 import { selectionMatchOccurrences } from "@/lib/editor/codemirrorSelectionMatches";
@@ -134,8 +137,9 @@ import { selectLineEnds } from "@/lib/editor/selectLineEnds";
 import { scrollEditorLine } from "@/lib/editor/scrollEditorLine";
 import { createQueryEditorStringMouseSelection } from "@/lib/editor/queryEditorStringMouseSelection";
 import { createQueryEditorCompletionShortcutBindings } from "@/lib/editor/queryEditorCompletionShortcut";
+import { handleQueryEditorCompletionNavigation } from "@/lib/editor/queryEditorCompletionNavigation";
 import { createQueryEditorSelectionCaseShortcutBindings } from "@/lib/editor/queryEditorSelectionCaseShortcut";
-import { createQueryEditorExecutionShortcutBindings, createQueryEditorPostCompositionKeyGuard } from "@/lib/editor/queryEditorExecutionShortcut";
+import { createQueryEditorExecutionShortcutBindings, createQueryEditorExecutionShortcutHandler, createQueryEditorPostCompositionKeyGuard } from "@/lib/editor/queryEditorExecutionShortcut";
 import { supportsQueryEditorBlockComments, supportsSqlInListPaste } from "@/lib/database/databaseFeatureSupport";
 import { queryContextObjectRoute, queryTableCandidateAtSqlPosition, resolveQueryContextCandidateDatabase, resolveQueryContextObjectTarget, type QueryContextObjectAction } from "@/lib/sql/queryCursorTableTarget";
 import * as api from "@/lib/backend/api";
@@ -1308,8 +1312,16 @@ function runKeymapExtension(codeMirrorKeymap: (typeof import("@codemirror/view")
         shortcuts.executeSql,
         () => requestExecute({ bypassPicker: true }),
         (currentView) => shouldBlockExecutionShortcut(undefined, currentView),
+        () => !props.isExecuting,
       );
-  const executeInNewResultTabBindings = props.hideExecutionControls ? [] : createQueryEditorExecutionShortcutBindings(shortcuts.executeSqlInNewResultTab, requestExecuteInNewResultTab, (currentView) => shouldBlockExecutionShortcut(undefined, currentView));
+  const executeInNewResultTabBindings = props.hideExecutionControls
+    ? []
+    : createQueryEditorExecutionShortcutBindings(
+        shortcuts.executeSqlInNewResultTab,
+        requestExecuteInNewResultTab,
+        (currentView) => shouldBlockExecutionShortcut(undefined, currentView),
+        () => !props.isExecuting,
+      );
   const explainBindings = props.enableExplainShortcut
     ? createQueryEditorExecutionShortcutBindings(
         shortcuts.explainSql,
@@ -1326,6 +1338,11 @@ function runKeymapExtension(codeMirrorKeymap: (typeof import("@codemirror/view")
     shortcut: shortcuts.replace,
     openReplace,
     isReadOnly: () => !!props.readOnly,
+  });
+  const executionShortcutHandler = createQueryEditorExecutionShortcutHandler({
+    getShortcuts: () => shortcuts,
+    isExecuting: () => !!props.isExecuting,
+    enableExplainShortcut: () => !!props.enableExplainShortcut,
   });
   const sqlShortcutActions = enabledSqlShortcutActions(settingsStore.editorSettings.sqlShortcuts);
   const sqlShortcutKeymapBindings = uniqueSqlShortcutBindings(sqlShortcutActions).filter((shortcut) => !isCharacterProducingShortcut(shortcut));
@@ -1351,6 +1368,7 @@ function runKeymapExtension(codeMirrorKeymap: (typeof import("@codemirror/view")
     () => props.databaseType,
   );
   const combinedDomKeydownHandler = (event: KeyboardEvent, view: EditorViewType) => {
+    if (executionShortcutHandler(event)) return true;
     if (replaceShortcutHandler(event)) return true;
     return sqlShortcutDomHandler(event, view);
   };
@@ -1534,6 +1552,7 @@ function vimModeExtension(enabled = settingsStore.editorSettings.vimModeEnabled)
       },
     ]),
     vimExtension,
+    createVimImeGuard(codeMirrorRuntime.editorViewModule, codeMirrorRuntime.codeMirrorGetVimCm),
   ]);
 }
 
@@ -1783,6 +1802,50 @@ function compressCurrentSql() {
   currentView.dispatch({
     changes: { from, to, insert: compressed },
     selection: compressesSelection ? { anchor: from, head: from + compressed.length } : { anchor: from + compressed.length },
+  });
+}
+
+/**
+ * Toolbar `a`/`A`: re-case only the keywords of the selection, or of the whole
+ * document when there is none (issue #11828).
+ *
+ * The toolbar flips `keywordCase` at the same time, so this must agree with
+ * what a later 格式化 would produce for keywords — hence the keyword spans come
+ * from sql-formatter's own lexer ({@link loadSqlKeywordSpans}) rather than a
+ * word list. When the input cannot be classified the document is left as-is:
+ * `convertSqlSelectionCase` remains the explicit "convert everything" command
+ * in the context menu.
+ */
+async function convertCurrentSqlKeywordCase(mode: "upper" | "lower") {
+  if (props.readOnly) return;
+  // Mongo/Elasticsearch/Redis documents are not SQL. Their text can still look
+  // enough like a statement for the lexer to accept it — an ES request line
+  // `GET /_search` lexes as `GET` + path — so gate on the tab's real language
+  // rather than on whether tokenizing happens to succeed.
+  if (queryEditorSelectionLanguage() !== "sql") return;
+  const currentView = view.value;
+  if (!currentView) return;
+
+  const originalState = currentView.state;
+  const selection = originalState.selection.main;
+  const convertsSelection = !selection.empty;
+  const from = convertsSelection ? selection.from : 0;
+  const to = convertsSelection ? selection.to : originalState.doc.length;
+  const source = originalState.sliceDoc(from, to);
+  if (!source.trim()) return;
+
+  const formatDialect = props.formatDialect ?? props.dialect ?? "generic";
+  const spans = await loadSqlKeywordSpans(source, formatDialect);
+  // Edit races the await: the user may have typed, or switched tabs, since the
+  // request arrived. Re-check everything before dispatching.
+  if (!spans || currentView !== view.value || currentView.state !== originalState || originalState.sliceDoc(from, to) !== source) return;
+
+  const converted = applySqlKeywordCase(source, { from: 0, to: source.length }, mode, spans);
+  if (converted === source) return;
+
+  currentView.dispatch({
+    changes: { from, to, insert: converted },
+    selection: convertsSelection ? { anchor: from, head: from + converted.length } : { anchor: from + converted.length },
   });
 }
 
@@ -2109,6 +2172,11 @@ const codeMirrorLifecycle = useQueryEditorCodeMirror({
           EditorView.domEventHandlers({
             keydown(event, currentView) {
               const shortcuts = normalizeShortcutSettings(settingsStore.editorSettings.shortcuts);
+              // The configured Quick Open shortcut (Ctrl-P on Windows/Linux)
+              // must keep working even while a completion list is open; yield
+              // before completion navigation can consume and preventDefault it.
+              if (matchesShortcut(event, shortcuts.quickOpen)) return false;
+              if (handleQueryEditorCompletionNavigation(currentView, event, initializedRuntime.codeMirrorMoveCompletionSelection)) return true;
               if (matchesShortcut(event, shortcuts.selectLineEnds)) {
                 event.preventDefault();
                 return selectLineEnds(currentView);
@@ -2414,6 +2482,19 @@ watch(
       lastHandledCompressRequestId = val;
       compressCurrentSql();
     }
+  },
+);
+
+watch(
+  () => props.keywordCaseRequestId,
+  (val) => {
+    if (!val || val <= lastHandledKeywordCaseRequestId) return;
+    lastHandledKeywordCaseRequestId = val;
+    // The direction travels with the request: the id alone says "a click
+    // happened", but the mode is what the toggle switched to, and reading it
+    // back from settings could race a second click.
+    const mode = props.keywordCaseRequestMode;
+    if (mode) void convertCurrentSqlKeywordCase(mode);
   },
 );
 
@@ -2835,6 +2916,8 @@ function unfoldAll(): boolean {
 }
 
 function shouldBlockExecutionShortcut(event?: KeyboardEvent, currentView: EditorViewType | null = view.value): boolean {
+  if (props.isExecuting) return true;
+  if (event?.repeat) return true;
   return (currentView ? isEditorComposing(currentView) : false) || (event ? postCompositionKeyGuard.blocks(event) : false);
 }
 

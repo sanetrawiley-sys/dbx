@@ -2492,6 +2492,62 @@ final class DbxJdbcPluginTest {
     }
 
     @Test
+    void listSchemasFallsBackWhenInformixStyleGetSchemasOverloadThrowsSqlException() throws Exception {
+        // #12213: IfxDatabaseMetaData.getSchemas(String, String) rejects the two-arg overload
+        // with a plain SQLException("不支持方法 ...") rather than AbstractMethodError.
+        String url = "jdbc:gbasedbt-sqli://gbase8s-mock.example.test:9088/sysmaster:GBASEDBTSERVER=gbase8s";
+        List<String> calls = new ArrayList<>();
+        DatabaseMetaData metadata = (DatabaseMetaData) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { DatabaseMetaData.class },
+            (proxy, method, args) -> {
+                if ("getSchemas".equals(method.getName())) {
+                    if (args != null && args.length == 2) {
+                        calls.add("getSchemas(" + args[0] + ", " + args[1] + ")");
+                        throw new SQLException("不支持方法 : IfxDatabaseMetaData.getSchemas(String, String)");
+                    }
+                    calls.add("getSchemas()");
+                    return rowsResultSet(
+                        new String[] { "TABLE_SCHEM" },
+                        new Object[][] { { "informix" }, { "appuser" } }
+                    );
+                }
+                return defaultValue(method.getReturnType());
+            }
+        );
+        Connection jdbcConnection = (Connection) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Connection.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "getMetaData" -> metadata;
+                case "getAutoCommit" -> true;
+                case "isClosed" -> false;
+                case "getSchema" -> "informix";
+                default -> defaultValue(method.getReturnType());
+            }
+        );
+        Driver driver = testDriver(url, jdbcConnection);
+        String connection = """
+            { "connection_string": "%s" }
+            """.formatted(url);
+        DriverManager.registerDriver(driver);
+        try {
+            JsonNode response = request("listSchemas", """
+                {
+                  "connection": %s,
+                  "database": "sysmaster"
+                }
+                """.formatted(connection));
+
+            assertFalse(response.has("error"), response.toString());
+            assertEquals(MAPPER.readTree("[\"informix\", \"appuser\"]"), response.path("result"));
+            assertEquals(List.of("getSchemas(sysmaster, null)", "getSchemas()"), calls);
+        } finally {
+            closeAndDeregister(connection, driver);
+        }
+    }
+
+    @Test
     void connectUsesRegisteredDriverWhenOtherDriversThrowUnsupportedOperationException() throws Exception {
         String url = "jdbc:hive2://hive2-connect-test:10000/default";
         String driverClass = Hive2ConnectGoodDriver.class.getName();
@@ -6471,5 +6527,28 @@ final class DbxJdbcPluginTest {
             "Object source is not supported by this JDBC driver",
             response.path("error").path("message").asText()
         );
+    }
+
+    @Test
+    void oracleStatementTrimKeepsThePlSqlUnitTerminator() {
+        List<String> units = List.of(
+            "DECLARE\n  l NUMBER;\nBEGIN\n  l := 1;\nEND;",
+            "CREATE OR REPLACE EDITIONABLE FUNCTION \"APP\".\"F\" (p VARCHAR2) RETURN VARCHAR2 IS\n"
+                + "  l VARCHAR2(200);\nBEGIN\n  RETURN l;\nEND;",
+            "CREATE OR REPLACE PROCEDURE p AS\nBEGIN\n  NULL;\nEND;",
+            "CREATE OR REPLACE PACKAGE BODY pkg AS\n  FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\nEND pkg;",
+            "-- leading comment\nBEGIN\n  NULL;\nEND;"
+        );
+        for (String unit : units) {
+            assertEquals(unit, DbxJdbcPlugin.trimStatementSql(unit, true));
+            assertEquals(unit, DbxJdbcPlugin.trimStatementSql(unit + "\n/", true));
+        }
+    }
+
+    @Test
+    void oracleStatementTrimStillDropsThePlainSqlSemicolon() {
+        assertEquals("SELECT 1 FROM DUAL", DbxJdbcPlugin.trimStatementSql("SELECT 1 FROM DUAL;", true));
+        assertEquals("BEGIN\n  NULL;\nEND IF", DbxJdbcPlugin.trimStatementSql("BEGIN\n  NULL;\nEND IF;", true));
+        assertEquals("BEGIN\n  NULL;\nEND", DbxJdbcPlugin.trimStatementSql("BEGIN\n  NULL;\nEND;", false));
     }
 }

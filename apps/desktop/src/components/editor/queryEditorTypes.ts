@@ -20,6 +20,9 @@ export interface QueryEditorProps {
   formatDialect?: SqlFormatDialect;
   formatRequestId?: number;
   compressRequestId?: number;
+  /** Toolbar `a`/`A`: convert keywords in place, matching `keywordCaseRequestMode`. */
+  keywordCaseRequestId?: number;
+  keywordCaseRequestMode?: "upper" | "lower";
   executionError?: string;
   executionErrorSql?: string;
   executionErrorResult?: QueryResult;
@@ -33,6 +36,7 @@ export interface QueryEditorProps {
   hideExecutionControls?: boolean;
   enableExplainShortcut?: boolean;
   canExplain?: boolean;
+  isExecuting?: boolean;
   initialViewport?: { scrollTop: number; scrollLeft: number };
   initialSelection?: { anchor: number; head: number };
   revealRequest?: { id: number; line: number; column?: number };

@@ -4,7 +4,8 @@ import { createApp, defineComponent, h, markRaw, nextTick, shallowRef, type App,
 import { createPinia, setActivePinia } from "pinia";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
-import type { QueryResult } from "@/types/database";
+import type { DatabaseType, QueryResult } from "@/types/database";
+import type { DataGridTableMeta } from "@/lib/dataGrid/dataGridSql";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 const mocks = vi.hoisted(() => ({
@@ -137,7 +138,7 @@ function pasteGridCell(host: HTMLElement, value: string) {
   gridRoot.dispatchEvent(paste);
 }
 
-function mountGrid(initialResult = largeValueResult(), onReload?: () => void) {
+function mountGrid(initialResult = largeValueResult(), onReload?: () => void, databaseType: DatabaseType = "mysql", tableMeta?: DataGridTableMeta) {
   const result = shallowRef(markRaw(initialResult));
   const onExecuteSql = vi.fn().mockResolvedValue(undefined);
   const pinia = createPinia();
@@ -157,12 +158,12 @@ function mountGrid(initialResult = largeValueResult(), onReload?: () => void) {
             default: () =>
               h(DataGrid, {
                 result: result.value,
-                databaseType: "mysql",
+                databaseType,
                 connectionId: "connection-1",
                 database: "dbx",
                 context: "table-data",
                 editable: true,
-                tableMeta: {
+                tableMeta: tableMeta ?? {
                   tableName: "events",
                   columns: [
                     { name: "id", data_type: "int" },
@@ -348,6 +349,36 @@ describe("DataGrid context menu target lifecycle", () => {
     expect(document.body.textContent).toContain("Grid Snapshot");
   });
 
+  it("formats Oracle date cells to display format in grid snapshot", async () => {
+    const oracleResult: QueryResult = {
+      columns: ["id", "created_at"],
+      column_types: ["number", "DATE"],
+      rows: [[1, "2026-10-09T10:56:57"]],
+      affected_rows: 0,
+      execution_time_ms: 0,
+    };
+    const oracleTableMeta: DataGridTableMeta = {
+      tableName: "events",
+      columns: [
+        { name: "id", data_type: "number" },
+        { name: "created_at", data_type: "DATE" },
+      ],
+      primaryKeys: ["id"],
+    };
+    const { host } = mountGrid(oracleResult, undefined, "oracle", oracleTableMeta);
+    await settle();
+
+    openContextMenu(rowNumber(host));
+    await settle();
+
+    expect(contextMenuLabels()).toContain("Screenshot selected rows");
+    contextMenuButton("Screenshot selected rows").click();
+    await settle();
+    expect(document.body.textContent).toContain("Grid Snapshot");
+    expect(document.body.textContent).toContain("2026-10-09 10:56:57");
+    expect(document.body.textContent).not.toContain("2026-10-09T10:56:57");
+  });
+
   it.each(["WHERE", "ORDER BY"] as const)("keeps the native context menu for the %s condition editor", async (placeholder) => {
     const { host } = mountGrid(hydratedResult(1, "value"));
     await settle();
@@ -402,31 +433,28 @@ describe("DataGrid context menu target lifecycle", () => {
     expect(contextMenuButton("SQL Select").disabled).toBe(true);
   });
 
-  async function openGridSearchAndType(host: HTMLElement, query: string) {
-    await settle();
-    const gridRoot = host.querySelector<HTMLElement>("[data-grid-root]");
-    if (!gridRoot) throw new Error("Grid root not found");
-    gridRoot.dispatchEvent(new KeyboardEvent("keydown", { key: "f", ctrlKey: true, bubbles: true, cancelable: true }));
-    await settle();
-    const input = host.querySelector<HTMLInputElement>("input[type=search]");
-    if (!input) throw new Error("Search input not found");
-    input.value = query;
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    await settle();
-    // useDataGridSearch 防抖 150ms，等待 deferredSearchText 生效
-    await new Promise((resolve) => setTimeout(resolve, 400));
-  }
-
-  it("marks the search overlay when truncated large values may hide matches (issue #7279)", async () => {
+  it("shows the large table preview notice when values are truncated", async () => {
     const { host } = mountGrid(largeValueResult(1, "preview"));
-    await openGridSearchAndType(host, "prev");
-    expect(host.querySelector("[data-grid-search-truncated-hint]")).toBeTruthy();
+    await settle();
+    expect(host.querySelector("[data-grid-preview-notice]")).toBeTruthy();
   });
 
-  it("does not show the truncation hint for fully loaded values", async () => {
+  it("does not show the large table preview notice for fully loaded values", async () => {
     const { host } = mountGrid(hydratedResult(1, "preview"));
-    await openGridSearchAndType(host, "prev");
-    expect(host.querySelector("[data-grid-search-truncated-hint]")).toBeNull();
+    await settle();
+    expect(host.querySelector("[data-grid-preview-notice]")).toBeNull();
+  });
+
+  it("re-shows the large table preview notice after pagination replaces the result (#12289)", async () => {
+    const { host, replaceResult } = mountGrid(largeValueResult(1, "preview"));
+    await settle();
+    expect(host.querySelector("[data-grid-preview-notice]")).toBeTruthy();
+    host.querySelector<HTMLElement>("[data-grid-preview-notice] button[title]")!.click();
+    await settle();
+    expect(host.querySelector("[data-grid-preview-notice]")).toBeNull();
+    replaceResult(largeValueResult(1, "next-page"));
+    await settle();
+    expect(host.querySelector("[data-grid-preview-notice]")).toBeTruthy();
   });
 
   it("offers toolbar-equivalent refresh in the cell context menu (issue #7273)", async () => {

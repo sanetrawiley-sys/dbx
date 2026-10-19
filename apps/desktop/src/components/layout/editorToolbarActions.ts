@@ -35,8 +35,10 @@ export interface EditorToolbarActions {
   explain(tabId: string): void;
   formatSql(tabId: string): void;
   compressSql(tabId: string): void;
-  toggleSqlKeywordCase(): void;
+  /** Flips the keyword-case preference and re-cases the acting tab's editor to match. */
+  toggleSqlKeywordCase(tabId: string): void;
   saveSql(tabId: string): void;
+  saveAllTabs(tabIds?: string[]): void;
   openSqlFile(): void;
   importResultArchive(): void;
   pasteSqlInCondition(): void;
@@ -87,6 +89,7 @@ export function createNoopEditorToolbarActions(): EditorToolbarActions {
     compressSql: noop,
     toggleSqlKeywordCase: noop,
     saveSql: noop,
+    saveAllTabs: noop,
     openSqlFile: noop,
     importResultArchive: noop,
     pasteSqlInCondition: noop,

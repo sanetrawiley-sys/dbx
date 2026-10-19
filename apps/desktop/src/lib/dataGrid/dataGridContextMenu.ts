@@ -46,8 +46,9 @@ export type DataGridContextMenuIcons = {
 export function createDataGridFilterSubmenu(options: {
   label: string;
   icon: Component;
-  labels: Record<"equals" | "notEquals" | "like" | "notLike" | "lessThan" | "greaterThan" | "isNull" | "isNotNull" | "clear", string>;
+  labels: Record<"equals" | "notEquals" | "like" | "notLike" | "lessThan" | "greaterThan" | "custom" | "isNull" | "isNotNull" | "clear", string>;
   apply: (mode: "equals" | "not-equals" | "like" | "not-like" | "less-than" | "greater-than" | "is-null" | "is-not-null") => void;
+  applyCustom: () => void;
   clear: () => void;
 }): DataGridContextMenuItem {
   const { labels } = options;
@@ -61,6 +62,7 @@ export function createDataGridFilterSubmenu(options: {
       { label: labels.notLike, action: () => options.apply("not-like") },
       { label: labels.lessThan, action: () => options.apply("less-than") },
       { label: labels.greaterThan, action: () => options.apply("greater-than") },
+      { label: labels.custom, action: () => options.applyCustom() },
       { label: "", separator: true },
       { label: labels.isNull, action: () => options.apply("is-null") },
       { label: labels.isNotNull, action: () => options.apply("is-not-null") },
@@ -113,6 +115,8 @@ export function createDataGridColumnContextMenuItems(options: {
   headerColumn: boolean;
   contextColumn: boolean;
   canCopyAlterSql: boolean;
+  /** 当前列（或选中列）解析到了非空注释时才提供「复制列注释」。 */
+  canCopyComment?: boolean;
   canFilter: boolean;
   hasSort: boolean;
   sortMode: "database" | "local";
@@ -128,13 +132,14 @@ export function createDataGridColumnContextMenuItems(options: {
   hiddenColumnCount?: number;
   canHideIdenticalColumns?: boolean;
   labels: Record<
-    "copyName" | "copyNames" | "details" | "copyAlterSql" | "databaseAscending" | "databaseDescending" | "localAscending" | "localDescending" | "clearSort" | "freezeToColumn" | "freezeSelectedColumns" | "unfreezeColumns" | "hideColumn" | "hideSelectedColumns" | "showAllColumnsMenu",
+    "copyName" | "copyComment" | "copyNames" | "details" | "copyAlterSql" | "databaseAscending" | "databaseDescending" | "localAscending" | "localDescending" | "clearSort" | "freezeToColumn" | "freezeSelectedColumns" | "unfreezeColumns" | "hideColumn" | "hideSelectedColumns" | "showAllColumnsMenu",
     string
   > &
     Partial<Record<"freezeCurrentColumn" | "unfreezeCurrentColumn" | "hideIdenticalColumns", string>>;
   icons: Pick<DataGridContextMenuIcons, "copy" | "columnDetails" | "database" | "ascending" | "descending" | "clearSort">;
   actions: {
     copyName: () => void;
+    copyComment: () => void;
     copyNames: () => void;
     details: () => void;
     copyAlterSql: () => void;
@@ -155,6 +160,8 @@ export function createDataGridColumnContextMenuItems(options: {
   const items: DataGridContextMenuItem[] = [];
   if (options.headerColumn) {
     items.push({ label: options.labels.copyName, action: options.actions.copyName, icon: options.icons.copy });
+    // 只有解析到注释时才给出入口：无元数据的查询结果里永远为空，展示反而误导。
+    if (options.canCopyComment) items.push({ label: options.labels.copyComment, action: options.actions.copyComment, icon: options.icons.copy });
     items.push({ label: options.labels.copyNames, action: options.actions.copyNames, icon: options.icons.copy });
     items.push({ label: options.labels.details, action: options.actions.details, icon: options.icons.columnDetails });
     if (options.canCopyAlterSql) items.push({ label: options.labels.copyAlterSql, action: options.actions.copyAlterSql, icon: options.icons.copy });

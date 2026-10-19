@@ -53,12 +53,17 @@ export type ShortcutActionId =
   | "newQuery"
   | "openSettings"
   | "closeTab"
+  | "reopenClosedTab"
   | "closeOtherTabs"
   | "closeAllTabs"
+  | "saveAllTabs"
   | "closeWindow"
   | "focusSearch"
   | "quickOpen"
   | "globalSearch"
+  | "openConnectionPicker"
+  | "openDatabasePicker"
+  | "openSchemaPicker"
   | "toggleAiPanel"
   | "navigateTabHistoryBack"
   | "navigateTabHistoryForward"
@@ -93,6 +98,7 @@ export type ShortcutActionId =
   | "disconnectAllActiveConnections"
   | "openDataInNewTab"
   | "viewTableDdl"
+  | "editSidebarTableStructure"
   | "sendSelectionToAi"
   | "sqlIntentionActions";
 
@@ -487,6 +493,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Mod+W",
   },
   {
+    id: "reopenClosedTab",
+    labelKey: "settings.shortcutReopenClosedTab",
+    scope: "global",
+    defaultShortcut: "Shift+Mod+T",
+  },
+  {
     id: "closeOtherTabs",
     labelKey: "contextMenu.closeOtherTabs",
     scope: "global",
@@ -497,6 +509,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     // registry doesn't have, so this action ships unbound and stays optional.
     id: "closeAllTabs",
     labelKey: "contextMenu.closeAllTabs",
+    scope: "global",
+    defaultShortcut: "",
+  },
+  {
+    id: "saveAllTabs",
+    labelKey: "contextMenu.saveAllTabs",
     scope: "global",
     defaultShortcut: "",
   },
@@ -525,6 +543,24 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutGlobalSearch",
     scope: "global",
     defaultShortcut: "Mod+Alt+F",
+  },
+  {
+    id: "openConnectionPicker",
+    labelKey: "settings.shortcutOpenConnectionPicker",
+    scope: "global",
+    defaultShortcut: "Mod+Alt+C",
+  },
+  {
+    id: "openDatabasePicker",
+    labelKey: "settings.shortcutOpenDatabasePicker",
+    scope: "global",
+    defaultShortcut: "Mod+Alt+D",
+  },
+  {
+    id: "openSchemaPicker",
+    labelKey: "settings.shortcutOpenSchemaPicker",
+    scope: "global",
+    defaultShortcut: "Mod+Alt+S",
   },
   {
     id: "toggleAiPanel",
@@ -730,6 +766,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutViewTableDdl",
     scope: "sidebar",
     defaultShortcut: "Shift+Mod+D",
+  },
+  {
+    id: "editSidebarTableStructure",
+    labelKey: "settings.shortcutEditSidebarTableStructure",
+    scope: "sidebar",
+    defaultShortcut: "F4",
   },
   {
     id: "sendSelectionToAi",

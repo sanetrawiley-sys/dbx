@@ -264,6 +264,18 @@ describe("SQL completion theme", () => {
     });
     expect(rules[".cm-completionIcon"]).toMatchObject({ width: "15px", height: "15px", overflow: "hidden" });
   });
+
+  // #12099: sequence completions were typed "variable" but no icon mask was
+  // defined for that kind, so the menu rendered a blank icon slot.
+  it("defines completion icon masks for sequence and variable kinds", () => {
+    const rules = buildSqlCompletionThemeRules();
+
+    for (const key of [".cm-completionIcon-sequence", ".cm-completionIcon-variable"]) {
+      expect(rules[key]).toMatchObject({
+        "--dbx-completion-icon-mask": expect.stringContaining("data:image/svg+xml"),
+      });
+    }
+  });
 });
 
 describe("SQL builtin highlight tag", () => {
@@ -316,6 +328,24 @@ describe("editor gutters", () => {
       alignItems: "center",
       display: "flex",
       justifyContent: "flex-end",
+    });
+  });
+
+  it("styles the fold gutter and SVG fold markers consistently (#11834)", () => {
+    const rules = buildEditorFontThemeRules();
+
+    expect(rules[".cm-foldGutter"]).toMatchObject({
+      width: "16px",
+    });
+    expect(rules[".cm-foldGutter .cm-gutterElement"]).toMatchObject({
+      alignItems: "center",
+      display: "flex",
+      justifyContent: "center",
+    });
+    expect(rules[".cm-foldMarker-svg"]).toMatchObject({
+      display: "inline-flex",
+      width: "16px",
+      height: "16px",
     });
   });
 });

@@ -39,7 +39,8 @@ pub const DEFAULT_PREVIEW_LIMIT: usize = 50;
 pub const DEFAULT_BATCH_SIZE: usize = 500;
 pub const CREATE_TABLE_INFERENCE_ROWS: usize = 100;
 /// 分隔文本、`.sql` 脚本与 JSON 都已改为流式解析，不再受体积上限约束；
-/// 该上限只保留给仍然需要整份物化的 Excel（xlsx）。
+/// `.xlsx`/`.xlsm` 的预览与导入同样按增量方式读取工作表；
+/// 该上限只保留给仍然需要整份物化的旧版 `.xls`，以及被显式标记为 Excel 的其他文件。
 pub const MAX_NON_STREAMING_IMPORT_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_LEGACY_XLS_IMPORT_BYTES: u64 = 50 * 1024 * 1024;
 const IMPORT_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -74,6 +75,8 @@ const POSTGRES_COPY_MAX_ROWS: usize = 50_000;
 // NVARCHAR staging values. The source JSON batch remains owned by the parser;
 // the bulk path must never add a second, batch-sized string matrix beside it.
 const SQLSERVER_BULK_ROW_MEMORY_BYTES: usize = 16 * 1024 * 1024;
+const SQL_IMPORT_EXPRESSION_KEY: &str = "$dbxSqlImportExpression";
+const SQL_IMPORT_CURRENT_TIMESTAMP: &str = "currentTimestamp";
 
 pub fn table_import_client_session_id(import_id: &str) -> String {
     task_client_session_id("table-import", import_id)
@@ -345,12 +348,17 @@ fn update_existing_primary_key_columns(
     conflict_policy: TableImportConflictPolicy,
     mappings: &[TableImportColumnMapping],
     target_columns: &[crate::db::ColumnInfo],
+    db_type: &DatabaseType,
 ) -> Result<Vec<String>, String> {
     if conflict_policy != TableImportConflictPolicy::UpdateExisting {
         return Ok(Vec::new());
     }
 
-    let primary_key_columns = target_columns.iter().filter(|column| column.is_primary_key).collect::<Vec<_>>();
+    let uses_unique_key_model = matches!(db_type, DatabaseType::Doris | DatabaseType::StarRocks);
+    let primary_key_columns = target_columns
+        .iter()
+        .filter(|column| column.is_primary_key || (uses_unique_key_model && column.is_unique))
+        .collect::<Vec<_>>();
     if primary_key_columns.is_empty() {
         return Err("Update-existing import requires target primary-key metadata".to_string());
     }
@@ -1827,6 +1835,43 @@ fn sql_import_number_value(raw: &str, context: &str) -> Result<serde_json::Value
     Err(format!("{context}: unsupported numeric literal '{raw}'"))
 }
 
+// SQL imports round-trip rows through the preview and prepared-source JSON. Keep
+// allowlisted server-evaluated expressions as a fixed marker so the SQL builder
+// can emit only its own canonical expression, never arbitrary frontend text.
+fn sql_import_current_timestamp_value() -> serde_json::Value {
+    serde_json::json!({ SQL_IMPORT_EXPRESSION_KEY: SQL_IMPORT_CURRENT_TIMESTAMP })
+}
+
+pub(crate) fn sql_import_is_current_timestamp_value(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == 1
+            && object.get(SQL_IMPORT_EXPRESSION_KEY).and_then(serde_json::Value::as_str)
+                == Some(SQL_IMPORT_CURRENT_TIMESTAMP)
+    })
+}
+
+fn sql_import_is_current_timestamp_function(function: &sqlparser::ast::Function) -> bool {
+    let name = function.name.to_string().to_ascii_lowercase();
+    if !matches!(name.as_str(), "now" | "sysdate" | "current_timestamp" | "localtime" | "localtimestamp") {
+        return false;
+    }
+    match &function.args {
+        FunctionArguments::None => true,
+        FunctionArguments::List(list) => {
+            list.args.is_empty() && list.clauses.is_empty() && list.duplicate_treatment.is_none()
+        }
+        _ => false,
+    }
+}
+
+fn sql_import_current_timestamp_sql(db_type: &DatabaseType) -> &'static str {
+    if *db_type == DatabaseType::ClickHouse {
+        "now()"
+    } else {
+        "CURRENT_TIMESTAMP"
+    }
+}
+
 fn sql_import_expr_value(expr: &Expr, context: &str) -> Result<serde_json::Value, String> {
     match expr {
         Expr::Value(value) => match &value.value {
@@ -1869,7 +1914,13 @@ fn sql_import_expr_value(expr: &Expr, context: &str) -> Result<serde_json::Value
         // `DATE '...'`、`TIMESTAMP '...'`、`TIME '...'` 等标准字面量：值就是引号里的字符串，无损导入。
         Expr::TypedString(typed) => sql_import_typed_string(typed, context),
         // 白名单字面量日期函数（TO_DATE/TO_TIMESTAMP/...）：参数全为字符串字面量时按第一个参数导入。
-        Expr::Function(function) => sql_import_literal_temporal_function(function, context),
+        Expr::Function(function) => {
+            if sql_import_is_current_timestamp_function(function) {
+                Ok(sql_import_current_timestamp_value())
+            } else {
+                sql_import_literal_temporal_function(function, context)
+            }
+        }
         _ => Err(sql_import_unsupported_expression(context)),
     }
 }
@@ -3712,6 +3763,16 @@ fn is_legacy_xls_path(path: &str) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("xls"))
 }
 
+/// `.xlsx`/`.xlsm` 由增量解析器处理：预览只读取需要的工作表行，导入按有界批次流式产出，
+/// 内存占用不随工作簿体积增长。calamine 的旧版 `.xls` 读取器会一次读入整个工作簿，
+/// 因此只有这两个扩展名可以跳过非流式体积上限。
+fn excel_path_streams_incrementally(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("xlsx") || extension.eq_ignore_ascii_case("xlsm"))
+}
+
 fn xlsx_style_selection_columns<T, Label>(range: &Range<T>, row_range: ImportRowRange, cell_label: Label) -> Vec<String>
 where
     T: CellType,
@@ -3762,9 +3823,8 @@ fn parse_xlsx_file_with_options_and_text_columns(
     } else {
         sheet_names.first().cloned().ok_or_else(|| "Workbook has no sheets".to_string())?
     };
-    let extension = Path::new(path).extension().and_then(|extension| extension.to_str()).unwrap_or_default();
     let legacy_xls = is_legacy_xls_path(path);
-    if extension.eq_ignore_ascii_case("xlsx") || extension.eq_ignore_ascii_case("xlsm") {
+    if excel_path_streams_incrementally(path) {
         let range = workbook.worksheet_range_ref(&sheet_name).map_err(|e| e.to_string())?;
         let row_range = effective_import_row_range(options)?;
         let style_selection_columns =
@@ -4508,17 +4568,18 @@ pub fn parse_xlsx_file(path: &str, preview_limit: usize) -> Result<ParsedImportF
 }
 
 fn ensure_non_streaming_file_size(path: &str, format: TableImportSourceFormat) -> Result<(), String> {
-    // 分隔文本、SQL 脚本与 JSON 都是流式解析，内存占用不随文件体积增长，没有体积上限。
+    // 分隔文本、SQL 脚本、JSON、Parquet 与 `.xlsx`/`.xlsm` 都是流式解析，
+    // 内存占用不随文件体积增长，没有体积上限。
     if format.is_delimited()
         || format == TableImportSourceFormat::Sql
         || format == TableImportSourceFormat::Json
         || format == TableImportSourceFormat::Parquet
+        || (format == TableImportSourceFormat::Excel && excel_path_streams_incrementally(path))
     {
         return Ok(());
     }
     let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
-    let extension = Path::new(path).extension().and_then(|extension| extension.to_str()).unwrap_or_default();
-    let max_bytes = if format == TableImportSourceFormat::Excel && extension.eq_ignore_ascii_case("xls") {
+    let max_bytes = if format == TableImportSourceFormat::Excel && is_legacy_xls_path(path) {
         MAX_LEGACY_XLS_IMPORT_BYTES
     } else {
         MAX_NON_STREAMING_IMPORT_BYTES
@@ -4604,10 +4665,7 @@ async fn parse_import_preview_file_with_options(
     }
 
     ensure_non_streaming_file_size(path, format)?;
-    let extension = Path::new(path).extension().and_then(|extension| extension.to_str()).unwrap_or_default();
-    if format == TableImportSourceFormat::Excel
-        && (extension.eq_ignore_ascii_case("xlsx") || extension.eq_ignore_ascii_case("xlsm"))
-    {
+    if format == TableImportSourceFormat::Excel && excel_path_streams_incrementally(path) {
         let path = path.to_string();
         let options = options.clone();
         let (parsed, sheets) =
@@ -4868,6 +4926,10 @@ fn import_value_rows_sql(
             }
             let source_value = row.get(*source_index).unwrap_or(&serde_json::Value::Null);
             let data_type = plan.column_types.get(target_index).and_then(|data_type| data_type.as_deref());
+            if sql_import_is_current_timestamp_value(source_value) {
+                values.push_str(sql_import_current_timestamp_sql(db_type));
+                continue;
+            }
             let normalized =
                 normalize_import_value_cow(source_value, data_type, db_type, kingbase_oracle_mode, date_time_format);
             values.push_str(&escape_value_typed(normalized.as_ref(), db_type, data_type));
@@ -5061,7 +5123,7 @@ fn normalize_import_value_cow<'a>(
     // Strip validated thousands separators before integer canonicalization so "1,234.00"
     // still collapses to a plain integer literal for integer targets.
     let thousands_canonical =
-        normalized.as_str().and_then(|value| normalize_thousands_numeric_literal(value, db_type, data_type));
+        normalized.as_str().and_then(|value| normalize_thousands_numeric_literal(value, data_type));
     if let Some(integer_text) = thousands_canonical
         .as_deref()
         .or_else(|| normalized.as_str())
@@ -5241,6 +5303,9 @@ fn infer_string_type(value: &str) -> ImportInferredType {
 }
 
 fn infer_value_type(value: &serde_json::Value) -> Option<ImportInferredType> {
+    if sql_import_is_current_timestamp_value(value) {
+        return Some(ImportInferredType::Timestamp);
+    }
     match value {
         serde_json::Value::Null => None,
         serde_json::Value::Bool(_) => Some(ImportInferredType::Boolean),
@@ -7337,7 +7402,7 @@ where
         Err(_) => Vec::new(),
     };
     let primary_key_columns =
-        match update_existing_primary_key_columns(conflict_policy, &request.mappings, &target_columns) {
+        match update_existing_primary_key_columns(conflict_policy, &request.mappings, &target_columns, db_type) {
             Ok(columns) => columns,
             Err(error) => {
                 return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
@@ -7703,11 +7768,7 @@ where
         return Ok(import_summary(&request.import_id, rows_imported, rows_imported, started_at));
     }
 
-    let extension =
-        Path::new(&request.file_path).extension().and_then(|extension| extension.to_str()).unwrap_or_default();
-    if source_format == TableImportSourceFormat::Excel
-        && (extension.eq_ignore_ascii_case("xlsx") || extension.eq_ignore_ascii_case("xlsm"))
-    {
+    if source_format == TableImportSourceFormat::Excel && excel_path_streams_incrementally(&request.file_path) {
         let total_bytes = tokio::fs::metadata(&request.file_path).await.map(|metadata| metadata.len()).unwrap_or(0);
         progress_callback(import_progress_with_details(
             &request.import_id,
@@ -8597,18 +8658,58 @@ mod tests {
             crate::db::ColumnInfo { name: "name".to_string(), ..Default::default() },
         ];
 
-        let missing_key =
-            update_existing_primary_key_columns(TableImportConflictPolicy::UpdateExisting, &mappings, &target_columns)
-                .unwrap_err();
+        let missing_key = update_existing_primary_key_columns(
+            TableImportConflictPolicy::UpdateExisting,
+            &mappings,
+            &target_columns,
+            &DatabaseType::Postgres,
+        )
+        .unwrap_err();
         assert!(missing_key.contains("id"));
 
         let missing_metadata = update_existing_primary_key_columns(
             TableImportConflictPolicy::UpdateExisting,
             &mappings,
             &[crate::db::ColumnInfo { name: "name".to_string(), ..Default::default() }],
+            &DatabaseType::Postgres,
         )
         .unwrap_err();
         assert!(missing_metadata.contains("primary-key metadata"));
+
+        let doris_unique_columns = vec![
+            crate::db::ColumnInfo {
+                name: "id".to_string(),
+                is_unique: true,
+                is_primary_key: false,
+                ..Default::default()
+            },
+            crate::db::ColumnInfo { name: "name".to_string(), ..Default::default() },
+        ];
+        // The Doris unique-key column still has to be mapped, like any key column —
+        // only the key discovery itself differs (is_unique instead of is_primary_key).
+        let mut doris_mappings = mappings.clone();
+        doris_mappings.push(TableImportColumnMapping {
+            source_column: "uid".to_string(),
+            target_column: "id".to_string(),
+            target_data_type: None,
+        });
+        let doris_keys = update_existing_primary_key_columns(
+            TableImportConflictPolicy::UpdateExisting,
+            &doris_mappings,
+            &doris_unique_columns,
+            &DatabaseType::Doris,
+        )
+        .expect("Doris unique key column should qualify as an update-existing key");
+        assert_eq!(doris_keys, vec!["id"]);
+
+        let mysql_without_pk = update_existing_primary_key_columns(
+            TableImportConflictPolicy::UpdateExisting,
+            &mappings,
+            &doris_unique_columns,
+            &DatabaseType::Mysql,
+        )
+        .unwrap_err();
+        assert!(mysql_without_pk.contains("primary-key metadata"));
 
         let unsupported =
             validate_update_existing_target(TableImportConflictPolicy::UpdateExisting, &DatabaseType::Oracle, false)
@@ -10505,6 +10606,54 @@ mod tests {
     }
 
     #[test]
+    fn sql_import_preserves_current_timestamp_functions() {
+        let options = sql_import_options(DatabaseType::Mysql);
+        let script = b"INSERT INTO sai_user (id, created_at, updated_at) VALUES (1, NOW(), SYSDATE());";
+        let parsed = parse_sql_bytes_with_options(script, &options, 10).unwrap();
+
+        assert_eq!(
+            parsed.rows[0],
+            vec![
+                serde_json::json!(1),
+                serde_json::json!({ "$dbxSqlImportExpression": "currentTimestamp" }),
+                serde_json::json!({ "$dbxSqlImportExpression": "currentTimestamp" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn sql_import_emits_current_timestamp_without_quoting_the_marker() {
+        let options = sql_import_options(DatabaseType::Mysql);
+        let parsed =
+            parse_sql_bytes_with_options(b"INSERT INTO sai_user (id, created_at) VALUES (1, NOW());", &options, 10)
+                .unwrap();
+        let mappings = parsed
+            .columns
+            .iter()
+            .map(|column| TableImportColumnMapping {
+                source_column: column.clone(),
+                target_column: column.clone(),
+                target_data_type: None,
+            })
+            .collect::<Vec<_>>();
+        let target_types =
+            vec![("id".to_string(), "bigint".to_string()), ("created_at".to_string(), "datetime".to_string())];
+
+        let batches =
+            build_import_insert_batches(&parsed, &mappings, &target_types, "sai_user", "", &DatabaseType::Mysql, 500)
+                .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let generated_sql = batches[0].sql.replace('\n', " ");
+        assert!(
+            generated_sql.contains("VALUES (1, CURRENT_TIMESTAMP)"),
+            "generated SQL should preserve the server-side time expression: {}",
+            batches[0].sql
+        );
+        assert!(!batches[0].sql.contains(SQL_IMPORT_EXPRESSION_KEY));
+    }
+
+    #[test]
     fn sql_import_rejects_replace() {
         let error = parse_sql_bytes(b"REPLACE INTO users (id) VALUES (1);", 10).unwrap_err();
         assert!(error.contains("REPLACE"));
@@ -10512,7 +10661,7 @@ mod tests {
 
     #[test]
     fn sql_import_rejects_expressions() {
-        let error = parse_sql_bytes(b"INSERT INTO t (a) VALUES (NOW());", 10).unwrap_err();
+        let error = parse_sql_bytes(b"INSERT INTO t (a) VALUES (UUID());", 10).unwrap_err();
         assert!(error.contains("not supported"));
     }
 
@@ -10557,9 +10706,9 @@ mod tests {
 
     #[test]
     fn sql_import_rejects_unlisted_function_still() {
-        // 非白名单函数（如 NOW()）仍按表达式拒绝。
+        // 非白名单函数（如 RAND()）仍按表达式拒绝。
         let options = sql_import_options(DatabaseType::Mysql);
-        let error = parse_sql_bytes_with_options(b"INSERT INTO t (a) VALUES (NOW());", &options, 10).unwrap_err();
+        let error = parse_sql_bytes_with_options(b"INSERT INTO t (a) VALUES (RAND());", &options, 10).unwrap_err();
         assert!(error.contains("not supported"));
     }
 
@@ -10782,9 +10931,9 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// `.sql` 与 JSON 都已经改成流式解析，不应再受 100 MB 非流式上限约束。
+    /// `.sql`、JSON 与 `.xlsx`/`.xlsm` 都已经改成流式解析，不应再受 100 MB 非流式上限约束。
     #[test]
-    fn sql_and_json_imports_are_not_size_capped() {
+    fn streaming_imports_are_not_size_capped() {
         let path = std::env::temp_dir().join(format!("dbx-table-import-limit-{}.sql", uuid::Uuid::new_v4()));
         let file = File::create(&path).unwrap();
         file.set_len(MAX_NON_STREAMING_IMPORT_BYTES + 1).unwrap();
@@ -10796,11 +10945,32 @@ mod tests {
         let xlsx_file = File::create(&xlsx_path).unwrap();
         xlsx_file.set_len(MAX_NON_STREAMING_IMPORT_BYTES + 1).unwrap();
         drop(xlsx_file);
-        let error =
-            ensure_non_streaming_file_size(&xlsx_path.to_string_lossy(), TableImportSourceFormat::Excel).unwrap_err();
-        assert!(error.contains("File too large for excel import"), "{error}");
+        ensure_non_streaming_file_size(&xlsx_path.to_string_lossy(), TableImportSourceFormat::Excel).unwrap();
+        ensure_non_streaming_file_size(&xlsx_path.to_string_lossy(), TableImportSourceFormat::Json).unwrap();
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(xlsx_path);
+    }
+
+    /// `.xlsm` 与 `.xlsx` 走同一条流式解析路径，因此同样不受非流式上限约束；
+    /// 其他被显式标记为 Excel 的路径仍然由 calamine 整份读入，必须保留上限。
+    #[test]
+    fn macro_enabled_workbooks_stream_but_materialized_excel_paths_stay_capped() {
+        let xlsm_path = std::env::temp_dir().join(format!("dbx-table-import-limit-{}.xlsm", uuid::Uuid::new_v4()));
+        let xlsm_file = File::create(&xlsm_path).unwrap();
+        xlsm_file.set_len(MAX_NON_STREAMING_IMPORT_BYTES + 1).unwrap();
+        drop(xlsm_file);
+        ensure_non_streaming_file_size(&xlsm_path.to_string_lossy(), TableImportSourceFormat::Excel).unwrap();
+
+        let mislabeled_path = std::env::temp_dir().join(format!("dbx-table-import-limit-{}.txt", uuid::Uuid::new_v4()));
+        let mislabeled_file = File::create(&mislabeled_path).unwrap();
+        mislabeled_file.set_len(MAX_NON_STREAMING_IMPORT_BYTES + 1).unwrap();
+        drop(mislabeled_file);
+        let error = ensure_non_streaming_file_size(&mislabeled_path.to_string_lossy(), TableImportSourceFormat::Excel)
+            .unwrap_err();
+        assert!(error.contains("File too large for excel import"), "{error}");
+
+        let _ = std::fs::remove_file(xlsm_path);
+        let _ = std::fs::remove_file(mislabeled_path);
     }
 
     /// 流式 `.sql` 在读完整份脚本之前，`total_rows` 只是已解析的部分行数。
@@ -11769,6 +11939,14 @@ mod tests {
         rows: Vec<Vec<serde_json::Value>>,
         target_types: &[(&str, &str)],
     ) -> Vec<ImportSqlBatch> {
+        import_batches_for(rows, target_types, &DatabaseType::Postgres)
+    }
+
+    fn import_batches_for(
+        rows: Vec<Vec<serde_json::Value>>,
+        target_types: &[(&str, &str)],
+        db_type: &DatabaseType,
+    ) -> Vec<ImportSqlBatch> {
         let data = ParsedImportFile {
             columns: target_types.iter().map(|(column, _)| column.to_string()).collect(),
             rows,
@@ -11787,16 +11965,7 @@ mod tests {
             .iter()
             .map(|(column, data_type)| (column.to_string(), data_type.to_string()))
             .collect::<Vec<_>>();
-        build_import_insert_batches(
-            &data,
-            &mappings,
-            &target_column_types,
-            "issue_6491",
-            "",
-            &DatabaseType::Postgres,
-            500,
-        )
-        .unwrap()
+        build_import_insert_batches(&data, &mappings, &target_column_types, "issue_6491", "", db_type, 500).unwrap()
     }
 
     #[test]
@@ -11819,6 +11988,59 @@ mod tests {
                 format!("INSERT INTO \"issue_6491\" (\"amount\") VALUES\n({expected})"),
                 "{value} -> {data_type}"
             );
+        }
+    }
+
+    #[test]
+    fn mysql_import_converts_valid_thousands_separators_for_numeric_targets() {
+        // #11993: MySQL/TiDB imports previously kept "123,456" as text, so a
+        // numeric target column rejected the row.
+        for (value, data_type, expected) in [
+            ("123,456", "bigint", "123456"),
+            ("1,234.56", "decimal(18,2)", "1234.56"),
+            ("-1,234.56", "decimal(18,2)", "-1234.56"),
+            ("1,234,567,890", "bigint", "1234567890"),
+            ("1,234.5", "double", "1234.5"),
+        ] {
+            let batches = import_batches_for(
+                vec![vec![serde_json::json!(value)]],
+                &[("amount", data_type)],
+                &DatabaseType::Mysql,
+            );
+            assert_eq!(
+                batches[0].sql,
+                format!("INSERT INTO `issue_6491` (`amount`) VALUES\n({expected})"),
+                "{value} -> {data_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_import_preserves_thousands_separators_for_text_targets() {
+        // A text column must keep the literal characters the user wrote.
+        for data_type in ["varchar(64)", "text"] {
+            let batches = import_batches_for(
+                vec![vec![serde_json::json!("123,456")]],
+                &[("amount", data_type)],
+                &DatabaseType::Mysql,
+            );
+            assert_eq!(
+                batches[0].sql,
+                format!("INSERT INTO `issue_6491` (`amount`) VALUES\n('123,456')"),
+                "{data_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_import_keeps_malformed_grouping_untouched() {
+        for value in ["1,23,4", "12,34.56", "1,,234", ",123", "123,", "1,234,", "1,234.5.6", "abc,123", "1,234abc"] {
+            let batches = import_batches_for(
+                vec![vec![serde_json::json!(value)]],
+                &[("amount", "decimal(18,2)")],
+                &DatabaseType::Mysql,
+            );
+            assert_eq!(batches[0].sql, format!("INSERT INTO `issue_6491` (`amount`) VALUES\n('{value}')"), "{value}");
         }
     }
 
@@ -11911,6 +12133,45 @@ mod tests {
         .unwrap();
 
         assert_eq!(batches[0].sql, "INSERT INTO \"issue_6491\" (\"amount\") VALUES\n('1234.56'),\n('-1234')");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn excel_text_cell_with_thousands_separator_imports_to_mysql_numeric() {
+        // #11993: the same spreadsheet into a MySQL/TiDB numeric column used to be
+        // inserted as the literal string "123,456".
+        let path = std::env::temp_dir().join(format!("dbx-table-import-11993-{}.xlsx", uuid::Uuid::new_v4()));
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:A3"/>
+  <sheetData>
+    <row r="1"><c r="A1" t="inlineStr"><is><t>amount</t></is></c></row>
+    <row r="2"><c r="A2" t="inlineStr"><is><t>123,456</t></is></c></row>
+    <row r="3"><c r="A3" t="inlineStr"><is><t>1,234.56</t></is></c></row>
+  </sheetData>
+</worksheet>"#;
+        std::fs::write(&path, build_preview_test_xlsx(sheet_xml, None)).unwrap();
+        let options = TableImportParseOptions::default();
+
+        let data = parse_xlsx_file_with_options(&path.to_string_lossy(), &options, 10).unwrap();
+        assert_eq!(data.rows, vec![vec![serde_json::json!("123,456")], vec![serde_json::json!("1,234.56")]]);
+        let mappings = vec![TableImportColumnMapping {
+            source_column: "amount".to_string(),
+            target_column: "amount".to_string(),
+            target_data_type: None,
+        }];
+        let batches = build_import_insert_batches(
+            &data,
+            &mappings,
+            &[("amount".to_string(), "decimal(18,2)".to_string())],
+            "issue_11993",
+            "",
+            &DatabaseType::Mysql,
+            500,
+        )
+        .unwrap();
+
+        assert_eq!(batches[0].sql, "INSERT INTO `issue_11993` (`amount`) VALUES\n(123456),\n(1234.56)");
         let _ = std::fs::remove_file(path);
     }
 
