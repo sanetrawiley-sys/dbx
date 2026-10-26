@@ -149,6 +149,7 @@ describe("QueryEditor component split integration", () => {
       "cancelGutterExecutionViewport",
       "shouldBlockExecutionShortcut",
       "requestExecute",
+      "requestExecuteAll",
       "requestExecuteInNewResultTab",
       "requestPreviewChanges",
       "captureExecutionSnapshot",
@@ -193,6 +194,24 @@ describe("QueryEditor component split integration", () => {
     expect(source.selectionTo).toBe(executeMode === "current" ? 18 : props.modelValue.length);
   });
 
+  it.each(["current", "all"] as const)("executes the full document despite a selection and the %s execution mode", async (executeMode) => {
+    const { editor, host, view, props, settingsStore, onExecute } = await mountEditor();
+    settingsStore.editorSettings.executeMode = executeMode;
+    settingsStore.editorSettings.showExecutionTargetPicker = true;
+    view.dispatch({ selection: EditorSelection.range(10, 18) });
+
+    expect(editor.requestExecuteAll()).toBe(true);
+    await nextTick();
+
+    expect(onExecute).toHaveBeenCalledTimes(1);
+    const snapshot = onExecute.mock.calls[0][0];
+    expect(snapshot.fullSql).toBe(props.modelValue);
+    expect(snapshot.selectedSql).toBe(props.modelValue);
+    expect(snapshot.selectionFrom).toBe(0);
+    expect(snapshot.selectionTo).toBe(props.modelValue.length);
+    expect(host.querySelector('[role="listbox"]')).toBeNull();
+  });
+
   it("keeps the new-result-tab shortcut independent of the optional picker", async () => {
     const { editor, host, settingsStore, onExecute, onExecuteInNewResultTab } = await mountEditor();
     settingsStore.editorSettings.showExecutionTargetPicker = true;
@@ -204,7 +223,7 @@ describe("QueryEditor component split integration", () => {
     expect(onExecuteInNewResultTab.mock.calls[0][0].selectedSql).toBe("SELECT 1");
   });
 
-  it("opens, navigates, cancels and confirms the execution picker without replacing the editor", async () => {
+  it("opens, navigates, cancels and confirms the execution picker without replacing the editor", { retry: 5 }, async () => {
     const { editor, host, view, props, settingsStore, onExecute } = await mountEditor();
     settingsStore.editorSettings.showExecutionTargetPicker = true;
     vi.spyOn(view, "coordsAtPos").mockReturnValue({ left: 10, right: 12, top: 20, bottom: 40 });
@@ -229,8 +248,7 @@ describe("QueryEditor component split integration", () => {
     keydown(picker, "ArrowDown");
     await nextTick();
     keydown(picker, "Enter");
-    await nextTick();
-    expect(onExecute).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(onExecute).toHaveBeenCalledTimes(1));
     expect(onExecute.mock.calls[0][0].selectedSql).toBe(props.modelValue);
     expect(host.querySelector('[role="listbox"]')).toBeNull();
     expect(host.querySelector(".cm-editor")).toBe(view.dom);

@@ -21,7 +21,7 @@ async function getBackend(): Promise<Backend> {
 // Helper: create a forwarding function that lazily resolves the backend
 // ---------------------------------------------------------------------------
 
-function forward<K extends keyof Backend>(name: K): Backend[K] {
+function forward<K extends keyof Backend>(name: K, logErrorDetails = true): Backend[K] {
   // SAFETY: the resolved module is one of exactly two implementations of the same
   // surface — `http.ts` imports its request/response types from `tauri.ts` on
   // purpose, so both transports are kept signature-compatible by construction.
@@ -42,7 +42,7 @@ function forward<K extends keyof Backend>(name: K): Backend[K] {
       appendDebugLog("error", "[DBX][api:error]", {
         operation,
         elapsedMs: Math.round(performance.now() - startedAt),
-        error,
+        ...(logErrorDetails ? { error } : {}),
       });
       throw error;
     }
@@ -52,6 +52,19 @@ function forward<K extends keyof Backend>(name: K): Backend[K] {
 // ---------------------------------------------------------------------------
 // Re-export all functions via lazy forwarding
 // ---------------------------------------------------------------------------
+
+// PL/SQL debugger
+export const plDebugBootstrap = forward("plDebugBootstrap", false);
+export const plDebugInspect = forward("plDebugInspect", false);
+export const plDebugCompile = forward("plDebugCompile", false);
+export const plDebugCompileStatus = forward("plDebugCompileStatus", false);
+export const plDebugList = forward("plDebugList", false);
+export const plDebugStart = forward("plDebugStart", false);
+export const plDebugStatus = forward("plDebugStatus", false);
+export const plDebugHeartbeat = forward("plDebugHeartbeat", false);
+export const plDebugOperation = forward("plDebugOperation", false);
+export const plDebugOperate = forward("plDebugOperate", false);
+export const plDebugRead = forward("plDebugRead", false);
 
 // Connection
 export const testConnection = forward("testConnection");
@@ -87,6 +100,7 @@ export const loadConnections = forward("loadConnections");
 export const loadTunnelProfiles = forward("loadTunnelProfiles");
 export const saveTunnelProfiles = forward("saveTunnelProfiles");
 export const testTunnelProfile = forward("testTunnelProfile");
+export const listSshAgentIdentities = forward("listSshAgentIdentities");
 export const resolveSshPrompt = forward("resolveSshPrompt");
 export const readKeychainPassword = forward("readKeychainPassword");
 export const readKeychainPasswords = forward("readKeychainPasswords");
@@ -226,6 +240,18 @@ export const completionAssistantSearch = forward("completionAssistantSearch");
 export const getObjectSource = forward("getObjectSource");
 export const getEventInfo = forward("getEventInfo");
 export const getCustomTypeDetails = forward("getCustomTypeDetails");
+export const nativeJobOpenContext = forward("nativeJobOpenContext");
+export const nativeJobList = forward("nativeJobList");
+export const nativeJobReferences = forward("nativeJobReferences");
+export const nativeJobRead = forward("nativeJobRead");
+export const nativeJobPrepare = forward("nativeJobPrepare");
+export const nativeJobApply = forward("nativeJobApply");
+export const nativeJobStatus = forward("nativeJobStatus");
+export const nativeJobCancel = forward("nativeJobCancel");
+export const getOracleTypeManagementSnapshot = forward("getOracleTypeManagementSnapshot");
+export const buildOracleTypeManagementSql = forward("buildOracleTypeManagementSql");
+export const verifyOracleTypeData = forward("verifyOracleTypeData");
+export const prepareOracleTypeEvolution = forward("prepareOracleTypeEvolution");
 export const getColumns = forward("getColumns");
 export const getPluginTableMetadata = forward("getPluginTableMetadata");
 export const getAllColumns = forward("getAllColumns");
@@ -246,6 +272,13 @@ export const listSubpartitions = forward("listSubpartitions");
 export const getTableDdl = forward("getTableDdl");
 export const getTableDisplayDdl = forward("getTableDisplayDdl");
 export const listFunctions = forward("listFunctions");
+export const loadSchemaDiffRoutines = forward("loadSchemaDiffRoutines");
+export const updateOracleRoutineOperationReferences = forward("updateOracleRoutineOperationReferences");
+export const prepareOracleRoutineSave = forward("prepareOracleRoutineSave");
+export const prepareOracleRoutinePlan = forward("prepareOracleRoutinePlan");
+export const prepareOracleRoutineRecovery = forward("prepareOracleRoutineRecovery");
+export const executeOracleRoutineOperation = forward("executeOracleRoutineOperation");
+export const observeOracleRoutineOperation = forward("observeOracleRoutineOperation");
 export const listSequences = forward("listSequences");
 export const listRules = forward("listRules");
 export const listOwners = forward("listOwners");
@@ -330,6 +363,7 @@ export const buildDuplicateTableStructureSql = forward("buildDuplicateTableStruc
 export const buildCopyTableDataSql = forward("buildCopyTableDataSql");
 export const buildExecutableObjectSourceStatements = forward("buildExecutableObjectSourceStatements");
 export const validateOracleExecutableObjectSource = forward("validateOracleExecutableObjectSource");
+export const prepareOracleTriggerSql = forward("prepareOracleTriggerSql");
 export const fingerprintOracleRoutineObjectSource = forward("fingerprintOracleRoutineObjectSource");
 export const buildExecutableObjectSourceSql = forward("buildExecutableObjectSourceSql");
 export const buildEditableObjectSource = forward("buildEditableObjectSource");
@@ -511,6 +545,7 @@ export const inspectExternalSqlFile = forward("inspectExternalSqlFile");
 export const writeExternalSqlFile = forward("writeExternalSqlFile");
 export const saveExternalSqlFile = forward("saveExternalSqlFile");
 export const listSqlFilesInFolder = forward("listSqlFilesInFolder");
+export const searchSqlFileContents = forward("searchSqlFileContents");
 export const globalSearch = forward("globalSearch");
 export const loadGlobalSearchSettings = forward("loadGlobalSearchSettings");
 export const saveGlobalSearchSettings = forward("saveGlobalSearchSettings");
@@ -1002,6 +1037,7 @@ export const cancelUpdateDownload = forward("cancelUpdateDownload");
 export const getDownloadedUpdate = forward("getDownloadedUpdate");
 export const discardDownloadedUpdate = forward("discardDownloadedUpdate");
 export const installDownloadedUpdate = forward("installDownloadedUpdate");
+export const relaunchApp = forward("relaunchApp");
 export const getAppVersion = forward("getAppVersion");
 export const getAppSupportInfo = forward("getAppSupportInfo");
 
@@ -1155,6 +1191,9 @@ export type {
   SqlFileTable,
   SqlFileProgress,
   TransferRequest,
+  OraclePackageTransferRequest,
+  OraclePackageTransferPreview,
+  OraclePackagePendingTables,
   TransferProgress,
   TransferMode,
   TransferContent,
@@ -1203,6 +1242,8 @@ export type {
   QueryResultExportRequest,
   AgentEvent,
   SqlFileEntry,
+  SqlFileContentMatch,
+  SqlFileContentSearchResult,
   GlobalSearchRequest,
   GlobalSearchMatch,
   GlobalSearchSettings,
