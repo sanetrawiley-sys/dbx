@@ -1224,6 +1224,10 @@ export async function revealPathInFileManager(_path: string): Promise<void> {
   throw new Error("Reveal in file manager is only available in the desktop app.");
 }
 
+export async function openPathWithDefaultApp(_path: string): Promise<void> {
+  throw new Error("Open with default application is only available in the desktop app.");
+}
+
 export async function deleteDatabaseBackupFiles(_paths: string[], _allowedRoots: string[] = []): Promise<number> {
   throw new Error("Database backup file management is only available in the desktop app.");
 }
@@ -1316,8 +1320,22 @@ export async function listSchemaInfos(connectionId: string, database: string): P
   return schemas.map((name) => ({ name, comment: null }));
 }
 
-export async function listTables(connectionId: string, database: string, schema: string, filter?: string, limit?: number, offset?: number, objectTypes?: SidebarObjectKind[], catalog?: string, tableNameFilter?: TableNameFilter, exactIdentity?: boolean): Promise<TableInfo[]> {
-  return get(`/api/schema/tables?${qs({ connection_id: connectionId, database, schema, filter, limit, offset, object_types: objectTypes?.join(","), catalog, table_name_filter: tableNameFilter ? JSON.stringify(tableNameFilter) : undefined, exact_identity: exactIdentity || undefined })}`);
+export async function listTables(
+  connectionId: string,
+  database: string,
+  schema: string,
+  filter?: string,
+  limit?: number,
+  offset?: number,
+  objectTypes?: SidebarObjectKind[],
+  catalog?: string,
+  tableNameFilter?: TableNameFilter,
+  exactIdentity?: boolean,
+  pageTableRoots?: boolean,
+): Promise<TableInfo[]> {
+  return get(
+    `/api/schema/tables?${qs({ connection_id: connectionId, database, schema, filter, limit, offset, object_types: objectTypes?.join(","), catalog, table_name_filter: tableNameFilter ? JSON.stringify(tableNameFilter) : undefined, exact_identity: exactIdentity || undefined, page_table_roots: pageTableRoots || undefined })}`,
+  );
 }
 
 export async function getTableComment(connectionId: string, database: string, schema: string, table: string, catalog?: string, exactIdentity?: boolean): Promise<string | null> {
@@ -1355,6 +1373,7 @@ export async function listObjects(
       table_name_filter: tableNameFilter ? JSON.stringify(tableNameFilter) : undefined,
       execution_id: executionId,
       identity_mode: readOptions?.identityMode,
+      lightweight: readOptions?.lightweight,
       exact_identity: options === true || undefined,
     })}`,
   );
@@ -1516,7 +1535,7 @@ export async function prepareSchemaDiff(options: SchemaDiffPreparationOptions): 
   return schemaDiffPreparationFromWire(await post<SchemaDiffPreparationWire>("/api/schema-diff/prepare", schemaDiffPreparationToWire(options)));
 }
 
-export async function generateSchemaSyncSql(diffs: TableDiff[], databaseType: DatabaseType, targetSchema?: string, functionDiffs?: FunctionDiff[], sequenceDiffs?: SequenceDiff[], ruleDiffs?: RuleDiff[], ownerDiffs?: OwnerDiff[], cascadeDelete?: boolean): Promise<string> {
+export async function generateSchemaSyncSql(diffs: TableDiff[], databaseType: DatabaseType, targetSchema?: string, functionDiffs?: FunctionDiff[], sequenceDiffs?: SequenceDiff[], ruleDiffs?: RuleDiff[], ownerDiffs?: OwnerDiff[], cascadeDelete?: boolean, compareCharset?: boolean): Promise<string> {
   return post("/api/schema-diff/generate-sync-sql", {
     diffs,
     databaseType,
@@ -1526,6 +1545,7 @@ export async function generateSchemaSyncSql(diffs: TableDiff[], databaseType: Da
     ruleDiffs: ruleDiffs ?? [],
     ownerDiffs: ownerDiffs ?? [],
     cascadeDelete: cascadeDelete ?? false,
+    compareCharset: compareCharset ?? true,
   });
 }
 
@@ -3957,11 +3977,11 @@ export async function createQueryResultTempFile(_extension = "xlsx"): Promise<st
   throw new Error("Opening query results in an external application is only available in the desktop app");
 }
 
-export async function exportQueryResultCsv(filePath: string, columns: string[], rows: readonly (readonly XlsxCellValue[])[], csvQuoteMode: CsvQuoteMode = "all", nullLiteral?: string): Promise<void> {
+export async function exportQueryResultCsv(filePath: string, columns: string[], rows: readonly (readonly XlsxCellValue[])[], csvQuoteMode: CsvQuoteMode = "all", nullLiteral?: string, csvWithoutBom = false): Promise<void> {
   const { formatCsv } = await import("@/lib/export/exportFormats");
   const content = formatCsv(columns, rows as (string | number | boolean | null)[][], csvQuoteMode, nullLiteral);
   const fileName = filePath.split(/[\\/]/).pop() || "export.csv";
-  const blob = new Blob(["\uFEFF", content], {
+  const blob = new Blob([csvWithoutBom ? "" : "\uFEFF", content], {
     type: "text/csv;charset=utf-8",
   });
   const url = URL.createObjectURL(blob);
